@@ -1,0 +1,1202 @@
+"""
+domonic._cssom
+==============
+
+Internal support module for :mod:`domonic.style`. A data-driven registry of CSS
+properties: their initial values, whether they inherit, and how shorthand
+properties map to their longhand components.
+
+Used by :class:`domonic.style.CSSStyleDeclaration` for shorthand expansion /
+reconstruction and by ``window.getComputedStyle`` for initial / inherited
+value resolution. Kept deliberately small and declarative - it does not try to
+mirror every property a browser knows, only the ones worth resolving.
+"""
+
+from __future__ import annotations
+
+from typing import Callable
+
+# --- inheritance ----------------------------------------------------------
+# CSS properties that inherit from the parent element by default.
+INHERITED_PROPERTIES: frozenset[str] = frozenset(
+    {
+        "azimuth",
+        "border-collapse",
+        "border-spacing",
+        "caption-side",
+        "color",
+        "cursor",
+        "direction",
+        "empty-cells",
+        "font",
+        "font-family",
+        "font-feature-settings",
+        "font-kerning",
+        "font-language-override",
+        "font-optical-sizing",
+        "font-size",
+        "font-size-adjust",
+        "font-stretch",
+        "font-style",
+        "font-synthesis",
+        "font-variant",
+        "font-variant-alternates",
+        "font-variant-caps",
+        "font-variant-east-asian",
+        "font-variant-ligatures",
+        "font-variant-numeric",
+        "font-variant-position",
+        "font-variation-settings",
+        "font-weight",
+        "hanging-punctuation",
+        "hyphens",
+        "image-rendering",
+        "letter-spacing",
+        "line-break",
+        "line-height",
+        "list-style",
+        "list-style-image",
+        "list-style-position",
+        "list-style-type",
+        "orphans",
+        "overflow-wrap",
+        "paint-order",
+        "pointer-events",
+        "quotes",
+        "ruby-position",
+        "tab-size",
+        "text-align",
+        "text-align-last",
+        "text-combine-upright",
+        "text-decoration-skip-ink",
+        "text-indent",
+        "text-justify",
+        "text-orientation",
+        "text-rendering",
+        "text-shadow",
+        "text-transform",
+        "text-underline-offset",
+        "text-underline-position",
+        "visibility",
+        "white-space",
+        "widows",
+        "word-break",
+        "word-spacing",
+        "word-wrap",
+        "writing-mode",
+        # custom properties inherit
+    }
+)
+
+# --- initial values -----------------------------------------------------
+# Only properties with a non-empty, meaningful initial value are listed. Any
+# property not here resolves its initial value to "" (good enough for a
+# non-layout engine).
+INITIAL_VALUES: dict[str, str] = {
+    "align-content": "normal",
+    "align-items": "normal",
+    "align-self": "auto",
+    "animation-delay": "0s",
+    "animation-direction": "normal",
+    "animation-duration": "0s",
+    "animation-fill-mode": "none",
+    "animation-iteration-count": "1",
+    "animation-name": "none",
+    "animation-play-state": "running",
+    "animation-timing-function": "ease",
+    "appearance": "none",
+    "background-attachment": "scroll",
+    "background-clip": "border-box",
+    "background-color": "rgba(0, 0, 0, 0)",
+    "background-image": "none",
+    "background-origin": "padding-box",
+    "background-position": "0% 0%",
+    "background-repeat": "repeat",
+    "background-size": "auto",
+    "border-bottom-color": "currentcolor",
+    "border-bottom-left-radius": "0px",
+    "border-bottom-right-radius": "0px",
+    "border-bottom-style": "none",
+    "border-bottom-width": "medium",
+    "border-collapse": "separate",
+    "border-image-outset": "0",
+    "border-image-repeat": "stretch",
+    "border-image-slice": "100%",
+    "border-image-source": "none",
+    "border-image-width": "1",
+    "border-left-color": "currentcolor",
+    "border-left-style": "none",
+    "border-left-width": "medium",
+    "border-right-color": "currentcolor",
+    "border-right-style": "none",
+    "border-right-width": "medium",
+    "border-spacing": "0px",
+    "border-top-color": "currentcolor",
+    "border-top-left-radius": "0px",
+    "border-top-right-radius": "0px",
+    "border-top-style": "none",
+    "border-top-width": "medium",
+    "bottom": "auto",
+    "box-sizing": "content-box",
+    "caption-side": "top",
+    "clear": "none",
+    "color": "rgb(0, 0, 0)",
+    "column-count": "auto",
+    "column-gap": "normal",
+    "column-width": "auto",
+    "cursor": "auto",
+    "direction": "ltr",
+    "display": "inline",
+    "empty-cells": "show",
+    "flex-basis": "auto",
+    "flex-direction": "row",
+    "flex-grow": "0",
+    "flex-shrink": "1",
+    "flex-wrap": "nowrap",
+    "float": "none",
+    "font-family": "",
+    "font-size": "medium",
+    "font-stretch": "normal",
+    "font-style": "normal",
+    "font-variant": "normal",
+    "font-weight": "normal",
+    "grid-auto-columns": "auto",
+    "grid-auto-flow": "row",
+    "grid-auto-rows": "auto",
+    "grid-column-end": "auto",
+    "grid-column-start": "auto",
+    "grid-row-end": "auto",
+    "grid-row-start": "auto",
+    "grid-template-areas": "none",
+    "grid-template-columns": "none",
+    "grid-template-rows": "none",
+    "height": "auto",
+    "hyphens": "manual",
+    "justify-content": "normal",
+    "justify-items": "legacy",
+    "justify-self": "auto",
+    "left": "auto",
+    "letter-spacing": "normal",
+    "line-height": "normal",
+    "list-style-image": "none",
+    "list-style-position": "outside",
+    "list-style-type": "disc",
+    "margin-bottom": "0px",
+    "margin-left": "0px",
+    "margin-right": "0px",
+    "margin-top": "0px",
+    "max-height": "none",
+    "max-width": "none",
+    "min-height": "auto",
+    "min-width": "auto",
+    "object-fit": "fill",
+    "object-position": "50% 50%",
+    "opacity": "1",
+    "order": "0",
+    "outline-color": "currentcolor",
+    "outline-offset": "0px",
+    "outline-style": "none",
+    "outline-width": "medium",
+    "overflow-x": "visible",
+    "overflow-y": "visible",
+    "padding-bottom": "0px",
+    "padding-left": "0px",
+    "padding-right": "0px",
+    "padding-top": "0px",
+    "pointer-events": "auto",
+    "position": "static",
+    "resize": "none",
+    "right": "auto",
+    "row-gap": "normal",
+    "table-layout": "auto",
+    "text-align": "start",
+    "text-decoration-color": "currentcolor",
+    "text-decoration-line": "none",
+    "text-decoration-style": "solid",
+    "text-indent": "0px",
+    "text-transform": "none",
+    "top": "auto",
+    "transform": "none",
+    "transform-origin": "50% 50%",
+    "transition-delay": "0s",
+    "transition-duration": "0s",
+    "transition-property": "all",
+    "transition-timing-function": "ease",
+    "vertical-align": "baseline",
+    "visibility": "visible",
+    "white-space": "normal",
+    "width": "auto",
+    "word-break": "normal",
+    "word-spacing": "normal",
+    "writing-mode": "horizontal-tb",
+    "z-index": "auto",
+}
+
+# --- shorthand -> longhand ---------------------------------------------
+# Order matters for reconstruction (values are emitted in this order).
+SHORTHANDS: dict[str, tuple[str, ...]] = {
+    "margin": ("margin-top", "margin-right", "margin-bottom", "margin-left"),
+    "padding": ("padding-top", "padding-right", "padding-bottom", "padding-left"),
+    "inset": ("top", "right", "bottom", "left"),
+    "border-width": (
+        "border-top-width",
+        "border-right-width",
+        "border-bottom-width",
+        "border-left-width",
+    ),
+    "border-style": (
+        "border-top-style",
+        "border-right-style",
+        "border-bottom-style",
+        "border-left-style",
+    ),
+    "border-color": (
+        "border-top-color",
+        "border-right-color",
+        "border-bottom-color",
+        "border-left-color",
+    ),
+    "border-radius": (
+        "border-top-left-radius",
+        "border-top-right-radius",
+        "border-bottom-right-radius",
+        "border-bottom-left-radius",
+    ),
+    "border-top": (
+        "border-top-width",
+        "border-top-style",
+        "border-top-color",
+    ),
+    "border-right": (
+        "border-right-width",
+        "border-right-style",
+        "border-right-color",
+    ),
+    "border-bottom": (
+        "border-bottom-width",
+        "border-bottom-style",
+        "border-bottom-color",
+    ),
+    "border-left": (
+        "border-left-width",
+        "border-left-style",
+        "border-left-color",
+    ),
+    "border": (
+        "border-top-width",
+        "border-right-width",
+        "border-bottom-width",
+        "border-left-width",
+        "border-top-style",
+        "border-right-style",
+        "border-bottom-style",
+        "border-left-style",
+        "border-top-color",
+        "border-right-color",
+        "border-bottom-color",
+        "border-left-color",
+    ),
+    "outline": ("outline-width", "outline-style", "outline-color"),
+    "overflow": ("overflow-x", "overflow-y"),
+    "gap": ("row-gap", "column-gap"),
+    "place-content": ("align-content", "justify-content"),
+    "place-items": ("align-items", "justify-items"),
+    "place-self": ("align-self", "justify-self"),
+    "flex": ("flex-grow", "flex-shrink", "flex-basis"),
+    "flex-flow": ("flex-direction", "flex-wrap"),
+    "font": (
+        "font-style",
+        "font-variant",
+        "font-weight",
+        "font-stretch",
+        "font-size",
+        "line-height",
+        "font-family",
+    ),
+    "list-style": (
+        "list-style-type",
+        "list-style-position",
+        "list-style-image",
+    ),
+    "text-decoration": (
+        "text-decoration-line",
+        "text-decoration-style",
+        "text-decoration-color",
+    ),
+    "columns": ("column-width", "column-count"),
+    "column-rule": (
+        "column-rule-width",
+        "column-rule-style",
+        "column-rule-color",
+    ),
+    "background": (
+        "background-image",
+        "background-position",
+        "background-size",
+        "background-repeat",
+        "background-origin",
+        "background-clip",
+        "background-attachment",
+        "background-color",
+    ),
+    "transition": (
+        "transition-property",
+        "transition-duration",
+        "transition-timing-function",
+        "transition-delay",
+    ),
+    "animation": (
+        "animation-duration",
+        "animation-timing-function",
+        "animation-delay",
+        "animation-iteration-count",
+        "animation-direction",
+        "animation-fill-mode",
+        "animation-play-state",
+        "animation-name",
+    ),
+    "grid-template": (
+        "grid-template-rows",
+        "grid-template-columns",
+        "grid-template-areas",
+    ),
+    "grid-column": ("grid-column-start", "grid-column-end"),
+    "grid-row": ("grid-row-start", "grid-row-end"),
+    "grid-area": (
+        "grid-row-start",
+        "grid-column-start",
+        "grid-row-end",
+        "grid-column-end",
+    ),
+}
+
+#: longhand property -> the shorthand(s) that include it
+LONGHAND_TO_SHORTHANDS: dict[str, tuple[str, ...]] = {}
+for _short, _longs in SHORTHANDS.items():
+    for _long in _longs:
+        LONGHAND_TO_SHORTHANDS.setdefault(_long, ())
+        LONGHAND_TO_SHORTHANDS[_long] += (_short,)
+
+#: box shorthands whose longhands follow the top/right/bottom/left 1-4 value rule
+BOX_SHORTHANDS: frozenset[str] = frozenset(
+    {"margin", "padding", "inset", "border-width", "border-style", "border-color"}
+)
+#: radius shorthand uses TL/TR/BR/BL order but the same 1-4 value collapsing
+RADIUS_SHORTHANDS: frozenset[str] = frozenset({"border-radius"})
+
+
+def is_shorthand(name: str) -> bool:
+    return name in SHORTHANDS
+
+
+def longhands_for(name: str) -> tuple[str, ...]:
+    return SHORTHANDS.get(name, ())
+
+
+# CSS Properties and Values API (@property / CSS.registerProperty) registrations,
+# keyed by custom-property name. Each value is
+# {"syntax": str, "inherits": bool, "initialValue": str | None}.
+REGISTERED_PROPERTIES: dict[str, dict] = {}
+
+
+def register_property(
+    name: str,
+    *,
+    syntax: str = "*",
+    inherits: bool = False,
+    initial_value: str | None = None,
+) -> None:
+    """Record a registered custom property (last registration wins, matching
+    ``@property`` cascade order; ``CSS.registerProperty`` enforces uniqueness
+    itself)."""
+    REGISTERED_PROPERTIES[name] = {
+        "syntax": syntax,
+        "inherits": bool(inherits),
+        "initialValue": initial_value,
+    }
+
+
+def registered_property(name: str) -> dict | None:
+    return REGISTERED_PROPERTIES.get(name)
+
+
+def inherits(name: str) -> bool:
+    registration = REGISTERED_PROPERTIES.get(name)
+    if registration is not None:
+        return registration["inherits"]
+    # An unregistered custom property inherits by default.
+    return name in INHERITED_PROPERTIES or name.startswith("--")
+
+
+def initial_value(name: str) -> str:
+    registration = REGISTERED_PROPERTIES.get(name)
+    if registration is not None and registration["initialValue"] is not None:
+        return registration["initialValue"]
+    return INITIAL_VALUES.get(name, "")
+
+
+def expand_box_values(value: str) -> tuple[str, str, str, str]:
+    """Expand a 1-4 token box value into (top, right, bottom, left)."""
+    parts = value.split()
+    if len(parts) == 1:
+        return parts[0], parts[0], parts[0], parts[0]
+    if len(parts) == 2:
+        return parts[0], parts[1], parts[0], parts[1]
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2], parts[1]
+    return parts[0], parts[1], parts[2], parts[3]
+
+
+def collapse_box_values(top: str, right: str, bottom: str, left: str) -> str:
+    """Collapse (top, right, bottom, left) back to the shortest equivalent."""
+    if not all((top, right, bottom, left)):
+        return ""
+    if left == right:
+        if top == bottom:
+            return top if top == right else f"{top} {right}"
+        return f"{top} {right} {bottom}"
+    return f"{top} {right} {bottom} {left}"
+
+
+_BORDER_STYLE_KEYWORDS = frozenset(
+    {
+        "none",
+        "hidden",
+        "dotted",
+        "dashed",
+        "solid",
+        "double",
+        "groove",
+        "ridge",
+        "inset",
+        "outset",
+    }
+)
+_BORDER_WIDTH_KEYWORDS = frozenset({"thin", "medium", "thick"})
+_FONT_STYLE_KEYWORDS = frozenset({"italic", "oblique"})
+_FONT_VARIANT_KEYWORDS = frozenset({"small-caps"})
+_FONT_WEIGHT_KEYWORDS = frozenset(
+    {"bold", "bolder", "lighter", "100", "200", "300", "400", "500", "600", "700", "800", "900"}
+)
+_FONT_STRETCH_KEYWORDS = frozenset(
+    {
+        "ultra-condensed",
+        "extra-condensed",
+        "condensed",
+        "semi-condensed",
+        "semi-expanded",
+        "expanded",
+        "extra-expanded",
+        "ultra-expanded",
+    }
+)
+_GLOBAL_KEYWORDS = frozenset({"inherit", "initial", "unset", "revert", "revert-layer"})
+
+
+def _has_top_level_comma(value: str) -> bool:
+    depth = 0
+    for char in value:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(depth - 1, 0)
+        elif char == "," and depth == 0:
+            return True
+    return False
+
+
+def _split_ws_keep_funcs(value: str) -> list[str]:
+    """Split on whitespace, but keep ``func(...)`` groups intact and emit a
+    bare ``/`` as its own token."""
+    tokens: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for char in value.strip():
+        if char == "(":
+            depth += 1
+            buf.append(char)
+        elif char == ")":
+            depth = max(depth - 1, 0)
+            buf.append(char)
+        elif depth == 0 and char.isspace():
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+        elif depth == 0 and char == "/":
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+            tokens.append("/")
+        else:
+            buf.append(char)
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def _looks_like_length(token: str) -> bool:
+    token = token.strip().lower()
+    if token in _BORDER_WIDTH_KEYWORDS:
+        return True
+    return (
+        bool(token)
+        and (token[0].isdigit() or token[0] in "+-.")
+        and (
+            token.endswith(
+                (
+                    "px",
+                    "em",
+                    "rem",
+                    "%",
+                    "vh",
+                    "vw",
+                    "vmin",
+                    "vmax",
+                    "pt",
+                    "pc",
+                    "ex",
+                    "ch",
+                    "cm",
+                    "mm",
+                    "in",
+                    "q",
+                    "fr",
+                    "0",
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5",
+                    "6",
+                    "7",
+                    "8",
+                    "9",
+                )
+            )
+        )
+    )
+
+
+def expand_shorthand(name: str, value: str) -> list[tuple[str, str]] | None:
+    """Expand ``name: value`` (a shorthand) into ``[(longhand, value), ...]``.
+
+    Returns ``None`` if the shorthand is not understood well enough to split
+    (the caller then keeps only the shorthand entry).
+    """
+    value = value.strip()
+    longs = SHORTHANDS.get(name)
+    if not longs or not value:
+        return None
+    lower = value.lower()
+    if lower in _GLOBAL_KEYWORDS:
+        return [(long, value) for long in longs]
+
+    if name in BOX_SHORTHANDS or name in RADIUS_SHORTHANDS:
+        if "/" in value:  # elliptical border-radius - keep as-is
+            return None
+        top, right, bottom, left = expand_box_values(value)
+        return list(zip(longs, (top, right, bottom, left)))
+
+    if name in ("border", "border-top", "border-right", "border-bottom", "border-left", "outline", "column-rule"):
+        width = style = color = None
+        for token in value.split():
+            tl = token.lower()
+            if tl in _BORDER_STYLE_KEYWORDS and style is None:
+                style = token
+            elif (_looks_like_length(token) or tl in _BORDER_WIDTH_KEYWORDS) and width is None:
+                width = token
+            else:
+                color = token if color is None else f"{color} {token}"
+        prefix = "border" if name == "border" else name
+        if name == "border":
+            # grouped by component then side, matching SHORTHANDS["border"] and
+            # a browser's declaration-block enumeration order
+            return [
+                (f"border-{side}-{comp}", val)
+                for comp, val in (
+                    ("width", width or "medium"),
+                    ("style", style or "none"),
+                    ("color", color or "currentcolor"),
+                )
+                for side in ("top", "right", "bottom", "left")
+            ]
+        return [
+            (f"{prefix}-width", width or "medium"),
+            (f"{prefix}-style", style or "none"),
+            (f"{prefix}-color", color or "currentcolor"),
+        ]
+
+    if name == "flex":
+        if lower == "none":
+            return [("flex-grow", "0"), ("flex-shrink", "0"), ("flex-basis", "auto")]
+        if lower == "auto":
+            return [("flex-grow", "1"), ("flex-shrink", "1"), ("flex-basis", "auto")]
+        parts = value.split()
+        grow, shrink, basis = "1", "1", "0%"
+        nums = [p for p in parts if p.replace(".", "", 1).isdigit()]
+        non_nums = [p for p in parts if p not in nums]
+        if len(nums) >= 1:
+            grow = nums[0]
+        if len(nums) >= 2:
+            shrink = nums[1]
+        if non_nums:
+            basis = non_nums[0]
+        elif len(parts) == 1 and parts[0].replace(".", "", 1).isdigit():
+            basis = "0%"
+        return [("flex-grow", grow), ("flex-shrink", shrink), ("flex-basis", basis)]
+
+    if name in ("grid-column", "grid-row"):
+        # <grid-line> [ / <grid-line> ]? -- the slash, not whitespace, is the
+        # separator (each <grid-line> can itself contain a space: "span 3").
+        parts = [p.strip() for p in value.split("/")]
+        if len(parts) == 1:
+            # no end line given: per spec this leaves -end as auto unless
+            # -start names a line, a narrower case domonic doesn't track.
+            return [(longs[0], parts[0]), (longs[1], "auto")]
+        if len(parts) == 2:
+            return list(zip(longs, parts))
+        return None
+
+    if name in (
+        "overflow",
+        "gap",
+        "place-content",
+        "place-items",
+        "place-self",
+        "flex-flow",
+        "columns",
+    ):
+        parts = value.split()
+        if len(parts) == 1:
+            return [(long, parts[0]) for long in longs]
+        if len(parts) == len(longs):
+            return list(zip(longs, parts))
+        return None
+
+    if name == "list-style":
+        type_ = position = image = None
+        for token in value.split():
+            tl = token.lower()
+            if tl in ("inside", "outside"):
+                position = token
+            elif tl == "none" or tl.startswith("url(") or "url(" in tl:
+                image = token
+            else:
+                type_ = token
+        return [
+            ("list-style-type", type_ or "disc"),
+            ("list-style-position", position or "outside"),
+            ("list-style-image", image or "none"),
+        ]
+
+    if name == "text-decoration":
+        line = style = color = None
+        line_kw = {"none", "underline", "overline", "line-through", "blink"}
+        style_kw = {"solid", "double", "dotted", "dashed", "wavy"}
+        for token in value.split():
+            tl = token.lower()
+            if tl in line_kw:
+                line = f"{line} {token}".strip() if line else token
+            elif tl in style_kw:
+                style = token
+            else:
+                color = token
+        return [
+            ("text-decoration-line", line or "none"),
+            ("text-decoration-style", style or "solid"),
+            ("text-decoration-color", color or "currentcolor"),
+        ]
+
+    if name == "font":
+        # [ style || variant || weight || stretch ]? size [ / line-height ]? family
+        tokens = value.split()
+        style = variant = weight = stretch = "normal"
+        size = line_height = ""
+        family_start = 0
+        for i, token in enumerate(tokens):
+            tl = token.lower()
+            if tl in _FONT_STYLE_KEYWORDS:
+                style = token
+            elif tl in _FONT_VARIANT_KEYWORDS:
+                variant = token
+            elif tl in _FONT_WEIGHT_KEYWORDS:
+                weight = token
+            elif tl in _FONT_STRETCH_KEYWORDS:
+                stretch = token
+            elif tl == "normal":
+                continue
+            else:
+                # first non-keyword token is the size (optionally size/line-height)
+                if "/" in token:
+                    size, _, line_height = token.partition("/")
+                else:
+                    size = token
+                family_start = i + 1
+                break
+        family = " ".join(tokens[family_start:]) or "inherit"
+        return [
+            ("font-style", style),
+            ("font-variant", variant),
+            ("font-weight", weight),
+            ("font-stretch", stretch),
+            ("font-size", size or "medium"),
+            ("line-height", line_height or "normal"),
+            ("font-family", family),
+        ]
+
+    if name == "background":
+        # single-layer best effort; multiple comma-separated layers keep verbatim
+        # (a comma inside url()/rgb()/gradient() is not a layer separator)
+        if _has_top_level_comma(value):
+            return None
+        bg = {
+            k: ""
+            for k in (
+                "image",
+                "position",
+                "size",
+                "repeat",
+                "attachment",
+                "origin",
+                "clip",
+                "color",
+            )
+        }
+        tokens = _split_ws_keep_funcs(value)
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            tl = token.lower()
+            if tl in ("repeat", "no-repeat", "repeat-x", "repeat-y", "space", "round"):
+                bg["repeat"] = f"{bg['repeat']} {token}".strip()
+            elif tl in ("fixed", "local", "scroll"):
+                bg["attachment"] = token
+            elif tl in ("border-box", "padding-box", "content-box"):
+                bg["origin" if not bg["origin"] else "clip"] = token
+            elif tl == "none" or tl.startswith("url(") or "-gradient(" in tl:
+                bg["image"] = token
+            elif tl in ("left", "right", "top", "bottom", "center") or _looks_like_length(token):
+                bg["position"] = f"{bg['position']} {token}".strip()
+                if i + 1 < len(tokens) and tokens[i + 1] == "/":
+                    if i + 2 < len(tokens):
+                        bg["size"] = tokens[i + 2]
+                    i += 2
+            elif tl in _GLOBAL_KEYWORDS:
+                return [(long, token) for long in longs]
+            else:
+                bg["color"] = f"{bg['color']} {token}".strip()
+            i += 1
+        return [
+            ("background-image", bg["image"] or "none"),
+            ("background-position", bg["position"] or "0% 0%"),
+            ("background-size", bg["size"] or "auto"),
+            ("background-repeat", bg["repeat"] or "repeat"),
+            ("background-origin", bg["origin"] or "padding-box"),
+            ("background-clip", bg["clip"] or bg["origin"] or "border-box"),
+            ("background-attachment", bg["attachment"] or "scroll"),
+            ("background-color", bg["color"] or "transparent"),
+        ]
+
+    # transition / animation / grid-template / grid-area:
+    # keep them as the shorthand only (round-trips correctly, just not split).
+    return None
+
+
+def build_shorthand(name: str, get: Callable[[str], str]) -> str:
+    """Reconstruct a shorthand string from longhand values via ``get(longhand)``.
+
+    Returns "" if the shorthand cannot be losslessly built (a longhand missing,
+    or the components disagree in a way that has no shorthand form).
+    """
+    longs = SHORTHANDS.get(name)
+    if not longs:
+        return ""
+
+    if name in BOX_SHORTHANDS or name in RADIUS_SHORTHANDS:
+        vals = [get(long) for long in longs]
+        if any(v == "" for v in vals):
+            return ""
+        return collapse_box_values(*vals)
+
+    if name in ("border-top", "border-right", "border-bottom", "border-left", "outline", "column-rule"):
+        # longs is (<x>-width, <x>-style, <x>-color) for this exact shorthand
+        parts = [get(long) for long in longs]
+        if any(p == "" for p in parts):
+            return ""
+        return " ".join(p for p in parts if p and p not in ("currentcolor", "medium")) or parts[1]
+
+    if name == "border":
+        # only if all four sides are identical
+        sides = ("top", "right", "bottom", "left")
+        for comp in ("width", "style", "color"):
+            side_vals = {get(f"border-{s}-{comp}") for s in sides}
+            if len(side_vals) != 1 or "" in side_vals:
+                return ""
+        w = get("border-top-width")
+        s = get("border-top-style")
+        c = get("border-top-color")
+        return " ".join(x for x in (w, s, c) if x and x not in ("medium", "currentcolor")) or s
+
+    if name in ("grid-column", "grid-row"):
+        start, end = (get(long) for long in longs)
+        if start == "" or end == "":
+            return ""
+        if end == "auto":
+            return start
+        return f"{start} / {end}"
+
+    if name in (
+        "overflow",
+        "gap",
+        "flex-flow",
+        "place-content",
+        "place-items",
+        "place-self",
+        "columns",
+    ):
+        vals = [get(long) for long in longs]
+        if any(v == "" for v in vals):
+            return ""
+        if len(set(vals)) == 1:
+            return vals[0]
+        return " ".join(vals)
+
+    if name == "flex":
+        g, s, b = (get("flex-grow"), get("flex-shrink"), get("flex-basis"))
+        if "" in (g, s, b):
+            return ""
+        return " ".join((g, s, b))
+
+    if name in ("list-style", "text-decoration"):
+        vals = [get(long) for long in longs]
+        vals = [v for v in vals if v and v not in ("disc", "outside", "none", "solid", "currentcolor")]
+        joined = " ".join(get(long) for long in longs if get(long))
+        return joined.strip()
+
+    if name == "font":
+        size = get("font-size")
+        family = get("font-family")
+        if not size or not family:
+            return ""
+        lh = get("line-height")
+        pieces = []
+        for comp in ("font-style", "font-variant", "font-weight", "font-stretch"):
+            v = get(comp)
+            if v and v != "normal":
+                pieces.append(v)
+        size_part = f"{size}/{lh}" if lh and lh != "normal" else size
+        pieces.append(size_part)
+        pieces.append(family)
+        return " ".join(pieces)
+
+    return ""
+
+
+# --- colour normalisation ----------------------------------------------------
+# The 148 CSS named colours -> (r, g, b). Used by ``window.getComputedStyle`` to
+# report a used colour as ``rgb()`` / ``rgba()`` the way a browser does.
+NAMED_COLORS: dict[str, tuple[int, int, int]] = {
+    "aliceblue": (240, 248, 255),
+    "antiquewhite": (250, 235, 215),
+    "aqua": (0, 255, 255),
+    "aquamarine": (127, 255, 212),
+    "azure": (240, 255, 255),
+    "beige": (245, 245, 220),
+    "bisque": (255, 228, 196),
+    "black": (0, 0, 0),
+    "blanchedalmond": (255, 235, 205),
+    "blue": (0, 0, 255),
+    "blueviolet": (138, 43, 226),
+    "brown": (165, 42, 42),
+    "burlywood": (222, 184, 135),
+    "cadetblue": (95, 158, 160),
+    "chartreuse": (127, 255, 0),
+    "chocolate": (210, 105, 30),
+    "coral": (255, 127, 80),
+    "cornflowerblue": (100, 149, 237),
+    "cornsilk": (255, 248, 220),
+    "crimson": (220, 20, 60),
+    "cyan": (0, 255, 255),
+    "darkblue": (0, 0, 139),
+    "darkcyan": (0, 139, 139),
+    "darkgoldenrod": (184, 134, 11),
+    "darkgray": (169, 169, 169),
+    "darkgreen": (0, 100, 0),
+    "darkgrey": (169, 169, 169),
+    "darkkhaki": (189, 183, 107),
+    "darkmagenta": (139, 0, 139),
+    "darkolivegreen": (85, 107, 47),
+    "darkorange": (255, 140, 0),
+    "darkorchid": (153, 50, 204),
+    "darkred": (139, 0, 0),
+    "darksalmon": (233, 150, 122),
+    "darkseagreen": (143, 188, 143),
+    "darkslateblue": (72, 61, 139),
+    "darkslategray": (47, 79, 79),
+    "darkslategrey": (47, 79, 79),
+    "darkturquoise": (0, 206, 209),
+    "darkviolet": (148, 0, 211),
+    "deeppink": (255, 20, 147),
+    "deepskyblue": (0, 191, 255),
+    "dimgray": (105, 105, 105),
+    "dimgrey": (105, 105, 105),
+    "dodgerblue": (30, 144, 255),
+    "firebrick": (178, 34, 34),
+    "floralwhite": (255, 250, 240),
+    "forestgreen": (34, 139, 34),
+    "fuchsia": (255, 0, 255),
+    "gainsboro": (220, 220, 220),
+    "ghostwhite": (248, 248, 255),
+    "gold": (255, 215, 0),
+    "goldenrod": (218, 165, 32),
+    "gray": (128, 128, 128),
+    "green": (0, 128, 0),
+    "greenyellow": (173, 255, 47),
+    "grey": (128, 128, 128),
+    "honeydew": (240, 255, 240),
+    "hotpink": (255, 105, 180),
+    "indianred": (205, 92, 92),
+    "indigo": (75, 0, 130),
+    "ivory": (255, 255, 240),
+    "khaki": (240, 230, 140),
+    "lavender": (230, 230, 250),
+    "lavenderblush": (255, 240, 245),
+    "lawngreen": (124, 252, 0),
+    "lemonchiffon": (255, 250, 205),
+    "lightblue": (173, 216, 230),
+    "lightcoral": (240, 128, 128),
+    "lightcyan": (224, 255, 255),
+    "lightgoldenrodyellow": (250, 250, 210),
+    "lightgray": (211, 211, 211),
+    "lightgreen": (144, 238, 144),
+    "lightgrey": (211, 211, 211),
+    "lightpink": (255, 182, 193),
+    "lightsalmon": (255, 160, 122),
+    "lightseagreen": (32, 178, 170),
+    "lightskyblue": (135, 206, 250),
+    "lightslategray": (119, 136, 153),
+    "lightslategrey": (119, 136, 153),
+    "lightsteelblue": (176, 196, 222),
+    "lightyellow": (255, 255, 224),
+    "lime": (0, 255, 0),
+    "limegreen": (50, 205, 50),
+    "linen": (250, 240, 230),
+    "magenta": (255, 0, 255),
+    "maroon": (128, 0, 0),
+    "mediumaquamarine": (102, 205, 170),
+    "mediumblue": (0, 0, 205),
+    "mediumorchid": (186, 85, 211),
+    "mediumpurple": (147, 112, 219),
+    "mediumseagreen": (60, 179, 113),
+    "mediumslateblue": (123, 104, 238),
+    "mediumspringgreen": (0, 250, 154),
+    "mediumturquoise": (72, 209, 204),
+    "mediumvioletred": (199, 21, 133),
+    "midnightblue": (25, 25, 112),
+    "mintcream": (245, 255, 250),
+    "mistyrose": (255, 228, 225),
+    "moccasin": (255, 228, 181),
+    "navajowhite": (255, 222, 173),
+    "navy": (0, 0, 128),
+    "oldlace": (253, 245, 230),
+    "olive": (128, 128, 0),
+    "olivedrab": (107, 142, 35),
+    "orange": (255, 165, 0),
+    "orangered": (255, 69, 0),
+    "orchid": (218, 112, 214),
+    "palegoldenrod": (238, 232, 170),
+    "palegreen": (152, 251, 152),
+    "paleturquoise": (175, 238, 238),
+    "palevioletred": (219, 112, 147),
+    "papayawhip": (255, 239, 213),
+    "peachpuff": (255, 218, 185),
+    "peru": (205, 133, 63),
+    "pink": (255, 192, 203),
+    "plum": (221, 160, 221),
+    "powderblue": (176, 224, 230),
+    "purple": (128, 0, 128),
+    "rebeccapurple": (102, 51, 153),
+    "red": (255, 0, 0),
+    "rosybrown": (188, 143, 143),
+    "royalblue": (65, 105, 225),
+    "saddlebrown": (139, 69, 19),
+    "salmon": (250, 128, 114),
+    "sandybrown": (244, 164, 96),
+    "seagreen": (46, 139, 87),
+    "seashell": (255, 245, 238),
+    "sienna": (160, 82, 45),
+    "silver": (192, 192, 192),
+    "skyblue": (135, 206, 235),
+    "slateblue": (106, 90, 205),
+    "slategray": (112, 128, 144),
+    "slategrey": (112, 128, 144),
+    "snow": (255, 250, 250),
+    "springgreen": (0, 255, 127),
+    "steelblue": (70, 130, 180),
+    "tan": (210, 180, 140),
+    "teal": (0, 128, 128),
+    "thistle": (216, 191, 216),
+    "tomato": (255, 99, 71),
+    "turquoise": (64, 224, 208),
+    "violet": (238, 130, 238),
+    "wheat": (245, 222, 179),
+    "white": (255, 255, 255),
+    "whitesmoke": (245, 245, 245),
+    "yellow": (255, 255, 0),
+    "yellowgreen": (154, 205, 50),
+}
+
+import re as _re  # noqa: E402
+
+_HEX_RE = _re.compile(r"^#([0-9a-fA-F]{3,8})$")
+
+
+def _hsl_to_rgb(h: float, s: float, ll: float) -> tuple[int, int, int]:
+    h = (h % 360) / 360.0
+    s = max(0.0, min(1.0, s))
+    ll = max(0.0, min(1.0, ll))
+    if s == 0:
+        v = round(ll * 255)
+        return (v, v, v)
+    q = ll * (1 + s) if ll < 0.5 else ll + s - ll * s
+    p = 2 * ll - q
+
+    def hue(t: float) -> float:
+        if t < 0:
+            t += 1
+        if t > 1:
+            t -= 1
+        if t < 1 / 6:
+            return p + (q - p) * 6 * t
+        if t < 1 / 2:
+            return q
+        if t < 2 / 3:
+            return p + (q - p) * (2 / 3 - t) * 6
+        return p
+
+    return (
+        round(hue(h + 1 / 3) * 255),
+        round(hue(h) * 255),
+        round(hue(h - 1 / 3) * 255),
+    )
+
+
+def _fmt_rgb(r: int, g: int, b: int, a: float | None) -> str:
+    r, g, b = (max(0, min(255, int(round(c)))) for c in (r, g, b))
+    if a is None or a >= 1:
+        return f"rgb({r}, {g}, {b})"
+    a = max(0.0, min(1.0, a))
+    text = f"{round(a, 3):.3f}".rstrip("0").rstrip(".") or "0"
+    return f"rgba({r}, {g}, {b}, {text})"
+
+
+def normalize_color(value: str) -> str | None:
+    """Return ``value`` as ``rgb()`` / ``rgba()``, or ``None`` if it is not a
+    colour this resolver understands (leave it untouched)."""
+    text = str(value).strip()
+    low = text.lower()
+    if low in ("", "currentcolor", "transparent"):
+        return "rgba(0, 0, 0, 0)" if low == "transparent" else None
+    if low in NAMED_COLORS:
+        return _fmt_rgb(*NAMED_COLORS[low], None)
+
+    hexmatch = _HEX_RE.match(text)
+    if hexmatch:
+        digits = hexmatch.group(1)
+        if len(digits) in (3, 4):
+            digits = "".join(c * 2 for c in digits)
+        if len(digits) in (6, 8):
+            r, g, b = (int(digits[i : i + 2], 16) for i in (0, 2, 4))
+            a = int(digits[6:8], 16) / 255 if len(digits) == 8 else None
+            return _fmt_rgb(r, g, b, a)
+        return None
+
+    func = _re.match(r"^(rgba?|hsla?)\(([^)]*)\)$", low)
+    if not func:
+        return None
+    kind = func.group(1)
+    parts = [p.strip() for p in _re.split(r"[,/]| (?=[^,])", func.group(2)) if p.strip()]
+    if len(parts) < 3:
+        return None
+
+    def num(tok: str, scale: float = 1.0) -> float:
+        tok = tok.strip()
+        if tok.endswith("%"):
+            return float(tok[:-1]) / 100.0 * scale
+        return float(tok)
+
+    try:
+        alpha = num(parts[3]) if len(parts) >= 4 else None
+        if kind.startswith("rgb"):
+            channels = [num(parts[i], 255.0) if parts[i].endswith("%") else float(parts[i]) for i in range(3)]
+            return _fmt_rgb(
+                int(round(channels[0])),
+                int(round(channels[1])),
+                int(round(channels[2])),
+                alpha,
+            )
+        h = float(_re.sub(r"deg$", "", parts[0]))
+        s = num(parts[1])
+        ll = num(parts[2])
+        return _fmt_rgb(*_hsl_to_rgb(h, s, ll), alpha)
+    except (ValueError, IndexError):
+        return None
+
+
+# --- style-resolution cache epochs -----------------------------------------
+#
+# Three independent, process-wide monotonic counters a cascade/computed-style
+# cache uses to tell "have my inputs changed" from "recompute everything".
+# They are kept separate because they change at very different rates: DOM
+# structure and attributes (including inline ``style``) change constantly
+# during ordinary use, while stylesheet rules are usually set up once and
+# rarely touched again, and layout geometry only exists at all once a layout
+# engine is attached. Folding all three into one counter would mean a single
+# ``classList.toggle()`` forces every stylesheet's selectors to be re-parsed
+# and re-indexed on the next style read, not just that element's cascade to
+# be redone -- this module, ``domonic.dom``, and ``domonic.layout`` all import
+# this leaf module, so it is the natural place for a counter all three reach.
+_DOM_STYLE_EPOCH: int = 0
+_STYLESHEET_EPOCH: int = 0
+_LAYOUT_EPOCH: int = 0
+
+
+def bump_dom_style_epoch() -> None:
+    """Call whenever a DOM mutation could change what a selector matches or
+    what an element inherits: an attribute (including inline ``style``)
+    changing, or the tree shape around any element changing. Invalidates
+    every element's cached cascade, but leaves stylesheets' parsed rule
+    index alone."""
+    global _DOM_STYLE_EPOCH
+    _DOM_STYLE_EPOCH += 1
+
+
+def dom_style_epoch() -> int:
+    return _DOM_STYLE_EPOCH
+
+
+def bump_stylesheet_epoch() -> None:
+    """Call whenever a stylesheet's own rules change (``insertRule`` /
+    ``deleteRule`` / ``replace`` / ``replaceSync``) -- invalidates every
+    document's cached rule index (and, transitively, every cascade, since a
+    changed rule can change what any element resolves to)."""
+    global _STYLESHEET_EPOCH
+    _STYLESHEET_EPOCH += 1
+
+
+def stylesheet_epoch() -> int:
+    return _STYLESHEET_EPOCH
+
+
+def bump_layout_epoch() -> None:
+    """Call whenever a layout engine attaches, replaces, or clears the box it
+    computed for an element (``domonic.layout.set_layout_box`` /
+    ``clear_layout_box``) -- invalidates every cached computed style, since
+    ``width``/``height``/``margin`` etc. resolve differently once real
+    geometry is available (see ``ComputedStyleDeclaration._to_used_length``)."""
+    global _LAYOUT_EPOCH
+    _LAYOUT_EPOCH += 1
+
+
+def layout_epoch() -> int:
+    return _LAYOUT_EPOCH

@@ -1,0 +1,81 @@
+{
+  "source": {
+    "nodes": 500,
+    "rules": 200
+  },
+  "load_ms": 112.6845832914114,
+  "png_bytes": 164094,
+  "layouts_per_bridge_tick": 2,
+  "bridge_script_bytes": 218856,
+  "timings": {
+    "layout": {
+      "median_ms": 56.97520775720477,
+      "samples_ms": [
+        56.97520775720477,
+        55.551374796777964,
+        57.05170892179012
+      ]
+    },
+    "raster_and_snapshot": {
+      "median_ms": 17.610332928597927,
+      "samples_ms": [
+        18.40291591361165,
+        17.610332928597927,
+        17.563707660883665
+      ]
+    },
+    "png_encode": {
+      "median_ms": 33.0293751321733,
+      "samples_ms": [
+        36.32091684266925,
+        33.0293751321733,
+        32.582707703113556
+      ]
+    },
+    "paint_and_png": {
+      "median_ms": 53.00520872697234,
+      "samples_ms": [
+        53.00520872697234,
+        50.981832668185234,
+        57.06241726875305
+      ]
+    },
+    "base64": {
+      "median_ms": 0.23524975404143333,
+      "samples_ms": [
+        0.2559171989560127,
+        0.23524975404143333,
+        0.23116683587431908
+      ]
+    },
+    "render": {
+      "median_ms": 123.56716627255082,
+      "samples_ms": [
+        123.56716627255082,
+        127.39616632461548,
+        103.06758293882012
+      ]
+    },
+    "tick_then_render": {
+      "median_ms": 168.1655407883227,
+      "samples_ms": [
+        168.1655407883227,
+        161.42925014719367,
+        171.3496670126915
+      ]
+    },
+    "bridge_tick": {
+      "median_ms": 193.68587527424097,
+      "samples_ms": [
+        170.0379578396678,
+        197.3895002156496,
+        193.68587527424097
+      ]
+    }
+  },
+  "limits": "Headless; excludes pywebview IPC, PNG decode, display composition, and input latency.",
+  "recorded_date": "2026-09-12",
+  "environment": {
+    "domonic_runtime_version": "1.8.0"
+  }
+}

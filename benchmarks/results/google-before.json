@@ -1,0 +1,53 @@
+{
+  "source": "https://google.com/",
+  "load_ms": 408.10554195195436,
+  "png_bytes": 18117,
+  "layouts_per_tick_and_frame": 2,
+  "timings": {
+    "layout": {
+      "median_ms": 25.30954172834754,
+      "samples_ms": [
+        25.30954172834754,
+        25.416582822799683,
+        25.08304174989462
+      ]
+    },
+    "paint_and_png": {
+      "median_ms": 24.85424978658557,
+      "samples_ms": [
+        24.82979092746973,
+        24.85424978658557,
+        25.799334049224854
+      ]
+    },
+    "base64": {
+      "median_ms": 0.02712523564696312,
+      "samples_ms": [
+        0.059833284467458725,
+        0.02712523564696312,
+        0.02391589805483818
+      ]
+    },
+    "render": {
+      "median_ms": 54.437125101685524,
+      "samples_ms": [
+        59.84666710719466,
+        54.437125101685524,
+        51.93966720253229
+      ]
+    },
+    "tick_then_render": {
+      "median_ms": 77.72854203358293,
+      "samples_ms": [
+        97.30516606941819,
+        77.72854203358293,
+        75.21350029855967
+      ]
+    }
+  },
+  "limits": "Headless; excludes pywebview IPC, PNG decode, display composition, and input latency.",
+  "recorded_date": "2026-09-12",
+  "environment": {
+    "domonic_runtime_version": "1.8.0"
+  }
+}

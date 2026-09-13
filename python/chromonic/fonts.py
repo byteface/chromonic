@@ -1,0 +1,166 @@
+"""Font resolution for chromonic's Skia painter -- given a CSS `font-family`
+list plus resolved `bold`/`italic` flags, pick one concrete `skia.Typeface`
+to actually paint text with. This is **paint-only**: `tree.py`'s text
+measurement still goes entirely through `domonic._fontmetrics`, which has
+exactly one advance-width table (public-domain Helvetica/Helvetica-Bold --
+see its own module docstring), with no notion of `font-family` at all. That
+means a `<p style="font-family: 'Courier New', monospace">` will now
+*paint* in a real monospace font but its box was still *sized* as if it
+were Helvetica -- text can visibly overflow its own box for a font whose
+average character width differs enough from Helvetica's (monospace and
+some serif faces are the most likely to show it; ordinary sans-serif body
+text rarely does, since that's what the metrics table already approximates).
+Fixing that for real needs an actual per-font metrics/shaping engine --
+real, separate work, not attempted here; this module closes the more
+visible half of the gap (what a page's chosen font *looks* like) rather
+than the deeper one (exactly how much space it should measure as needing).
+
+`font-style: italic`/`oblique` has no equivalent width concern -- this POC
+doesn't model per-style advance widths at all (italic and upright variants
+of the same typeface are close enough in width that the Helvetica table
+already in use is the same approximation either way), so italic is applied
+freely here with no measurement-side caveat.
+"""
+
+from __future__ import annotations
+
+import skia
+
+# CSS generic family keywords -> one concrete name Skia's platform font
+# manager can actually resolve. Skia's own fuzzy matching (see
+# `resolve_typeface`) has no idea what "serif" or "monospace" mean as CSS
+# keywords -- it treats an unrecognised name as a request to fall back to
+# the platform default, same as passing `None`. `None` here means exactly
+# that fallback is already the right answer (asking for "sans-serif" and
+# getting Skia's own default -- already a sans-serif-ish system font on
+# every platform this repo targets -- needs no translation).
+_GENERIC_FAMILIES = {
+    "serif": "Times New Roman",
+    "sans-serif": None,
+    "monospace": "Courier New",
+    "cursive": "Comic Sans MS",
+    "fantasy": "Papyrus",
+    "system-ui": None,
+    "ui-serif": "Times New Roman",
+    "ui-sans-serif": None,
+    "ui-monospace": "Courier New",
+    # Browser-internal "use the OS UI font" keywords, not real family names
+    # -- no font manager lists a family literally called "-apple-system", so
+    # without this they'd always fail `_is_installed` and fall through
+    # (usually harmlessly, to the *next* name in the stack, but wastefully:
+    # a guaranteed-failing lookup for a name that could never succeed).
+    # Mapped straight to `None` (the platform default) instead, same as the
+    # generic `sans-serif` these keywords are always paired with in a real
+    # font stack (this repo's own `ua_style.py` included).
+    "-apple-system": None,
+    "-webkit-system-font": None,
+    "blinkmacsystemfont": None,
+}
+
+# (family_name_or_None, bold, italic) -> skia.Typeface. Resolving a typeface
+# is real work (platform font-manager lookup); the same handful of fonts
+# repaint every piece of text on a page, every frame, so this is worth
+# caching exactly like `paint.py`'s own `_FONT_CACHE` already caches
+# `skia.Font` objects built from these typefaces.
+_typeface_cache: "dict[tuple, skia.Typeface]" = {}
+
+# Shared `FontMgr` for `_is_installed()` -- constructing one isn't free, and
+# it's stateless (queries the platform's installed fonts), so one instance
+# for the whole process is enough.
+_font_mgr = skia.FontMgr()
+
+
+def _is_installed(name: "str | None") -> bool:
+    """Whether `name` actually matches an installed font family -- *not*
+    what `skia.Typeface(name, style)` alone can tell you (see
+    `resolve_typeface`'s docstring for why that constructor is the wrong
+    tool for this check)."""
+    if not name:
+        return False
+    return _font_mgr.matchFamily(name).count() > 0
+
+
+def parse_family_list(value: "str | None") -> list:
+    """A CSS `font-family` computed value (e.g. `Georgia, "Helvetica Neue",
+    sans-serif`) -> an ordered list of plain family names, surrounding
+    quotes stripped, generic keywords left as-is (mapped later, in
+    `resolve_typeface`). Empty if the property was never set -- domonic's
+    own "nothing declared, nothing inherited" value for `font-family` is
+    the literal string `"none"`, not an empty string, so that's checked for
+    explicitly rather than just falsiness."""
+    if not value or value == "none":
+        return []
+    names = []
+    for raw in value.split(","):
+        name = raw.strip().strip("'\"")
+        if name:
+            names.append(name)
+    return names
+
+
+def is_italic(font_style: "str | None") -> bool:
+    return isinstance(font_style, str) and font_style.strip().lower() in ("italic", "oblique")
+
+
+def warm_cache() -> None:
+    """Resolve the four typeface combinations almost every page uses
+    (default family, normal/bold x upright/italic) once, up front. Measured
+    (see PLAN.md's "Phase 9" perf notes, profiling `native_browser.py`):
+    resolving a `skia.Typeface` for the very first time is a real ~25ms
+    platform font-manager lookup, one-time but real -- every combination
+    after the first hits `_typeface_cache` and costs close to nothing. A
+    caller that's about to show a window (`native_browser.py`'s `View`)
+    calls this once at startup so that cost lands before the first frame
+    is due, not silently inside it."""
+    for bold in (False, True):
+        for italic in (False, True):
+            resolve_typeface(None, bold=bold, italic=italic)
+
+
+def resolve_typeface(family_value: "str | None", *, bold: bool = False, italic: bool = False) -> "skia.Typeface":
+    """The `skia.Typeface` to paint text in, given a CSS `font-family`
+    computed value and resolved `bold`/`italic` flags.
+
+    **Every name in the list is tried, in order, against what's actually
+    installed** -- an earlier version of this function tried only the
+    *first* name and stopped, reasoning that `skia.Typeface(name, style)`
+    is documented to never return null so there was no signal to act on.
+    That reasoning was wrong: `Typeface()`'s own fallback is exactly the
+    problem, not a reason to skip checking -- a real CSS font stack like
+    `-apple-system, "Segoe UI", sans-serif` (this repo's own UA stylesheet)
+    has its *first* name be a non-standard, browser-internal keyword no
+    font manager has ever heard of, and `Typeface("-apple-system", ...)`
+    silently, successfully resolves to *something* (Helvetica, on this
+    repo's own dev machine) without ever giving the second or third names a
+    chance -- exactly backwards from what a font stack is for. The actual
+    reliable signal is `FontMgr().matchFamily(name)`, which comes back
+    *empty* for a name nothing provides (`_is_installed`, above); this
+    walks the list until one name is actually installed, only then handing
+    it to `Typeface()`. A generic CSS keyword (`serif`, `monospace`, ...) is
+    translated to one concrete candidate name first (`_GENERIC_FAMILIES`),
+    since font managers have no notion of CSS's generic keywords on their
+    own -- that translated name is still checked for installation like any
+    other candidate, not assumed to exist."""
+    name = None  # nothing resolves -> the platform default, same as an empty/unset font-family
+    for candidate in parse_family_list(family_value):
+        mapped = _GENERIC_FAMILIES.get(candidate.lower(), candidate)
+        if mapped is None or _is_installed(mapped):
+            name = mapped
+            break
+        # not installed -- fall through to the next name in the stack,
+        # exactly as CSS's own font-family fallback is supposed to work.
+
+    key = (name, bold, italic)
+    typeface = _typeface_cache.get(key)
+    if typeface is None:
+        if bold and italic:
+            style = skia.FontStyle.BoldItalic()
+        elif bold:
+            style = skia.FontStyle.Bold()
+        elif italic:
+            style = skia.FontStyle.Italic()
+        else:
+            style = skia.FontStyle.Normal()
+        typeface = skia.Typeface(name, style)
+        _typeface_cache[key] = typeface
+    return typeface

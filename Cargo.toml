@@ -1,0 +1,13 @@
+[package]
+name = "chromonic_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+parley = "0.11.1"
+pyo3 = { version = "0.29.2", features = ["extension-module"] }
+taffy = "0.14.0"
