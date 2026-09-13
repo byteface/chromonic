@@ -1,6 +1,7 @@
 name: Release to PyPI
 
 "on":
+  workflow_dispatch:
   release:
     types: [published]
 
@@ -8,6 +9,7 @@ jobs:
   wheels:
     name: Build wheel (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -35,7 +37,8 @@ jobs:
       - name: Build wheel
         run: maturin build --release --out dist --interpreter python
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.python }}
           path: dist/*
@@ -57,30 +60,39 @@ jobs:
       - name: Build sdist
         run: maturin sdist --out dist
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
         with:
           name: sdist
           path: dist/*
 
   publish:
+    if: github.event_name == 'release'
+
     name: Publish to PyPI
+
     needs:
       - wheels
       - sdist
+
     runs-on: ubuntu-latest
+
     environment:
       name: pypi
+
     permissions:
       id-token: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download wheels
+        uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@v4
+      - name: Download sdist
+        uses: actions/download-artifact@v4
         with:
           name: sdist
           path: dist
@@ -88,4 +100,5 @@ jobs:
       - name: Show artifacts
         run: ls -lah dist
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

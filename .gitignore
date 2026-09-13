@@ -8,6 +8,7 @@ python/chromonic/*.so
 python/chromonic/*.pyd
 
 .DS_Store
+dist
 
 # Cargo.lock IS committed (pins the exact dependency versions this POC was
 # built and verified against) -- examples/poc.png and examples/poc_mutated.png ARE committed -- they're
