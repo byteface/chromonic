@@ -83,6 +83,9 @@ h5 { font-size: 0.83em; font-weight: bold; margin: 1.67em 0; }
 h6 { font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
 ul, ol { padding: 0 0 0 40px; }
 b, strong { font-weight: bold; }
+th { font-weight: bold; text-align: center; }
+pre, code, kbd, samp { font-family: monospace; }
+pre { white-space: pre; }
 small { font-size: 0.83em; }
 a { color: #0000ee; }
 hr { margin: 0.5em 0; border: 1px solid; height: 0; }
@@ -118,3 +121,13 @@ def apply(document) -> None:
     style_element.setAttribute("data-chromonic-ua", "")
     style_element.textContent = STYLESHEET
     head.insertBefore(style_element, head.firstChild)
+
+    if getattr(document, "_Document__stylesheets", None) is not None:
+        from domonic.style import CSSStyleSheet
+
+        sheet = CSSStyleSheet()
+        sheet._constructed = False
+        sheet.href = getattr(document, "URL", "")
+        sheet.ownerNode = style_element
+        sheet.replaceSync(STYLESHEET)
+        document.styleSheets.insert(0, sheet)

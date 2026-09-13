@@ -9,10 +9,10 @@ venv:
 	$(PYTHON) -m pip install maturin
 
 install:
-	$(PYTHON) -m pip install -e '.[dev,native,browse]'
+	$(PYTHON) -m pip install -e .
 
 develop:
-	$(MATURIN) develop --release --extras dev
+	$(MATURIN) develop --release
 
 test:
 	$(PYTHON) -m pytest tests

@@ -14,8 +14,8 @@ make layout-conformance
 Run selected fixtures or change the numeric tolerance:
 
 ```sh
-PYTHONPATH=chromonic/tests/layout .venv/bin/python -m harness.run_suite \
-  chromonic/tests/layout/fixtures/flex.html \
+PYTHONPATH=tests/layout .venv/bin/python -m harness.run_suite \
+  tests/layout/fixtures/flex.html \
   --tolerance 0.5 --output /tmp/layout-results
 ```
 
@@ -63,8 +63,9 @@ the regression test. Generated `artifacts/` can be removed and recreated at
 any time; Chrome references are generated from the current fixture every run.
 
 The original eleven fixtures remain as regression coverage. The expanded
-suite intentionally exposes many more failures; its pass count should only
-rise through general renderer fixes that also improve the realistic pages.
+suite now has a zero-geometry-mismatch baseline across all 21 fixtures,
+including the realistic pages, and should stay green unless a fixture is added
+to pin a newly found rendering gap.
 
 ## Current ownership
 
@@ -88,14 +89,10 @@ an anonymous inline row.
 
 The current high-priority geometry/paint work belongs in chromonic:
 
-- replace the retained anonymous mixed-text fragments' flex approximation with
-  real line boxes and place inline text/elements in one formatting context;
-- preserve text fragment metrics, wrapping, baseline alignment, and inline
-  padding/borders when projecting the resulting geometry to Taffy/Skia.
 - extend table layout beyond equal auto-width cells (spans, intrinsic/explicit
   column negotiation, separate borders and captions), and paint list markers;
-- provide UA intrinsic sizing for form controls and paint stacking, clipping,
-  border radii, and backgrounds in CSS paint order.
+- broaden CSS paint order coverage for stacking, clipping, border radii, and
+  backgrounds.
 
 More complex grid functions (`minmax`, auto-fill/auto-fit, named tracks) still
 require broader parsing and native representation.
@@ -104,6 +101,9 @@ Viewport-relative `vw`, `vh`, `vmin`, and `vmax` lengths are resolved by the
 Chromonic style bridge against the exact harness/window viewport. Positioned
 mixed content also retains direct text alongside out-of-flow children, and
 root body geometry accounts for collapsed child margins with explicit heights.
+The harness waits for Chrome fonts and Chromonic image/font downloads before
+capturing, preserves stylesheet base URLs for relative assets, and writes
+opaque amplified diffs so screenshot disagreements are visible.
 
 The remaining non-fatal style diagnostics belong primarily in Domonic's
 computed-style/CSSOM layer. Geometry already uses the correct numeric values,

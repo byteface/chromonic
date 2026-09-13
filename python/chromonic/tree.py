@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import functools
 import re
+import math
 
 import skia
 
@@ -119,9 +120,16 @@ class _InlineFormattingPlan:
             width = sum(run["intrinsic_width"] for run in self.runs)
         base_height = _resolved_line_height(self.parent_style["line_height"])
         base_font = _fontmetrics.parse_length(self.parent_style["font_size"], default=16.0)
-        base_height = base_height or float(round(base_font * 1.15))
+        base_ascent, base_descent, normal = fonts.text_metrics(
+            self.parent_style["font_family"], base_font,
+            _parse_font_weight(self.parent_style["font_weight"]) >= 600,
+            fonts.is_italic(self.parent_style["font_style"]))
+        base_height = base_height or normal
+        base_above = base_ascent + math.floor((base_height - base_ascent - base_descent) / 2)
+        base_below = base_height - base_above
         x = y = 0.0
-        line_height = base_height
+        above, below = base_above, base_below
+        self._line_baselines = {}
         placed = []
         for run_index, run in enumerate(self.runs):
             tokens = run["tokens"]
@@ -140,15 +148,18 @@ class _InlineFormattingPlan:
                                 following_space = later["tokens"][0][1]
                             break
                 if x and x + fit_total + following_space > width and text.strip():
-                    y += line_height
+                    self._line_baselines[y] = above
+                    y += above + below
                     x = 0.0
-                    line_height = base_height
+                    above, below = base_above, base_below
                 token_height = run["box_height"]
-                line_height = max(line_height, token_height)
+                above = max(above, run["above"])
+                below = max(below, run["below"])
                 placed.append((run, text, x + leading, y, token_width, token_height,
                                leading, trailing, advance_width))
                 x += total
-        self.height = y + line_height if placed else 0.0
+        self._line_baselines[y] = above
+        self.height = y + above + below if placed else 0.0
         self._placed = placed
         return (min(width, max((px + advance for _r, _t, px, _y, _pw, _h, _l, _tr, advance in placed), default=0.0)),
                 self.height)
@@ -168,10 +179,7 @@ class _InlineFormattingPlan:
             visual_advance = max(0.0, advance - collapsed_space)
             font_size = run["font_size"]
             glyph_height = min(token_height, run["glyph_height"])
-            glyph_y = y + max(0.0, (max(
-                _resolved_line_height(self.parent_style["line_height"]) or token_height,
-                token_height,
-            ) - glyph_height) / 2.0)
+            glyph_y = y + self._line_baselines[y] - run["ascent"]
             key = (id(run["source"]), y)
             entry = grouped.get(key)
             if entry is None:
@@ -198,7 +206,7 @@ class _InlineFormattingPlan:
                     client_width=combined_width, client_height=old.client_height,
                 )
             owner = run["owner"]
-            owner_y = origin_y + (y if run["atomic_width"] else glyph_y)
+            owner_y = origin_y + (y if run["atomic_width"] else glyph_y - run["top_edge"])
             rect = (origin_x + x - leading, owner_y,
                     visual_advance + leading + trailing, token_height)
             owner_rects.setdefault(owner, []).append(rect)
@@ -281,6 +289,7 @@ def _extract_paint_style(computed) -> dict:
         "letter_spacing": computed.letterSpacing,
         "word_spacing": computed.wordSpacing,
         "line_height": computed.lineHeight,
+        "white_space": computed.whiteSpace,
     }
 
 
@@ -349,6 +358,12 @@ def _describe(element, computed_cache=None, *, reuse_styles=False):
     style_obj = LayoutStyle._from_computed(computed)
     element._chromonic_computed_style = computed
     element._chromonic_paint_style = _extract_paint_style(computed)
+    from . import webfonts
+    webfonts.resolve_style(element, element._chromonic_paint_style)
+    # Give Parley and Skia the same platform choice for CSS monospace.
+    family = element._chromonic_paint_style["font_family"]
+    if family and family.strip().lower() in ("monospace", "ui-monospace"):
+        element._chromonic_paint_style["font_family"] = fonts._GENERIC_FAMILIES[family.strip().lower()]
     result = (computed, style_obj)
     element._chromonic_resolved_style = result
     cache[id(element)] = result
@@ -386,7 +401,11 @@ def _own_text(element) -> str:
     # Mixed content (text alongside child *elements*) is out of this POC's
     # scope -- an element with any child element is a Taffy branch, full
     # stop; only a childless element's own text is ever measured.
-    return " ".join((element.textContent or "").split())
+    text = element.textContent or ""
+    style = element.__dict__.get("_chromonic_paint_style", {})
+    if style.get("white_space") in ("pre", "pre-wrap", "break-spaces"):
+        return text
+    return " ".join(text.split())
 
 
 def _collapsed_text_node(node) -> str:
@@ -459,6 +478,9 @@ def _numeric_edge(value) -> float:
 
 def _make_inline_formatting_plan(element, inline_items, style):
     """Build styled text runs for a shared inline formatting context."""
+    if any(kind == "element" and _is_absolutely_positioned(child_style)
+           for kind, _item, _text, _computed, child_style in inline_items):
+        return None
     runs = []
     for kind, item, collapsed, child_computed, child_style in inline_items:
         if kind == "text":
@@ -495,10 +517,11 @@ def _make_inline_formatting_plan(element, inline_items, style):
         family = "" if paint_style["font_family"] == "none" else paint_style["font_family"]
         weight = _parse_font_weight(paint_style["font_weight"])
         italic = fonts.is_italic(paint_style["font_style"])
-        skia_font = skia.Font(fonts.resolve_typeface(
-            family, bold=weight >= 600, italic=italic
-        ), font_size)
-        metric_height = skia_font.getMetrics().fDescent - skia_font.getMetrics().fAscent
+        ascent, descent, normal_height = fonts.text_metrics(family, font_size, weight >= 600, italic)
+        glyph_height = ascent + descent
+        used_line_height = _resolved_line_height(paint_style["line_height"]) or normal_height
+        above = ascent + math.floor((used_line_height - glyph_height) / 2)
+        below = used_line_height - above
         nowrap = bool(kind == "element" and child_computed.whiteSpace == "nowrap")
         token_texts = [text] if nowrap else re.findall(r"\S+\s*|\s+", text)
         one_width = layout_text("a", family, font_size, font_weight=weight, italic=italic)[0]
@@ -507,17 +530,17 @@ def _make_inline_formatting_plan(element, inline_items, style):
         tokens = []
         for token in token_texts:
             measured, _height, _lines = layout_text(
-                token.strip(), family, font_size, font_weight=weight, italic=italic,
+                token, family, font_size, font_weight=weight, italic=italic,
                 letter_spacing=_fontmetrics.parse_length(paint_style["letter_spacing"], default=0.0),
                 word_spacing=_fontmetrics.parse_length(paint_style["word_spacing"], default=0.0),
             )
-            measured += (len(token) - len(token.strip())) * space_width
+            measured = sum(line[1] for line in _lines)
             tokens.append((token, measured))
         leading = trailing = 0.0
-        box_height = (float(round(metric_height))
-                      if family.lower().startswith(("menlo", "monospace")) or font_size >= 20
-                      else float(int(metric_height)))
+        box_height = glyph_height
+        top_edge = 0.0
         if native is not None:
+            top_edge = _numeric_edge(native["padding"][0]) + _numeric_edge(native["border"][0])
             leading = _numeric_edge(native["padding"][3]) + _numeric_edge(native["border"][3])
             trailing = _numeric_edge(native["padding"][1]) + _numeric_edge(native["border"][1])
             box_height += (_numeric_edge(native["padding"][0]) + _numeric_edge(native["padding"][2])
@@ -530,15 +553,36 @@ def _make_inline_formatting_plan(element, inline_items, style):
             "source": source, "owner": owner, "paint_style": paint_style,
             "font_size": font_size, "tokens": tokens, "leading": leading,
             "trailing": trailing, "box_height": box_height,
-            "glyph_height": (float(round(metric_height))
-                             if family.lower().startswith(("menlo", "monospace")) or font_size >= 20
-                             else float(int(metric_height))),
+            "glyph_height": glyph_height, "ascent": ascent,
+            "above": above, "below": below, "top_edge": top_edge,
             "space_width": space_width,
             "atomic_width": atomic_width,
             "intrinsic_width": leading + max(
                 atomic_width, sum(width for _text, width in tokens)
             ) + trailing,
         })
+    # DOM boundaries with identical shaping properties are not kerning
+    # boundaries. Preserve the pair adjustment across adjacent text owners.
+    shaping_keys = ("font_family", "font_size", "font_weight", "font_style",
+                    "letter_spacing", "word_spacing")
+    for left, right in zip(runs, runs[1:]):
+        if left["trailing"] or right["leading"] or left["atomic_width"] or right["atomic_width"]:
+            continue
+        if any(left["paint_style"][key] != right["paint_style"][key] for key in shaping_keys):
+            continue
+        ls = left["paint_style"]
+        a = ''.join(token for token, _width in left["tokens"])
+        b = ''.join(token for token, _width in right["tokens"])
+        def advance(value):
+            return sum(line[1] for line in layout_text(
+                value, ls["font_family"], left["font_size"],
+                font_weight=_parse_font_weight(ls["font_weight"]), italic=fonts.is_italic(ls["font_style"]),
+                letter_spacing=_fontmetrics.parse_length(ls["letter_spacing"], default=0.0),
+                word_spacing=_fontmetrics.parse_length(ls["word_spacing"], default=0.0))[2])
+        adjustment = advance(a + b) - advance(a) - advance(b)
+        token, old_width = left["tokens"][-1]
+        left["tokens"][-1] = (token, old_width + adjustment)
+        left["intrinsic_width"] += adjustment
     return _InlineFormattingPlan(element, runs, element._chromonic_paint_style) if runs else None
 
 
@@ -635,11 +679,13 @@ def _make_measure(paint_style: dict, text: str, element):
     letter_spacing = _fontmetrics.parse_length(paint_style["letter_spacing"], default=0.0)
     word_spacing = _fontmetrics.parse_length(paint_style["word_spacing"], default=0.0)
     line_height = _resolved_line_height(paint_style["line_height"])
+    ascent, descent, normal_height = fonts.text_metrics(font_family, font_size, font_weight >= 600, italic)
 
     def measure(available_width, available_height):
         width, height, lines = layout_text(
             text, font_family, font_size,
-            font_weight=font_weight, italic=italic, max_width=available_width,
+            font_weight=font_weight, italic=italic,
+            max_width=None if paint_style.get("white_space") in ("pre", "nowrap") else available_width,
             letter_spacing=letter_spacing, word_spacing=word_spacing, line_height=line_height,
         )
         if line_height is None and lines:
@@ -648,11 +694,6 @@ def _make_measure(paint_style: dict, text: str, element):
             # Parley's raw font metrics retain fractional ascender/descent
             # values. Keep glyph widths subpixel-precise, but normalize the
             # implicit `normal` line box before it accumulates down a page.
-            if ("-apple-system" in font_family or "Segoe UI" in font_family
-                    or font_family.strip().lower().startswith("times")):
-                normal_height = float(round(font_size * 1.15))
-            else:
-                normal_height = float(round(lines[0][2]))
             lines = [(line_text, line_width, normal_height)
                      for line_text, line_width, _height in lines]
             height = normal_height * len(lines)
@@ -1016,14 +1057,20 @@ def build(
                    if inline_items else None)
 
     if inline_plan is not None:
-        element._chromonic_inline_plan = inline_plan
         element._chromonic_has_layout_children = True
         if style["display"] == "block" and style["width"] == "auto":
             style["width"] = ("pct", 1.0)
-        measure_key = ("inline-context", tuple(
-            (run["source"].textContent, run["font_size"], run["intrinsic_width"])
+        measure_key = ("inline-context", tuple(element._chromonic_paint_style.items()), tuple(
+            (id(run["source"]), id(run["owner"]), tuple(run["paint_style"].items()),
+             tuple(run["tokens"]), run["above"], run["below"], run["box_height"],
+             run["leading"], run["trailing"], run["top_edge"], run["atomic_width"])
             for run in inline_plan.runs
         ))
+        if projection is not None and not projection.measure_changed(element, measure_key):
+            # Taffy retains the callback bound to the existing plan. Publish
+            # that plan's placements too, including when cached layout is used.
+            inline_plan = element._chromonic_inline_plan
+        element._chromonic_inline_plan = inline_plan
         measure = (inline_plan.measure
                    if projection is None or projection.measure_changed(element, measure_key) else None)
         node_id = (projection.upsert(element, style, [], measure, measure_key)
@@ -1171,7 +1218,7 @@ def _measure_key(paint_style: dict, text: str) -> tuple:
         text, paint_style["font_family"], paint_style["font_size"],
         paint_style["font_weight"], paint_style["font_style"],
         paint_style["letter_spacing"], paint_style["word_spacing"],
-        paint_style["line_height"],
+        paint_style["line_height"], paint_style.get("white_space", "normal"),
     )
 
 
@@ -1291,6 +1338,9 @@ class LayoutProjection:
         parameter here means -- this is the same operation, just against a
         retained projection that reuses native nodes by element identity
         instead of rebuilding the whole Taffy tree from scratch."""
+        from . import webfonts
+        if webfonts.prepare_layout(root_element):
+            reuse_styles = False
         self.begin()
         with style_bridge.viewport(width, viewport_height if viewport_height is not None else height):
             root_id = build(
@@ -1662,6 +1712,9 @@ def layout(root_element, *, width: float, height: "float | None" = None, reuse_s
     only matters once a page's document can grow taller than what's
     actually visible.
     """
+    from . import webfonts
+    if webfonts.prepare_layout(root_element):
+        reuse_styles = False
     tree = Tree()
     node_map: dict[int, object] = {}
     with style_bridge.viewport(width, viewport_height if viewport_height is not None else height):

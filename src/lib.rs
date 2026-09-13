@@ -477,6 +477,29 @@ fn to_py_err(err: TaffyError) -> PyErr {
 }
 
 // -- Parley: real text layout ------------------------------------------------
+
+/// Register an in-memory web font in this thread's layout context. The private
+/// family alias also identifies the identical bytes in the Skia registry.
+#[pyfunction]
+#[pyo3(signature = (data, family, weight=400.0, italic=false))]
+fn register_font(data: Vec<u8>, family: &str, weight: f32, italic: bool) -> PyResult<()> {
+    TEXT_FONT_CX.with(|cell| {
+        let mut cx = cell.borrow_mut();
+        let fonts = cx.collection.register_fonts(
+            parley::fontique::Blob::new(std::sync::Arc::new(data)),
+            Some(parley::fontique::FontInfoOverride {
+                family_name: Some(family),
+                weight: Some(ParleyFontWeight::new(weight)),
+                style: Some(if italic { ParleyFontStyle::Italic } else { ParleyFontStyle::Normal }),
+                ..Default::default()
+            }),
+        );
+        if fonts.is_empty() {
+            return Err(PyValueError::new_err("invalid web font"));
+        }
+        Ok(())
+    })
+}
 //
 // `FontContext` (a font database) and `LayoutContext` (scratch space) are
 // meant to be constructed rarely and reused -- Parley's own docs say
@@ -564,5 +587,6 @@ fn layout_text(
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Tree>()?;
     m.add_function(wrap_pyfunction!(layout_text, m)?)?;
+    m.add_function(wrap_pyfunction!(register_font, m)?)?;
     Ok(())
 }

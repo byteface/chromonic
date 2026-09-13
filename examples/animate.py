@@ -3,15 +3,11 @@
 Seven bars in a flex row, each height following its own phase-shifted sine
 wave -- a real-time equalizer, entirely from Python mutating
 `element.style.height` ~30 times a second and chromonic relaying it through
-Taffy (relayout) and Skia (repaint) every time. No pywebview thread, no
-Rust-side timer -- see `window.py`'s `run(on_tick=...)`: the hosted page
-itself is the clock, calling back into Python on the same bridge a click
-already uses, self-paced (each tick scheduled only once the previous one
-resolves, see `window._TICK_LOOP_JS`) rather than fired on a bare timer.
+Taffy (relayout) and Skia (repaint) every time.
 
 Needs a real display -- run it by hand:
 
-    .venv/bin/pip install 'chromonic[window]'
+    make develop
     .venv/bin/python chromonic/examples/animate.py
 """
 

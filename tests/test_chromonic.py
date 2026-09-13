@@ -7,6 +7,9 @@ path -- run these with `maturin develop` done first):
     maturin develop && .venv/bin/python -m pytest tests/
 """
 
+import subprocess
+import sys
+
 import pytest
 
 pytest.importorskip("chromonic._native", reason="chromonic's Rust extension isn't built -- run `maturin develop` in chromonic/")
@@ -69,12 +72,15 @@ def test_style_bridge_resolves_viewport_units_for_current_layout():
     assert style["padding"] == [16.0] * 4
 
 
-def test_chromonic_bootstrap_uses_the_domonic_compatibility_snapshot():
-    sources = chromonic._domonic_vendor.active_sources()
-    assert sources["domonic.dom"].endswith("chromonic/_vendor/domonic/dom.py")
-    assert sources["domonic.style"].endswith("chromonic/_vendor/domonic/style.py")
-    assert sources["domonic._cssom"].endswith("chromonic/_vendor/domonic/_cssom.py")
-    assert sources["domonic.layout"].endswith("chromonic/_vendor/domonic/layout.py")
+def test_chromonic_uses_released_domonic_package():
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import chromonic, domonic, pathlib; "
+         "assert tuple(map(int, domonic.__version__.split('.')[:3])) >= (1, 8, 1); "
+         "assert '_vendor/domonic' not in pathlib.Path(domonic.__file__).as_posix()"],
+        check=True, capture_output=True, text=True,
+    )
+    assert result.returncode == 0
 
 
 def test_content_box_size_includes_padding_and_border_in_layout_geometry():
@@ -149,11 +155,7 @@ def test_render_produces_a_png():
 
 # -- phase 2: interactivity (chromonic.window.Interaction) -----------------
 
-def test_chromonic_window_does_not_import_pywebview_until_run_is_called():
-    # `import chromonic` must not require pywebview -- only actually calling
-    # `window.run(...)` should. Checked in a fresh subprocess so an
-    # already-imported `webview` elsewhere in this test session can't hide
-    # a real eager import.
+def test_chromonic_window_does_not_import_webview():
     import subprocess
     import sys
 
@@ -383,7 +385,7 @@ def test_browser_interaction_fragment_links_do_not_navigate():
         srv.shutdown()
 
 
-def test_browser_module_does_not_import_pywebview_or_myjs_until_used():
+def test_browser_module_does_not_import_webview_or_myjs_until_used():
     import subprocess
     import sys
 
@@ -603,25 +605,7 @@ def test_particles_example_set_count_rebuilds_the_stage():
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_tick_clock_is_self_pacing_not_a_bare_setinterval():
-    # a real hang, not just a slow one: a bare `setInterval` fires the next
-    # `tick()` on a fixed timer whether or not the previous call (a
-    # synchronous round-trip into Python) has returned yet, so a scene slow
-    # enough queues up an unbounded backlog and eventually locks the whole
-    # window up. The clock must instead wait for one call to resolve before
-    # scheduling the next.
-    from chromonic.window import _TICK_LOOP_JS
-
-    js = _TICK_LOOP_JS.format(interval_ms=16)
-    assert "window.pywebview.api.tick()" in js
-    assert ".finally(" in js  # only schedules the next tick once this one resolves
-    assert "setTimeout(loop" in js
-    assert "setInterval(" not in js
-
-
-def test_particles_example_reuses_the_self_pacing_tick_clock():
-    # regression guard: examples/particles.py used to build its own bare
-    # `setInterval(...)` string instead of sharing window.py's fix.
+def test_particles_example_uses_native_particle_runner():
     import inspect
     import sys
     from pathlib import Path
@@ -630,8 +614,8 @@ def test_particles_example_reuses_the_self_pacing_tick_clock():
     import particles
 
     source = inspect.getsource(particles.run)
-    assert "window._TICK_LOOP_JS" in source
-    assert "setInterval(" not in source
+    assert "particles2" in source
+    assert "webview" not in source
 
 
 def test_animate_example_produces_visibly_different_frames_over_time():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,10 @@ from .schema import RECT_FIELDS, STYLE_PROPERTIES, write_json
 
 
 def compare_results(chrome: dict, ours: dict, *, tolerance: float = 0.5) -> dict:
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("tolerance must be finite and non-negative")
+    if chrome.get("viewport") != ours.get("viewport"):
+        raise ValueError("cannot compare captures with different viewports")
     mismatches = []
     chrome_elements = chrome.get("elements", {})
     our_elements = ours.get("elements", {})
@@ -28,7 +33,7 @@ def compare_results(chrome: dict, ours: dict, *, tolerance: float = 0.5) -> dict
             expected = float(reference["rect"][field])
             got = float(actual["rect"][field])
             delta = got - expected
-            if abs(delta) > tolerance:
+            if not math.isfinite(expected) or not math.isfinite(got) or abs(delta) > tolerance:
                 mismatches.append({
                     "element": element_id, "field": field,
                     "chrome": expected, "ours": got, "delta": delta,
@@ -57,7 +62,7 @@ def compare_results(chrome: dict, ours: dict, *, tolerance: float = 0.5) -> dict
                     expected = float(expected_fragment[field])
                     got = float(actual_fragment[field])
                     delta = got - expected
-                    if abs(delta) > tolerance:
+                    if not math.isfinite(expected) or not math.isfinite(got) or abs(delta) > tolerance:
                         mismatches.append({
                             "element": element_id, "field": f"{fragment_type}[{index}].{field}",
                             "chrome": expected, "ours": got, "delta": delta, "kind": "fragment",
@@ -119,9 +124,14 @@ def write_image_diff(chrome_path: Path, ours_path: Path, output_path: Path, over
 
     left = decode(chrome_path)
     right = decode(ours_path)
+    if left.shape != right.shape:
+        raise ValueError(f"screenshot dimensions differ: {left.shape} != {right.shape}")
     height, width = min(left.shape[0], right.shape[0]), min(left.shape[1], right.shape[1])
     difference = np.abs(left[:height, :width].astype(np.int16) - right[:height, :width].astype(np.int16))
     difference = np.clip(difference * 4, 0, 255).astype(np.uint8)
+    # Equal opaque source alphas subtract to zero; the diagnostic itself must
+    # remain opaque or all RGB differences disappear in an image viewer.
+    difference[:, :, 3] = 255
     image = skia.Image.fromarray(difference)
     output_path.write_bytes(bytes(image.encodeToData()))
     overlay = ((left[:height, :width].astype(np.float32) + right[:height, :width].astype(np.float32)) / 2).astype(np.uint8)

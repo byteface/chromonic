@@ -1,11 +1,4 @@
-"""chromonic phase 2: a real, interactive window. See ../PLAN.md and
-python/chromonic/window.py for how the click -> hit-test -> real DOM event ->
-relayout -> repaint loop works.
-
-Needs a real display -- run it by hand, not from an automated check:
-
-    .venv/bin/pip install 'chromonic[window]'   # adds pywebview
-    .venv/bin/python chromonic/examples/live.py
+"""chromonic
 
 Click the button. Its background colour and the counter above it are both
 ordinary domonic DOM state, mutated by an ordinary `addEventListener`

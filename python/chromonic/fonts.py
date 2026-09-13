@@ -1,30 +1,17 @@
-"""Font resolution for chromonic's Skia painter -- given a CSS `font-family`
-list plus resolved `bold`/`italic` flags, pick one concrete `skia.Typeface`
-to actually paint text with. This is **paint-only**: `tree.py`'s text
-measurement still goes entirely through `domonic._fontmetrics`, which has
-exactly one advance-width table (public-domain Helvetica/Helvetica-Bold --
-see its own module docstring), with no notion of `font-family` at all. That
-means a `<p style="font-family: 'Courier New', monospace">` will now
-*paint* in a real monospace font but its box was still *sized* as if it
-were Helvetica -- text can visibly overflow its own box for a font whose
-average character width differs enough from Helvetica's (monospace and
-some serif faces are the most likely to show it; ordinary sans-serif body
-text rarely does, since that's what the metrics table already approximates).
-Fixing that for real needs an actual per-font metrics/shaping engine --
-real, separate work, not attempted here; this module closes the more
-visible half of the gap (what a page's chosen font *looks* like) rather
-than the deeper one (exactly how much space it should measure as needing).
-
-`font-style: italic`/`oblique` has no equivalent width concern -- this POC
-doesn't model per-style advance widths at all (italic and upright variants
-of the same typeface are close enough in width that the Helvetica table
-already in use is the same approximation either way), so italic is applied
-freely here with no measurement-side caveat.
+"""
+tree.py uses Parley/fontique for text shaping and layout.
+This module independently resolves Skia typefaces for painting.
+Downloaded @font-face resources are registered from identical bytes with
+Parley/fontique and Skia. Document-private aliases resolve before installed
+fonts, then generic/platform fallbacks. No fonts are installed into the OS.
 """
 
 from __future__ import annotations
 
 import skia
+import math
+import sys
+from functools import lru_cache
 
 # CSS generic family keywords -> one concrete name Skia's platform font
 # manager can actually resolve. Skia's own fuzzy matching (see
@@ -37,13 +24,13 @@ import skia
 _GENERIC_FAMILIES = {
     "serif": "Times New Roman",
     "sans-serif": None,
-    "monospace": "Courier New",
+    "monospace": "Menlo" if sys.platform == "darwin" else "Courier New",
     "cursive": "Comic Sans MS",
     "fantasy": "Papyrus",
     "system-ui": None,
     "ui-serif": "Times New Roman",
     "ui-sans-serif": None,
-    "ui-monospace": "Courier New",
+    "ui-monospace": "Menlo" if sys.platform == "darwin" else "Courier New",
     # Browser-internal "use the OS UI font" keywords, not real family names
     # -- no font manager lists a family literally called "-apple-system", so
     # without this they'd always fail `_is_installed` and fall through
@@ -63,6 +50,7 @@ _GENERIC_FAMILIES = {
 # caching exactly like `paint.py`'s own `_FONT_CACHE` already caches
 # `skia.Font` objects built from these typefaces.
 _typeface_cache: "dict[tuple, skia.Typeface]" = {}
+_web_typefaces: "dict[str, skia.Typeface]" = {}
 
 # Shared `FontMgr` for `_is_installed()` -- constructing one isn't free, and
 # it's stateless (queries the platform's installed fonts), so one instance
@@ -100,6 +88,23 @@ def parse_family_list(value: "str | None") -> list:
 
 def is_italic(font_style: "str | None") -> bool:
     return isinstance(font_style, str) and font_style.strip().lower() in ("italic", "oblique")
+
+
+@lru_cache(maxsize=512)
+def text_metrics(family, size, bold=False, italic=False):
+    """CSS ascent, descent and normal line height, in CSS pixels.
+
+    Round font metrics separately, as Blink does, rather than rounding their
+    sum. The macOS legacy-font adjustment matches Blink's FontMetrics::
+    AscentDescentWithHacks (also used by Safari); it is not fixture-specific.
+    """
+    face = resolve_typeface(family, bold=bold, italic=italic)
+    metrics = skia.Font(face, size).getMetrics()
+    ascent = math.floor(-metrics.fAscent + 0.5)
+    descent = math.floor(metrics.fDescent + 0.5)
+    if sys.platform == 'darwin' and face.getFamilyName() in ('Times', 'Helvetica', 'Courier'):
+        ascent += math.floor((ascent + descent) * 0.15 + 0.5)
+    return float(ascent), float(descent), float(ascent + descent + math.floor(metrics.fLeading + 0.5))
 
 
 def warm_cache() -> None:
@@ -143,6 +148,9 @@ def resolve_typeface(family_value: "str | None", *, bold: bool = False, italic: 
     other candidate, not assumed to exist."""
     name = None  # nothing resolves -> the platform default, same as an empty/unset font-family
     for candidate in parse_family_list(family_value):
+        web = _web_typefaces.get(candidate.lower())
+        if web is not None:
+            return web
         mapped = _GENERIC_FAMILIES.get(candidate.lower(), candidate)
         if mapped is None or _is_installed(mapped):
             name = mapped

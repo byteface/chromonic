@@ -5,26 +5,17 @@ build-backend = "maturin"
 [project]
 name = "chromonic"
 version = "0.0.1"
-description = "Experimental POC: domonic DOM/CSSOM + Taffy layout (Rust/PyO3) + Skia painting"
+description = "Experimental POC: domonic DOM/CSSOM backed browser"
 requires-python = ">=3.10"
 dependencies = [
-    "domonic>=1.8.0",
+    "domonic>=1.8.1",
+    "fonttools[woff]>=4.0",
+    "glfw>=2.7",
+    "myjs",
+    "PyOpenGL>=3.1",
+    "pytest>=8.0",
     "skia-python>=87.0",
 ]
-
-[project.optional-dependencies]
-# `chromonic.window.run(...)` -- a real interactive window (phase 2). pywebview
-# hosts the window as a plain image + click-coordinate bridge only; it never
-# renders the page itself (Skia does that, same as the static PNG path).
-window = ["pywebview>=5.0"]
-# `chromonic.browser.run(url)` -- a simple navigable browser window. `myjs`
-# supplies fetch + parse + external-stylesheet application (`Page.load`,
-# already tested elsewhere in this repo); pulls in `pywebview` too, since a
-# browser with no window isn't useful.
-browse = ["pywebview>=5.0", "myjs"]
-# Direct Skia/OpenGL presentation, without pywebview or encoded images.
-native = ["glfw>=2.7", "PyOpenGL>=3.1", "myjs"]
-dev = ["pytest>=8.0", "myjs"]
 
 [tool.maturin]
 # The compiled extension lands at chromonic/_native.*.so; python/chromonic/ is the

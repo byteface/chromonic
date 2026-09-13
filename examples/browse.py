@@ -5,7 +5,7 @@ real-world pages -- not a general-purpose browser.
 
 Needs a real display -- run it by hand:
 
-    .venv/bin/pip install 'chromonic[browse]'
+    make develop
     .venv/bin/python chromonic/examples/browse.py [url]
 
 Defaults to example.com if no URL is given.

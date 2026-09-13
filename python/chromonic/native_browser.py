@@ -115,8 +115,7 @@ class View:
         if self.page is not None:
             # The CSS viewport remains window-sized even though the document
             # is allowed to grow vertically and is clipped/scrolled at paint.
-            self.page.session.window._own['innerWidth'] = self.width
-            self.page.session.window._own['innerHeight'] = self.viewport_height
+            browser.set_viewport(self.page, self.width, self.viewport_height)
             doc = self.page.document
             # domonic indexes media rules on the document; resize changes which
             # rules can apply and must not reuse the old viewport's index.
@@ -164,6 +163,11 @@ class View:
         needs to redo layout math + the arrived image's own intrinsic
         size (`_apply_image_intrinsic_size` already handles that
         independently of the CSS cache)."""
+        from . import webfonts
+        if self.page is not None:
+            reg = webfonts.registry(self.page.document.body)
+            if reg is not None and reg.poll():
+                self.relayout()
         current = browser_images.generation()
         if current == self._image_generation:
             return
@@ -444,7 +448,9 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
                 renderer.draw(view, glfw.get_framebuffer_size(win))
                 glfw.swap_buffers(win)
                 drawn += 1
-                if frames is not None and drawn >= frames and navigation.pending is None:
+                from . import webfonts
+                reg = webfonts.registry(view.page.document.body) if view.page is not None else None
+                if frames is not None and drawn >= frames and navigation.pending is None and not (reg and reg.pending()):
                     break
             eager = navigation.pending is not None or frames is not None or browser_images.has_pending()
             glfw.wait_events_timeout(.02 if eager else .25)

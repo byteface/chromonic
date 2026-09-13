@@ -1,9 +1,10 @@
 """Direct browser controller tests; GPU/display smoke test is separate."""
 import skia
 import pytest
+from types import SimpleNamespace
 
 from myjs import Page
-from chromonic import paint, tree
+from chromonic import browser, paint, tree
 from chromonic.native_browser import TOOLBAR, View
 from chromonic import ua_style
 
@@ -24,6 +25,21 @@ def test_resize_reflows_document_and_updates_viewport():
     assert el.get_layout_box().width == 500
     assert view.page.session.window._own['innerWidth'] == 500
     assert view.page.session.window._own['innerHeight'] == 400 - TOOLBAR
+
+
+def test_set_viewport_updates_domonic_attached_window_without_myjs_own_dict():
+    class Window:
+        def resizeTo(self, width, height):
+            self.innerWidth = width
+            self.innerHeight = height
+
+    window = Window()
+    page = SimpleNamespace(session=SimpleNamespace(window=window), document=SimpleNamespace(defaultView=window))
+
+    browser.set_viewport(page, 640, 480)
+
+    assert window.innerWidth == 640
+    assert window.innerHeight == 480
 
 
 def test_ua_form_controls_keep_intrinsic_sizes_in_one_inline_run():

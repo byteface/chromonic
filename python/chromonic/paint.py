@@ -73,9 +73,7 @@ _FONT_CACHE: "dict[tuple, skia.Font]" = {}
 def _font(size_px: float, *, bold: bool = False, italic: bool = False, family: "str | None" = None) -> skia.Font:
     """A cached `skia.Font` for this exact (size, weight, style, family)
     combination -- see `fonts.py` for how `family` resolves to a typeface,
-    and its module docstring for what this does and doesn't fix (paint-only;
-    `tree.py`'s measurement still assumes a fixed Helvetica-shaped table
-    regardless of `family`)."""
+    with downloaded fonts shared with Parley/fontique text layout."""
     size_px = round(size_px)
     key = (size_px, bold, italic, family)
     font = _FONT_CACHE.get(key)

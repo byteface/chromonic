@@ -1,6 +1,6 @@
 """chromonic phase 8: a UA stylesheet (`ua_style.py`) and real `<img>` loading
-(`browser_images.py`) -- both wired into `chromonic.browser.load()`, so both
-`browse.py` (webview) and `browse2.py` (direct GPU) get them automatically.
+(`browser_images.py`) -- both wired into `chromonic.browser.load()`, so the
+native browser gets them automatically.
 
 Serves a tiny page (a heading, a paragraph, a list, two images) from a local
 HTTP server -- no live network needed to run this -- fetches it through the

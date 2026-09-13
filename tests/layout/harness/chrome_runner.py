@@ -38,7 +38,11 @@ def _instrument(source: str, fixture_name: str) -> str:
     properties = json.dumps(STYLE_PROPERTIES)
     rect_fields = json.dumps(RECT_FIELDS)
     script = f"""<script>
-(() => {{
+(async () => {{
+  if (document.readyState !== 'complete') {{
+    await new Promise(resolve => window.addEventListener('load', resolve, {{once: true}}));
+  }}
+  await document.fonts.ready;
   const properties = {properties};
   const rectFields = {rect_fields};
   const elements = {{}};
@@ -91,12 +95,25 @@ def run(fixture: Path, output: Path, screenshot: Path, *, chrome=None, viewport=
         ]
     with tempfile.TemporaryDirectory(prefix="chromonic-layout-") as temporary:
         instrumented = Path(temporary) / fixture.name
-        instrumented.write_text(_instrument(fixture.read_text(), fixture.name))
+        source = fixture.read_text()
+        # The probe lives in a temporary directory; retain resource resolution
+        # against the fixture, including an authored relative <base href>.
+        base = f'<base href="{html.escape(fixture.resolve().as_uri(), quote=True)}">'
+        existing_base = re.search(r'<base\b[^>]*href=["\'](.*?)["\'][^>]*>', source, re.I)
+        if existing_base:
+            import urllib.parse
+            base = f'<base href="{html.escape(urllib.parse.urljoin(fixture.resolve().as_uri(), existing_base.group(1)), quote=True)}">'
+        insertion = (re.search(r"<head\b[^>]*>", source, re.I)
+                     or re.search(r"<html\b[^>]*>", source, re.I)
+                     or re.search(r"<!doctype\b[^>]*>", source, re.I))
+        index = insertion.end() if insertion else 0
+        source = source[:index] + base + source[index:]
+        instrumented.write_text(_instrument(source, fixture.name))
         window_height = viewport[1] + _WINDOW_HEIGHT_ADJUSTMENT
         for _attempt in range(2):
             dumped = subprocess.run(
                 [*command(window_height), "--dump-dom", instrumented.resolve().as_uri()],
-                check=True, capture_output=True, text=True,
+                check=True, capture_output=True, text=True, timeout=30,
             ).stdout
             match = _RESULT_RE.search(dumped)
             if not match:
@@ -113,7 +130,7 @@ def run(fixture: Path, output: Path, screenshot: Path, *, chrome=None, viewport=
     # headless mode when device scale is forced to one.
     subprocess.run(
         [*command(window_height), f"--screenshot={screenshot.resolve()}", fixture.resolve().as_uri()],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, timeout=30,
     )
     image = skia.Image.MakeFromEncoded(screenshot.read_bytes())
     if image is None or image.width() < viewport[0] or image.height() < viewport[1]:

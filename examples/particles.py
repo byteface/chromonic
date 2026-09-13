@@ -3,9 +3,9 @@ change N, and a real (measured, not requested) frames-per-second readout --
 a way to actually *see* how many absolutely-positioned boxes chromonic can push
 through a full Taffy relayout + Skia repaint every animation frame before
 the frame rate visibly drops. No new architecture: `tree.py`/`paint.py`/
-`window.py` are exactly what phase 3's equalizer used -- this is that same
-click-free "clock drives on_tick" loop, at a scale meant to be pushed until
-it hurts.
+`window.py` first exercised -- now presented through the same native
+GLFW/Skia path as `particles2.py`, at a scale meant to be pushed until it
+hurts.
 
 Each particle is a `position:absolute` div inside a `position:relative`
 stage, moved every tick by rewriting its own `style.top`/`style.left` --
@@ -16,24 +16,23 @@ only ever needed normal flow (block/flex/grid) layout, where nothing reads
 
 Needs a real display -- run it by hand:
 
-    .venv/bin/pip install 'chromonic[window]'
+    make develop
     .venv/bin/python chromonic/examples/particles.py [initial_count]
 """
 
 from __future__ import annotations
 
-import base64
+import argparse
 import math
 import random
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from domonic.html import div  # noqa: E402
 
-from chromonic import tree, window  # noqa: E402
+from chromonic import tree  # noqa: E402
 from chromonic.window import Interaction  # noqa: E402
 
 WIDTH = 800
@@ -131,105 +130,22 @@ class ParticleInteraction(Interaction):
         tree.layout(self.root, width=self.width, height=self.height)
 
 
-_HTML = """<!doctype html>
-<html>
-<head>
-<style>
-  html, body {{ margin: 0; padding: 0; background: #0f1115; font-family: -apple-system, system-ui, sans-serif; color: #e2e8f0; }}
-  #toolbar {{ display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: #1a202c; box-sizing: border-box; }}
-  #toolbar label {{ font-size: 13px; white-space: nowrap; }}
-  #count-slider {{ flex: 1; }}
-  #count, #fps {{ font-variant-numeric: tabular-nums; min-width: 70px; font-size: 13px; }}
-  img {{ display: block; }}
-</style>
-</head>
-<body>
-  <div id="toolbar">
-    <label for="count-slider">Particles</label>
-    <input id="count-slider" type="range" min="0" max="3000" step="10" value="{initial_count}" />
-    <span id="count">{initial_count}</span>
-    <span id="fps">-- fps</span>
-  </div>
-  <img id="frame" src="" alt="chromonic particles" />
-  <script>
-    var slider = document.getElementById('count-slider');
-    slider.addEventListener('input', function () {{
-      document.getElementById('count').textContent = slider.value;
-      window.pywebview.api.set_count(parseInt(slider.value, 10));
-    }});
-  </script>
-</body>
-</html>"""
-
-
-class _Api(window._Api):
-    """As `window._Api`, plus `set_count` (the slider's bridge call) and a
-    *measured* FPS pushed to the toolbar each frame -- the wall-clock time
-    between one `tick()` call and the next, not the rate the JS
-    `setInterval` merely *asked* for. Since pywebview's `js_api` call is a
-    synchronous round-trip from the page's perspective, a slow relayout+
-    repaint here delays the next tick just as it would in a real browser's
-    render loop -- so this number is an honest "what you're actually
-    getting", the whole reason this demo exists."""
-
-    def __init__(self, interaction: ParticleInteraction):
-        super().__init__(interaction)
-        self._last_tick: "float | None" = None
-
-    def set_count(self, count) -> None:
-        try:
-            count = max(0, min(int(count), 3000))
-        except (TypeError, ValueError):
-            return
-        self._interaction.set_count(count)
-        self._last_tick = None  # don't let a resize's own delay count as a slow frame
-        self.push_frame()
-
-    def tick(self) -> None:
-        now = time.perf_counter()
-        fps = 1.0 / (now - self._last_tick) if self._last_tick else None
-        self._last_tick = now
-        self._interaction.tick()
-        self.push_frame(fps=fps, relayout=False)
-
-    def push_frame(self, *, fps: "float | None" = None, relayout: bool = True) -> None:
-        if self._window is None:
-            return
-        png = self._interaction.render(relayout=relayout)
-        data_uri = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
-        script = f"document.getElementById('frame').src = {data_uri!r};"
-        if fps is not None:
-            script += f"document.getElementById('fps').textContent = {f'{fps:.0f} fps'!r};"
-        self._window.evaluate_js(script)
-
-
-def run(*, initial_count: int = 200, fps: float = 60.0) -> None:
+def run(*, initial_count: int = 200, fps: float = 60.0, frames=None) -> None:
     """Boot the particle demo in a real window. Needs a real display -- run
     this from a script, not from an automated check."""
-    import webview
+    from particles2 import run as run_native
 
-    interaction = ParticleInteraction(width=float(WIDTH), height=float(HEIGHT), count=initial_count)
-    api = _Api(interaction)
-    html = _HTML.format(initial_count=initial_count)
-    win = webview.create_window("chromonic -- particles", html=html, js_api=api, width=WIDTH, height=HEIGHT + 46)
-    api.attach(win)
-
-    def _on_loaded():
-        api.push_frame()
-        interval_ms = max(1, round(1000.0 / fps))
-        # `window._TICK_LOOP_JS`, not a bare `setInterval`: this demo is
-        # exactly the scene slow enough (a few hundred particles) to hit the
-        # unbounded-backlog hang a fixed timer causes -- see window.py's
-        # module docstring.
-        win.evaluate_js(window._TICK_LOOP_JS.format(interval_ms=interval_ms))
-
-    win.events.loaded += _on_loaded
-    webview.start()
+    run_native(initial_count, frames=frames)
 
 
 def main() -> int:
-    initial_count = int(sys.argv[1]) if len(sys.argv) > 1 else 200
-    run(initial_count=initial_count)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("count", type=int, nargs="?", default=200)
+    parser.add_argument("--frames", type=int)
+    args = parser.parse_args()
+    if args.frames is not None and args.frames < 1:
+        parser.error("--frames must be positive")
+    run(initial_count=args.count, frames=args.frames)
     return 0
 
 

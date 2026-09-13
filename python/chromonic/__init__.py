@@ -15,12 +15,6 @@ onto the same domonic elements (`element.set_layout_box(...)`), so
 
 from __future__ import annotations
 
-from . import _domonic_vendor
-
-# This must precede every module below: several import domonic classes at module
-# scope, and swapping them after that point would split live DOM class identity.
-_domonic_vendor.install()
-
 from . import browser, browser_images, canvas2d, domonic_canvas_patch, fonts, hittest, paint, pyscript, style_bridge, tree, ua_style, window
 from .tree import layout
 from . import native_browser
@@ -28,7 +22,7 @@ from . import native_browser
 __all__ = [
     "layout", "render", "hittest", "paint", "style_bridge", "tree", "window",
     "browser", "pyscript", "native_browser", "ua_style", "browser_images", "fonts",
-    "canvas2d", "domonic_canvas_patch", "initialize", "_domonic_vendor",
+    "canvas2d", "domonic_canvas_patch", "initialize",
 ]
 
 

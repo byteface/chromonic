@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import shutil
 
@@ -29,8 +30,16 @@ def main(argv=None) -> int:
     fixtures = args.fixtures or (sorted(DEFAULT_FIXTURES.glob("*.html")) + sorted(DEFAULT_PAGES.glob("*.html")))
     if not fixtures:
         parser.error("no fixtures found")
-    if args.tolerance < 0:
-        parser.error("tolerance must be non-negative")
+    if not math.isfinite(args.tolerance) or args.tolerance < 0:
+        parser.error("tolerance must be finite and non-negative")
+    if not math.isfinite(args.visual_tolerance) or not 0 <= args.visual_tolerance <= 1:
+        parser.error("visual tolerance must be between zero and one")
+    if any(not fixture.is_file() for fixture in fixtures):
+        parser.error("every fixture must be an existing file")
+    if len({fixture.stem for fixture in fixtures}) != len(fixtures):
+        parser.error("fixture names must be unique to avoid overwriting artifacts")
+    if any(args.output.resolve() in fixture.resolve().parents for fixture in fixtures):
+        parser.error("output must not contain fixture sources")
     if args.output.exists() and not args.keep:
         shutil.rmtree(args.output)
     failed = 0

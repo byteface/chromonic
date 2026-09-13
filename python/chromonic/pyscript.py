@@ -159,8 +159,7 @@ def load_and_run(url_or_path: str, *, window=None):
     """Convenience: `myjs.Page.load(url_or_path, run=False)` (fetch/parse,
     `<link rel=stylesheet>` folded in, no script runs there) then
     `run_python_scripts` on the result. Returns `(document, scope)`. Needs
-    the same `myjs` optional dependency `chromonic.browser` does
-    (`chromonic[browse]`)."""
+    the same `myjs` dependency `chromonic.browser` does."""
     from myjs import Page
 
     page = Page.load(url_or_path, run=False)

@@ -16,10 +16,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from domonic.html import button, div, h1, p  # noqa: E402
-
+# Import Chromonic before Domonic helpers so its runtime hooks are installed.
 import chromonic  # noqa: E402
 from chromonic import hittest  # noqa: E402
+from domonic.html import button, div, h1, p  # noqa: E402
 
 WIDTH = 900
 OUT_DIR = Path(__file__).resolve().parent
@@ -133,7 +133,9 @@ def main() -> int:
     out2.write_bytes(png2)
     print(f"wrote {out2} ({WIDTH}x{height2})")
     print(f"  grid width before: {before.width:.1f}px   after: {after.width:.1f}px")
-    assert round(after.width) == 400, "the mutation did not reach Taffy"
+    # CSS width sizes the content box; layout geometry includes padding/border.
+    expected_width = 400 + 2 * 16 + 2 * 1
+    assert round(after.width) == expected_width, "the mutation did not reach Taffy"
     print("\nmark layout dirty -> rerun Taffy -> update geometry -> repaint: proven.")
     return 0
 
