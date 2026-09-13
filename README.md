@@ -3,7 +3,7 @@
 **Experimental.** Chromonic is a standalone project proving that Domonic can
 be the DOM/CSSOM behind a native rendering pipeline:
 
-<img src="https://raw.githubusercontent.com/byteface/chromonic/main/chromonic.png" alt="Chromonic rendering preview" width="900">
+<img src="https://raw.githubusercontent.com/byteface/chromonic/master/chromonic.png" alt="Chromonic rendering preview" width="900">
 
 
 ## Build & run
