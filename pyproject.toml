@@ -17,6 +17,11 @@ dependencies = [
     "skia-python>=87.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/byteface/chromonic/"
+Repository = "https://github.com/byteface/chromonic/"
+Issues = "https://github.com/byteface/chromonic/issues"
+
 [tool.maturin]
 # The compiled extension lands at chromonic/_native.*.so; python/chromonic/ is the
 # pure-Python package (tree walking, the style bridge, the Skia painter).
