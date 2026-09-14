@@ -86,6 +86,27 @@ def _fetch_bytes(url: str) -> bytes:
         return response.read()
 
 
+def _decode_image(data: bytes) -> "skia.Image | None":
+    image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(data))
+    if image is not None:
+        return image
+    try:
+        stream = skia.MemoryStream(skia.Data.MakeWithCopy(data))
+        svg = skia.SVGDOM.MakeFromStream(stream)
+    except Exception:
+        svg = None
+    if svg is None:
+        return None
+    size = svg.containerSize()
+    width = max(1, int(round(size.width())))
+    height = max(1, int(round(size.height())))
+    surface = skia.Surface(width, height)
+    canvas = surface.getCanvas()
+    canvas.clear(skia.ColorTRANSPARENT)
+    svg.render(canvas)
+    return surface.makeImageSnapshot()
+
+
 def _fetch_and_decode(url: str) -> None:
     """Runs on a background thread -- network I/O and Skia decoding only,
     nothing touching the DOM or a Taffy tree (neither is safe to touch off
@@ -94,7 +115,7 @@ def _fetch_and_decode(url: str) -> None:
     global _generation
     try:
         data = _fetch_bytes(url)
-        image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(data))
+        image = _decode_image(data)
     except Exception:
         image = None
     _cache[url] = image
@@ -137,7 +158,7 @@ def load_image(url: str) -> "skia.Image | None":
         return _cache[url]
     if url.startswith("data:"):
         try:
-            image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(_decode_data_uri(url)))
+            image = _decode_image(_decode_data_uri(url))
         except Exception:
             image = None
         _cache[url] = image

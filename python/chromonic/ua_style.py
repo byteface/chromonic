@@ -66,6 +66,19 @@ stylesheet and real browsers' `html.css`, trimmed to properties this POC's
 
 from __future__ import annotations
 
+# Tags this stylesheet gives an explicit `display: block` default. Exposed
+# so `tree.py` can tell "this tag's UA default is unambiguous, a computed
+# `inline` here must be an author override" apart from a tag this
+# stylesheet says nothing about (`tr`/`td`/`th`, ...), where domonic's raw,
+# un-cascaded initial value of `inline` is still the only thing a computed
+# style can report either way.
+BLOCK_DEFAULT_TAGS = frozenset({
+    "html", "body", "div", "section", "article", "header", "footer", "nav",
+    "main", "aside", "figure", "figcaption", "address", "blockquote",
+    "form", "fieldset", "table", "dl", "dd", "dt", "pre", "p", "ul", "ol",
+    "li", "hr", "h1", "h2", "h3", "h4", "h5", "h6",
+})
+
 _RULES = """
 html, body, div, section, article, header, footer, nav, main, aside,
 figure, figcaption, address, blockquote, form, fieldset, table, dl, dd,

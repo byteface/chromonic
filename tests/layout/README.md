@@ -62,6 +62,10 @@ suite to capture its exact mismatch, fix the renderer, then keep the fixture as
 the regression test. Generated `artifacts/` can be removed and recreated at
 any time; Chrome references are generated from the current fixture every run.
 
+Known upstream or deliberately unfixed gaps live under `known_issues/`. Run
+them explicitly with `harness.run_suite tests/layout/known_issues/<name>.html`
+when working that issue, but they are not part of the default green baseline.
+
 The original eleven fixtures remain as regression coverage. The expanded
 suite now has a zero-geometry-mismatch baseline across all 21 fixtures,
 including the realistic pages, and should stay green unless a fixture is added

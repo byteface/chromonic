@@ -80,6 +80,16 @@ def test_style_bridge_resolves_viewport_units_for_current_layout():
     assert style["padding"] == [16.0] * 4
 
 
+def test_root_percentage_height_resolves_against_viewport_height():
+    child = div(_style="height:100%;")
+    root = div(child, _style="height:100%;")
+
+    tree.layout(root, width=800.0, height=None, viewport_height=600.0)
+
+    assert root.get_layout_box().height == 600.0
+    assert child.get_layout_box().height == 600.0
+
+
 def test_chromonic_uses_released_domonic_package():
     result = subprocess.run(
         [sys.executable, "-c",
@@ -950,6 +960,32 @@ def test_resolve_image_sources_makes_relative_srcs_absolute_only():
     assert document.getElementById("none").getAttribute("src") is None
 
 
+def test_browser_load_applies_legacy_presentational_attributes(tmp_path):
+    from domonic.style import ComputedStyleDeclaration
+
+    from chromonic import browser, tree
+
+    page_path = tmp_path / "legacy.html"
+    page_path.write_text(
+        "<!doctype html><html><body>"
+        "<table id='t' width='85%' bgcolor='#f6f6ef'><tr>"
+        "<td id='bar' bgcolor='#ff6600'>"
+        "<img id='logo' src='y18.svg' width='18' height='18'>"
+        "</td></tr></table></body></html>"
+    )
+
+    page = browser.load(page_path.as_uri())
+    table = page.document.getElementById("t")
+    bar = page.document.getElementById("bar")
+    logo = page.document.getElementById("logo")
+
+    assert ComputedStyleDeclaration(table).backgroundColor == "rgb(246, 246, 239)"
+    assert ComputedStyleDeclaration(bar).backgroundColor == "rgb(255, 102, 0)"
+    tree.layout(page.document.body, width=800.0)
+    assert logo.get_layout_box().width == 18.0
+    assert logo.get_layout_box().height == 18.0
+
+
 def _await_image(browser_images, url, timeout=5.0):
     """`load_image()` is asynchronous (see `browser_images.py`'s module
     docstring) -- it returns `None` immediately and starts a background
@@ -1025,6 +1061,21 @@ def test_load_image_decodes_a_data_uri():
     image = browser_images.load_image(uri)
     assert image is not None
     assert (image.width(), image.height()) == (3, 3)
+
+
+def test_load_image_decodes_an_svg_data_uri():
+    from chromonic import browser_images
+
+    browser_images.clear_cache()
+    uri = (
+        "data:image/svg+xml,"
+        "<svg xmlns='http://www.w3.org/2000/svg' width='18' height='18'>"
+        "<rect width='18' height='18' fill='%23ff6600'/></svg>"
+    )
+    image = browser_images.load_image(uri)
+
+    assert image is not None
+    assert (image.width(), image.height()) == (18, 18)
 
 
 def test_an_img_with_no_css_size_gets_its_intrinsic_size_from_tree_layout(monkeypatch):

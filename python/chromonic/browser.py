@@ -12,7 +12,7 @@ import json
 from types import SimpleNamespace
 import urllib.parse
 
-from . import hittest, tree, window
+from . import domonic_layout_calc_var_patch, domonic_logical_properties_patch, hittest, tree, window
 
 
 def _is_url(s: str) -> bool:
@@ -60,6 +60,53 @@ def warm_interpreter() -> None:
         run=False,
         css=False,
     )
+
+
+def _append_presentational_style(element, declarations: list[str]) -> None:
+    if not declarations:
+        return
+    existing = element.getAttribute("style") or ""
+    prefix = "; ".join(declarations) + ";"
+    # Put presentational attributes first so authored inline style text that
+    # follows still wins when both mention the same property.
+    element.setAttribute("style", f"{prefix} {existing}".strip())
+
+
+def _apply_presentational_attributes(document) -> None:
+    """Translate the old HTML attributes real legacy pages still use.
+
+    Hacker News is the canonical small repro: the orange bar is
+    ``<td bgcolor="#ff6600">`` and the logo is an SVG ``<img>`` whose layout
+    size comes from ``width``/``height`` attributes. domonic exposes those as
+    attributes, not computed CSS, so normalize the narrow set Chromonic needs
+    before resolving styles.
+    """
+
+    def length(value):
+        value = (value or "").strip()
+        if not value:
+            return None
+        if value.endswith("%"):
+            return value
+        try:
+            float(value)
+        except ValueError:
+            return value
+        return f"{value}px"
+
+    for element in document.getElementsByTagName("*"):
+        declarations = []
+        bgcolor = element.getAttribute("bgcolor")
+        if bgcolor:
+            declarations.append(f"background-color:{bgcolor}")
+        if (getattr(element, "tagName", "") or "").lower() in {"img", "table"}:
+            width = length(element.getAttribute("width"))
+            height = length(element.getAttribute("height"))
+            if width:
+                declarations.append(f"width:{width}")
+            if height:
+                declarations.append(f"height:{height}")
+        _append_presentational_style(element, declarations)
 
 
 def _load_local(url: str):
@@ -118,6 +165,8 @@ def load(url: str):
 
     page = _load_remote(url) if _is_url(url) else _load_local(url)
     page.document._chromonic_base_url = page.url
+
+    _apply_presentational_attributes(page.document)
 
     webfonts.prepare(
         page,

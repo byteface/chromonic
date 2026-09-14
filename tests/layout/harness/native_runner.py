@@ -86,8 +86,13 @@ def _fragments(element, rect):
     return {"element": element_rects, "text": text_rects}
 
 
-def run(fixture: Path, output: Path, screenshot: Path, *, viewport=VIEWPORT) -> dict:
-    page = browser.load(str(fixture.resolve()))
+def run(fixture: Path, output: Path, screenshot: Path, *, viewport=VIEWPORT, load_url: "str | None" = None) -> dict:
+    # `load_url`, when given, is loaded instead of the local file path --
+    # for a fixture whose stylesheets/fonts reference absolute-root paths
+    # (`/fonts/ahem.css`, common in the real web-platform-tests suite),
+    # only a real HTTP(S) URL resolves those correctly; `browser.load()`
+    # already fetches over HTTP(S) or the filesystem based on `_is_url()`.
+    page = browser.load(load_url if load_url is not None else str(fixture.resolve()))
     registry = webfonts.registry(page.document.body)
     if registry is not None:
         for face in registry.faces:

@@ -70,6 +70,22 @@ def _edges(edges: Edges) -> list:
     return [_len(edges.top), _len(edges.right), _len(edges.bottom), _len(edges.left)]
 
 
+def _non_negative(value):
+    return max(0.0, value) if isinstance(value, (int, float)) else value
+
+
+def _padding_edges(edges: Edges) -> list:
+    # CSS 2.1 8.4: a negative `padding` is an invalid value, so the whole
+    # declaration is dropped and padding stays at its initial value, `0`.
+    # domonic's parser doesn't reject it (found via `wpt/css/CSS2/
+    # margin-padding-clear/padding-left-001.xht`'s `padding-left: -1px`,
+    # which shifted content left by a real pixel instead of being ignored)
+    # -- clamping to zero here lands on the same outcome without needing a
+    # real "was this declaration invalid" signal, since padding's initial
+    # value already *is* zero.
+    return [_non_negative(value) for value in _edges(edges)]
+
+
 _REPEAT_TRACK = re.compile(r"^repeat\(\s*(\d+)\s*,\s*([^(),]+)\s*\)$", re.I)
 
 
@@ -123,7 +139,17 @@ def _display(kw: Keyword) -> str:
 
 
 def _position(kw: Keyword) -> str:
-    return "absolute" if kw.value in ("absolute", "fixed", "sticky") else "relative"
+    # `sticky` stays in normal flow and only offsets once scrolled past its
+    # threshold -- chromonic has no scroll-position simulation at all (it
+    # always renders the initial, un-stuck scroll position), so the correct
+    # approximation is the same one used for an ordinary in-flow element:
+    # Taffy's "relative" (participates in flow; `inset` is ignored the same
+    # way it would be for `static` -- see `to_dict()` below -- since nothing
+    # here ever "sticks"). Previously grouped with `absolute`/`fixed`, which
+    # incorrectly pulled every `position:sticky` element (a `sticky` header/
+    # nav is extremely common) out of the flow entirely, collapsing its
+    # containing block and everything after it.
+    return "absolute" if kw.value in ("absolute", "fixed") else "relative"
 
 
 def _keyword(kw: Keyword) -> str:
@@ -136,14 +162,31 @@ def _grid_line(value) -> "int | None":
     return value.line if isinstance(value, GridLine) else None  # AUTO / GridSpan / named -- not modelled
 
 
+_AUTO_EDGES = ["auto", "auto", "auto", "auto"]
+
+
 def to_dict(style: LayoutStyle) -> dict:
     """A `chromonic._native.Tree.new_leaf` / `new_with_children` / `set_style`
     style dict for one element's already-cascaded `LayoutStyle`."""
+    # `top`/`right`/`bottom`/`left` never apply to a statically positioned
+    # box (CSS 2.1 9.3.1) -- Taffy has no separate "static" position variant,
+    # so `_position()` maps it onto "relative" the same as an actual
+    # `position:relative`, which *does* apply `inset` as a post-layout
+    # offset. Without this, an author who left stray `top`/`left` values on
+    # an otherwise-static element (or a UA default that happens to carry
+    # one) gets visibly shifted for no CSS-valid reason.
+    # `sticky`'s inset only ever takes effect once actually scrolled past its
+    # threshold; chromonic never simulates a scrolled state (always renders
+    # the initial, un-stuck position), so an authored `top`/`left`/... on a
+    # `position:sticky` element must be ignored here the same way it is for
+    # `static`, not applied as a real offset the way it would be for a
+    # genuine `position:relative`.
+    inset = (_AUTO_EDGES if style.position.value in ("static", "sticky") else _edges(style.inset))
     return {
         "display": _display(style.display),
         "position": _position(style.position),
         "box_sizing": _keyword(style.boxSizing),
-        "inset": _edges(style.inset),
+        "inset": inset,
         "width": _len(style.width),
         "height": _len(style.height),
         "min_width": _len(style.minWidth),
@@ -151,7 +194,7 @@ def to_dict(style: LayoutStyle) -> dict:
         "max_width": _len(style.maxWidth),
         "max_height": _len(style.maxHeight),
         "margin": _edges(style.margin),
-        "padding": _edges(style.padding),
+        "padding": _padding_edges(style.padding),
         "border": _edges(style.borderWidth),
         "gap": (_len(style.gap.row, default=0.0), _len(style.gap.column, default=0.0)),
         "flex_direction": _keyword(style.flexDirection),

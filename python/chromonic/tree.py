@@ -44,7 +44,7 @@ from domonic.layout import LayoutBox, LayoutStyle
 from domonic.style import ComputedStyleDeclaration
 from domonic.utils import Utils
 
-from . import fonts, style_bridge
+from . import fonts, style_bridge, ua_style
 from ._native import Tree, layout_text
 
 # `Utils.case_kebab` (camelCase/snake_case -> kebab-case, via two regex
@@ -669,7 +669,13 @@ def _group_inline_element_runs(tree, parent, entries, parent_style, node_map, pr
             wrapper = cache[run_index] = _AnonymousInlineRun(None, parent)
         run_index += 1
         wrapper_style = _inline_text_style(parent_style)
-        wrapper_style.update({"display": "flex", "flex_direction": "row", "flex_wrap": "nowrap"})
+        # A real inline formatting context's default cross-axis alignment is
+        # the text baseline, not CSS's flex initial value ("normal"/stretch)
+        # -- without this, a shorter inline-block sibling top-aligns with a
+        # taller one instead of sitting on the shared baseline the way
+        # `elif inline_items:` below already gives siblings mixed with text.
+        wrapper_style.update({"display": "flex", "flex_direction": "row", "flex_wrap": "nowrap",
+                              "align_items": "baseline"})
         wrapper._chromonic_native_style = wrapper_style
         wrapper_id = (projection.upsert(wrapper, wrapper_style, run, None, None)
                       if projection else tree.new_with_children(wrapper_style, run))
@@ -886,29 +892,70 @@ def _apply_button_intrinsic_width(style: dict, element) -> None:
     style["width"] = width + horizontal
 
 
-# Tags a real browser's UA stylesheet defaults to `display: inline` --
-# checked *by tag name*, deliberately, not by trusting a computed `display`
-# of "inline" on its own (see `_approximate_inline_flow`'s docstring for
-# why that alone is unsafe here: domonic has no UA stylesheet either, so an
-# ordinary, entirely unstyled `<div>` or `<p>` -- not meant to be inline at
-# all -- reports the exact same raw CSS initial value, "inline").
+# Tags a real browser's UA stylesheet defaults to `display: inline`. Used
+# only as a *fallback tag guess* now -- `ua_style.apply()` (run by every real
+# `browser.load()`) already gives `div`/`p`/the other ordinary block tags a
+# UA-default `display: block`, so `_is_inline_level` below can trust a
+# genuinely computed "inline"/"inline-block" directly for a loaded page.
+# This set only still matters for a raw DOM tree built without
+# `browser.load()` (some unit tests do this to skip the UA stylesheet
+# entirely), where domonic's un-cascaded initial value of "inline" applies
+# to every tag alike and tag-name is the only signal left.
 _USUALLY_INLINE_TAGS = frozenset({
     "a", "span", "b", "i", "em", "strong", "small", "code", "label", "abbr",
     "cite", "mark", "sub", "sup", "time", "kbd", "samp", "var", "q", "u", "s",
     "button", "input", "select", "textarea",
 })
 
+# Replaced elements and form controls size themselves from authored
+# `width`/`height` even at `display:inline` -- unlike an ordinary inline
+# element, whose box is purely a function of its content.
+_REPLACED_OR_CONTROL_TAGS = frozenset({
+    "img", "canvas", "svg", "input", "textarea", "select", "button",
+})
+
+
+def _ua_stylesheet_applied(element) -> bool:
+    """Whether `ua_style.apply()` ran on `element`'s document -- cached per
+    document (this is checked once per element, on the hot `build()` path)."""
+    document = getattr(element, "ownerDocument", None)
+    if document is None:
+        return False
+    cached = getattr(document, "_chromonic_ua_applied_cache", None)
+    if cached is None:
+        cached = document.querySelector("style[data-chromonic-ua]") is not None
+        document._chromonic_ua_applied_cache = cached
+    return cached
+
+
+def _trusts_computed_inline(element, tag_name: str) -> bool:
+    """Whether a genuinely computed `display: inline`/`inline-block` on
+    `element` can be trusted as real author intent rather than domonic's
+    un-cascaded initial value (every tag's raw default, absent a UA
+    stylesheet). True either for a tag this module already assumes is
+    usually inline (`_USUALLY_INLINE_TAGS`), or -- more generally -- for
+    any tag `ua_style.py`'s stylesheet gives an explicit `display: block`
+    default (`ua_style.BLOCK_DEFAULT_TAGS`), *when that stylesheet actually
+    ran* (`browser.load()` always runs it; a raw DOM tree built without it,
+    as some unit tests do, did not). A tag in neither set -- `<tr>`/`<td>`/
+    `<th>`/etc., which this project doesn't give a UA default at all -- has
+    no way to disambiguate and is never trusted here, same as before."""
+    if tag_name in _USUALLY_INLINE_TAGS:
+        return True
+    return tag_name in ua_style.BLOCK_DEFAULT_TAGS and _ua_stylesheet_applied(element)
+
 
 def _is_inline_level(element, style_obj) -> bool:
-    if (getattr(element, "tagName", "") or "").lower() not in _USUALLY_INLINE_TAGS:
-        return False
     display = style_obj.display
     value = getattr(display, "value", display)
     if isinstance(value, str):
         match = style_bridge._SIMPLE_VAR_FALLBACK.match(value.strip())
         if match:
             value = match.group(1).strip()
-    return value in ("inline", "inline-block")
+    if value not in ("inline", "inline-block"):
+        return False
+    tag_name = (getattr(element, "tagName", "") or "").lower()
+    return _trusts_computed_inline(element, tag_name)
 
 
 def _is_floated(child_computed) -> bool:
@@ -1093,6 +1140,23 @@ def build(
     style = getattr(element, "_chromonic_native_style", None) if reuse_styles else None
     if style is None:
         style = style_bridge.to_dict(style_obj)
+        # Not modelled in `LayoutStyle`/`style_bridge.to_dict()` at all, so
+        # read straight off `computed` here. CSS 2.1 8.3.1: a non-`visible`
+        # `overflow` makes an element establish a new block formatting
+        # context, which -- among other things -- stops an in-flow child's
+        # margin from collapsing through it. Taffy (`src/lib.rs`) already
+        # implements this correctly *given* `Style.overflow`; leaving every
+        # node at Taffy's `Overflow::Visible` default (this field was never
+        # threaded through before) silently disabled that CSS rule
+        # entirely. Any value Rust's `parse_overflow_axis` doesn't
+        # recognise falls back to "visible" rather than erroring.
+        _valid_overflow = ("visible", "clip", "hidden", "scroll", "auto")
+        overflow_x = getattr(computed, "overflowX", "visible") or "visible"
+        overflow_y = getattr(computed, "overflowY", "visible") or "visible"
+        style["overflow"] = (
+            overflow_x if overflow_x in _valid_overflow else "visible",
+            overflow_y if overflow_y in _valid_overflow else "visible",
+        )
         element._chromonic_native_style = style
     if is_grid_item and style["min_width"] == "auto":
         # Prevent an auto-width block descendant from feeding its containing
@@ -1101,6 +1165,53 @@ def build(
     own_escapees = [] if is_containing_block else escapees
     tag_name = (getattr(element, "tagName", "") or "").lower()
     element._chromonic_tag_name = tag_name
+    if (tag_name not in _REPLACED_OR_CONTROL_TAGS
+            and getattr(style_obj.display, "value", "") == "inline"
+            and _trusts_computed_inline(element, tag_name)):
+        # CSS 2.1 10.3.1: `width`/`height` never apply to a non-replaced
+        # inline box -- only its content (and any inline-block/replaced
+        # descendant) determines its size. `style_bridge._display()` already
+        # collapsed "inline" onto Taffy's plain "block" display (Taffy has
+        # no inline mode), which would otherwise make an authored
+        # `width`/`height` on e.g. a `<div style="display:inline">` a hard
+        # box size instead of being ignored like a real browser does. Same
+        # `_trusts_computed_inline` gate as `_is_inline_level` -- a tag with
+        # no UA default at all (`<tr>`/`<td>`/...), or a raw DOM tree built
+        # without `browser.load()` (skipping `ua_style.py`, as some unit
+        # tests do), still sees domonic's un-cascaded "inline" default and
+        # must not have its authored size discarded on that basis alone.
+        style["width"] = "auto"
+        style["height"] = "auto"
+        # CSS 2.1 10.3.1/10.6.1: `margin-top`/`margin-bottom` are likewise
+        # accepted but have no effect on a non-replaced inline box's height
+        # (only `margin-left`/`margin-right` add real horizontal spacing).
+        # Taffy has no inline mode to know that on its own -- left as
+        # ordinary flex-item margins, they inflated the anonymous inline
+        # run's cross-axis size. Found via `wpt/css/CSS2/margin-padding-
+        # clear/margin-applies-to-008.xht` (`div div { display: inline;
+        # margin: 50px }`): the line grew 100px taller instead of staying
+        # at the text's own line height.
+        margin = list(style["margin"])
+        margin[0] = margin[2] = 0.0
+        style["margin"] = margin
+    if (getattr(style_obj.display, "value", "") == "inline-block"
+            and _trusts_computed_inline(element, tag_name)):
+        # CSS 2.1 9.2.1/CSS Display 3: `inline-block` is an atomic
+        # inline-level box that establishes its own block formatting
+        # context, so (like `overflow:hidden`, fixed above) an in-flow
+        # child's margin must not collapse through it -- confirmed on
+        # `wpt/css/CSS2/margin-padding-clear/margin-collapse-015a.xht`
+        # ("An element with its display set to 'inline-block' does not
+        # collapse its margins with its children"). Taffy has no
+        # `inline-block` display mode to key off (it's mapped onto plain
+        # `Display::Block`, same as an ordinary block, by
+        # `style_bridge._display()`), so this is signalled the same way
+        # `overflow` was: a field Rust's `parse_style` turns into
+        # `Contain::PAINT`, which establishes a new formatting context in
+        # Taffy without the side effect `Contain::LAYOUT` would have had on
+        # the separate inline-block baseline-alignment fix (see
+        # `get_contain` in `src/lib.rs`).
+        style["establishes_bfc"] = True
     if tag_name == "table":
         element._chromonic_border_collapse = computed.borderCollapse == "collapse"
         if element._chromonic_border_collapse:
@@ -1418,12 +1529,13 @@ class LayoutProjection:
         """Compute and publish geometry after explicit projection patches.
         `viewport_height`: see `layout()`'s own parameter of the same name."""
         root_id = self.nodes[id(root_element)]
-        boxes = self.tree.compute(root_id, width, height)
+        compute_height = _root_compute_height(root_element, height, viewport_height)
+        boxes = self.tree.compute(root_id, width, compute_height)
         _write_boxes(boxes, self.node_map)
         _adjust_body_collapsed_margins(root_element)
         _apply_root_margin_offset(root_element, self.node_map)
         if viewport_height is not None:
-            _fix_viewport_anchored_positioning(self.node_map, viewport_height)
+            _fix_viewport_anchored_positioning(self.node_map, viewport_height, width)
         _publish_inline_formatting(self.node_map)
         return self.node_map
 
@@ -1442,12 +1554,13 @@ class LayoutProjection:
                 reuse_styles=reuse_styles, projection=self,
             )
         self.finish()
-        boxes = self.tree.compute(root_id, width, height)
+        compute_height = _root_compute_height(root_element, height, viewport_height)
+        boxes = self.tree.compute(root_id, width, compute_height)
         _write_boxes(boxes, self.node_map)
         _adjust_body_collapsed_margins(root_element)
         _apply_root_margin_offset(root_element, self.node_map)
         if viewport_height is not None:
-            _fix_viewport_anchored_positioning(self.node_map, viewport_height)
+            _fix_viewport_anchored_positioning(self.node_map, viewport_height, width)
         _publish_inline_formatting(self.node_map)
         return self.node_map
 
@@ -1458,6 +1571,16 @@ def _snapshot_style(style):
     # dict equality then stays in optimized Python/C code during reconciliation.
     return {key: list(value) if isinstance(value, list) else value
             for key, value in style.items()}
+
+
+def _root_compute_height(root_element, height, viewport_height):
+    if height is not None or viewport_height is None:
+        return height
+    style = getattr(root_element, "_chromonic_native_style", {})
+    root_height = style.get("height")
+    if isinstance(root_height, tuple) and root_height == ("pct", 1.0):
+        return viewport_height
+    return height
 
 
 def warm_text_layout() -> None:
@@ -1531,6 +1654,7 @@ def _adjust_body_collapsed_margins(root_element):
            for value in style.get(name, ())):
         return
     boxes = []
+    visible_boxes = []
     for child in root_element.childNodes or []:
         if not _is_element(child):
             continue
@@ -1538,21 +1662,56 @@ def _adjust_body_collapsed_margins(root_element):
         if child_style.get("position") == "absolute":
             continue
         box = child.__dict__.get("_layout_box")
-        if box is not None:
-            boxes.append(box)
+        if box is None:
+            continue
+        boxes.append(box)
+        # A CSS-empty box (no border/padding/height and, since only
+        # out-of-flow descendants can leave a box with zero height here, no
+        # in-flow content of its own) doesn't stop a preceding margin from
+        # collapsing straight through it -- its own Taffy `y` is only where
+        # that margin *would have* landed had the box actually rendered
+        # something there, not real content extent. Counting it toward
+        # `bottom` double-counts that same margin as literal separation
+        # space inside body's box instead of letting it escape past this
+        # empty child the way Chrome does. Found on the CSS2.1 suite's
+        # `margin-*`/`padding-*` tests (`wpt/css/CSS2/margin-padding-clear`):
+        # an absolutely-positioned-only wrapper `<div>` after a `<p>` added
+        # the `<p>`'s own collapsed-through bottom margin to `body`'s height
+        # a second time.
+        if box.height == 0 and not any(
+            value not in (0.0, "auto") for name in ("padding", "border")
+            for value in child_style.get(name, ())
+        ):
+            continue
+        visible_boxes.append(box)
     if not boxes:
         return
-    top = min(box.y for box in boxes)
-    bottom = max(box.y + box.height for box in boxes)
+    if visible_boxes:
+        boxes = visible_boxes
+    # CSS 2.1 10.6.3: auto height is anchored to the *first* and *last*
+    # in-flow child's own margin edges specifically -- not the extent of
+    # whichever child happens to reach furthest. `boxes` is already in DOM
+    # order, so those are literally the first/last entries here. This only
+    # differs from a plain min/max when a negative margin makes an earlier
+    # sibling's box visually stick out past a later one (`box.y + box.height`
+    # for that earlier child now exceeds the true last child's bottom edge) --
+    # found on `wpt/css/CSS2/margin-padding-clear/padding-bottom-003.xht`
+    # (`#div2 { margin-top: -3px }` pulling it back over `#div1`'s own
+    # bottom edge): Chrome's body height tracks `#div2` (the real last
+    # child) regardless, ignoring `#div1`'s now-irrelevant extra 1px.
+    top = boxes[0].y
+    bottom = boxes[-1].y + boxes[-1].height
     old = root_element.__dict__.get("_layout_box")
     if old is not None:
         # The escaped final margin still contributes to the document's scroll
-        # extent even though it is outside body.getBoundingClientRect().
+        # extent even though it is outside body.getBoundingClientRect() --
+        # and unlike the rendered height above, the scrollable area *does*
+        # need the true max over every child, first/last or not.
         explicit_height = style.get("height") != "auto"
         corrected_height = old.height if explicit_height else bottom - top
         corrected_client_height = old.client_height if explicit_height else corrected_height
         root_element.__dict__["_chromonic_scroll_extent"] = max(
-            old.y + old.height, bottom
+            old.y + old.height, bottom, *(box.y + box.height for box in boxes)
         )
         root_element.__dict__["_layout_box"] = LayoutBox(
             x=old.x, y=top, width=old.width, height=corrected_height,
@@ -1605,14 +1764,28 @@ def _resolve_viewport_anchored_box(style: dict, box, viewport_height: float):
     top, _right, bottom, _left = style["inset"]
     top_v = _resolve_inset(top, viewport_height)
     bottom_v = _resolve_inset(bottom, viewport_height)
+    margin_top, _mr, margin_bottom, _ml = style["margin"]
+    mt = _resolve_inset(margin_top, viewport_height) or 0.0
+    mb = _resolve_inset(margin_bottom, viewport_height) or 0.0
+    height = style["height"]
+    if isinstance(height, tuple) and height[0] == "pct":
+        # A percentage height resolves against the containing block's own
+        # height regardless of whether `bottom` is also set -- unlike the
+        # top+bottom-both-set case below, this doesn't need the opposite
+        # inset to become definite (`abspos-containing-block-004.xht`:
+        # `top:0; height:100%`, no `bottom` at all -- Taffy had nothing to
+        # resolve `100%` against but the root's own, too-small Taffy box).
+        new_height = height[1] * viewport_height
+        if top_v is not None:
+            return top_v + mt, new_height
+        if bottom_v is not None:
+            return viewport_height - bottom_v - mb - new_height, new_height
+        return None, new_height
     if bottom_v is None:
         # `top` alone (or neither) determines this element's position --
         # independent of the containing block's height either way, so
         # whatever Taffy already computed is already correct.
         return None, None
-    margin_top, _mr, margin_bottom, _ml = style["margin"]
-    mt = _resolve_inset(margin_top, viewport_height) or 0.0
-    mb = _resolve_inset(margin_bottom, viewport_height) or 0.0
     if top_v is None:
         # bottom-anchored, top:auto -- box.height is already right (an
         # explicit or intrinsic height never depends on the containing
@@ -1623,9 +1796,51 @@ def _resolve_viewport_anchored_box(style: dict, box, viewport_height: float):
     # box, same as the top-only case above, so leave it alone. If height is
     # auto, the box stretches to fill the gap between top and bottom, which
     # *does* depend on the containing block's height.
-    if style["height"] != "auto":
+    if height != "auto":
         return None, None
     return top_v + mt, viewport_height - top_v - mt - bottom_v - mb
+
+
+def _resolve_viewport_anchored_box_x(style: dict, box, viewport_width: float):
+    """`(new_x, new_width)` for a root-anchored element, the same horizontal
+    counterpart to `_resolve_viewport_anchored_box`'s vertical correction --
+    see that function's docstring for the shape of the logic, mirrored here
+    across `left`/`right`/`margin-left`/`margin-right`/`width` instead of
+    `top`/`bottom`/`margin-top`/`margin-bottom`/`height`. Needed because the
+    root's own Taffy box, unlike its height, is *not* always the true
+    viewport width either: `_apply_root_margin_offset` documents that the
+    root correctly shrinks for its own margin, and a body with horizontal
+    margin (`abspos-containing-block-001.xht`: `body { margin: 100px }`, a
+    `position:fixed` box with `left:0; right:0`) shrinks the root's width by
+    that margin the same way it shrinks height -- previously uncorrected."""
+    _top, right, _bottom, left = style["inset"]
+    left_v = _resolve_inset(left, viewport_width)
+    right_v = _resolve_inset(right, viewport_width)
+    _mt, margin_right, _mb, margin_left = style["margin"]
+    ml = _resolve_inset(margin_left, viewport_width) or 0.0
+    mr = _resolve_inset(margin_right, viewport_width) or 0.0
+    width = style["width"]
+    if isinstance(width, tuple) and width[0] == "pct":
+        # Same percentage-independent-of-the-opposite-inset resolution as
+        # `_resolve_viewport_anchored_box`'s height branch -- also catches
+        # the synthetic `("pct", 1.0)` `tree.build()` assigns a block box
+        # with inline content and `width:auto` (line ~1253) to stretch it
+        # to its containing block, which for a root-anchored box must be
+        # the true viewport width, not the root's own (possibly
+        # margin-shrunk) Taffy box.
+        new_width = width[1] * viewport_width
+        if left_v is not None:
+            return left_v + ml, new_width
+        if right_v is not None:
+            return viewport_width - right_v - mr - new_width, new_width
+        return None, new_width
+    if right_v is None:
+        return None, None
+    if left_v is None:
+        return viewport_width - right_v - mr - box.width, None
+    if width != "auto":
+        return None, None
+    return left_v + ml, viewport_width - left_v - ml - right_v - mr
 
 
 def _shift_box(node, dx: float, dy: float) -> None:
@@ -1653,7 +1868,8 @@ def _shift_subtree(element, dx: float, dy: float) -> None:
             _shift_subtree(child, dx, dy)
 
 
-def _fix_viewport_anchored_positioning(node_map: dict, viewport_height: float) -> None:
+def _fix_viewport_anchored_positioning(node_map: dict, viewport_height: float,
+                                        viewport_width: "float | None" = None) -> None:
     """Correct the vertical position (and, when stretched, height) Taffy
     computed for any `position:absolute`/`fixed` element whose containing
     block is the document root itself -- i.e. no ancestor establishes one
@@ -1679,10 +1895,14 @@ def _fix_viewport_anchored_positioning(node_map: dict, viewport_height: float) -
     Only called when a caller supplies a real `viewport_height` distinct
     from "whatever height the root computed to" (see `layout()`'s
     docstring) -- every existing caller that doesn't pass one keeps today's
-    behaviour exactly, at zero extra cost. Only the vertical axis is
-    corrected: the root's own *width* already equals the true viewport
-    width in every caller this repo has (chromonic has no horizontal-scroll
-    model), so there is no equivalent horizontal bug to fix."""
+    behaviour exactly, at zero extra cost. `viewport_width`, when given,
+    applies the same correction horizontally -- the root's own width is
+    usually already the true viewport width (chromonic has no
+    horizontal-scroll model), but not when the root itself carries
+    horizontal margin (`_apply_root_margin_offset` shrinks the root's own
+    box for that margin the same way it does for height); every existing
+    caller passes it, so there is no untouched-behaviour case to preserve
+    here the way there is for `viewport_height`."""
     seen = set()
     for element in list(node_map.values()):
         if id(element) in seen or not _is_element(element):
@@ -1695,21 +1915,25 @@ def _fix_viewport_anchored_positioning(node_map: dict, viewport_height: float) -
         if style is None or box is None:
             continue
         new_y, new_height = _resolve_viewport_anchored_box(style, box, viewport_height)
-        if new_y is None and new_height is None:
+        new_x, new_width = ((None, None) if viewport_width is None
+                             else _resolve_viewport_anchored_box_x(style, box, viewport_width))
+        if new_y is None and new_height is None and new_x is None and new_width is None:
             continue
         dy = (new_y - box.y) if new_y is not None else 0.0
+        dx = (new_x - box.x) if new_x is not None else 0.0
         height = new_height if new_height is not None else box.height
+        width = new_width if new_width is not None else box.width
         element.__dict__["_layout_box"] = LayoutBox(
-            x=box.x, y=box.y + dy, width=box.width, height=height,
+            x=box.x + dx, y=box.y + dy, width=width, height=height,
             client_width=box.client_width, client_height=box.client_height,
             border_top=box.border_top, border_left=box.border_left,
         )
-        if dy:
+        if dx or dy:
             for fragment in getattr(element, "_chromonic_inline_fragments", None) or ():
-                _shift_box(fragment, 0.0, dy)
+                _shift_box(fragment, dx, dy)
             for child in getattr(element, "childNodes", None) or ():
                 if _is_element(child):
-                    _shift_subtree(child, 0.0, dy)
+                    _shift_subtree(child, dx, dy)
 
 
 def _apply_root_margin_offset(root_element, node_map: dict) -> None:
@@ -1813,11 +2037,12 @@ def layout(root_element, *, width: float, height: "float | None" = None, reuse_s
     node_map: dict[int, object] = {}
     with style_bridge.viewport(width, viewport_height if viewport_height is not None else height):
         root_id = build(tree, root_element, node_map, reuse_styles=reuse_styles)
-    boxes = tree.compute(root_id, width, height)
+    compute_height = _root_compute_height(root_element, height, viewport_height)
+    boxes = tree.compute(root_id, width, compute_height)
     _write_boxes(boxes, node_map)
     _adjust_body_collapsed_margins(root_element)
     _apply_root_margin_offset(root_element, node_map)
     if viewport_height is not None:
-        _fix_viewport_anchored_positioning(node_map, viewport_height)
+        _fix_viewport_anchored_positioning(node_map, viewport_height, width)
     _publish_inline_formatting(node_map)
     return node_map

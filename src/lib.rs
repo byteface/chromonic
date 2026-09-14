@@ -18,6 +18,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use taffy::prelude::*;
+use taffy::geometry::Point;
+use taffy::style::{Contain, Overflow};
 use taffy::{compute_leaf_layout, AlignContent, AlignItems, TaffyError};
 
 use parley::{
@@ -144,6 +146,55 @@ fn get_str(dict: &Bound<PyDict>, key: &str, default: &str) -> PyResult<String> {
     }
 }
 
+fn parse_overflow_axis(text: &str) -> PyResult<Overflow> {
+    Ok(match text {
+        "visible" => Overflow::Visible,
+        "clip" => Overflow::Clip,
+        "hidden" => Overflow::Hidden,
+        // CSS `auto`'s scrollbar-on-demand has no exact Taffy equivalent;
+        // `Scroll` is the closer of the two non-`visible` options for BFC
+        // purposes (both are scroll containers -- see `Overflow::is_scroll_container`).
+        "scroll" | "auto" => Overflow::Scroll,
+        other => return Err(PyValueError::new_err(format!("unrecognised overflow: {other:?}"))),
+    })
+}
+
+fn get_overflow(dict: &Bound<PyDict>) -> PyResult<Point<Overflow>> {
+    match get(dict, "overflow") {
+        None => Ok(Point { x: Overflow::Visible, y: Overflow::Visible }),
+        Some(v) => {
+            let tuple = v.cast::<PyTuple>().map_err(|_| PyValueError::new_err("overflow must be an (x, y) tuple"))?;
+            if tuple.len() != 2 {
+                return Err(PyValueError::new_err("overflow must be an (x, y) tuple"));
+            }
+            Ok(Point {
+                x: parse_overflow_axis(&tuple.get_item(0)?.extract::<String>()?)?,
+                y: parse_overflow_axis(&tuple.get_item(1)?.extract::<String>()?)?,
+            })
+        }
+    }
+}
+
+fn get_bool(dict: &Bound<PyDict>, key: &str, default: bool) -> PyResult<bool> {
+    match get(dict, key) {
+        Some(v) => v.extract::<bool>(),
+        None => Ok(default),
+    }
+}
+
+fn get_contain(dict: &Bound<PyDict>) -> PyResult<Contain> {
+    // `establishes_bfc`, when true, is Python's narrower request for exactly
+    // the one thing this POC needs from CSS `contain`: making the box
+    // establish an independent formatting context (so a child's margin
+    // can't collapse through it) -- not a real `contain` property. `PAINT`
+    // (not `LAYOUT`) specifically: both establish a formatting context
+    // equally, but `LAYOUT` *also* suppresses the box's baseline for its
+    // parent's baseline-alignment purposes (`Contain::suppresses_baseline`),
+    // which would silently undo the separate baseline-alignment fix for
+    // inline-block siblings -- the first (only, currently) caller of this.
+    Ok(if get_bool(dict, "establishes_bfc", false)? { Contain::PAINT } else { Contain::NONE })
+}
+
 fn get_f32(dict: &Bound<PyDict>, key: &str, default: f32) -> PyResult<f32> {
     match get(dict, key) {
         Some(v) => v.extract::<f32>(),
@@ -250,6 +301,8 @@ fn parse_style(dict: &Bound<PyDict>) -> PyResult<Style> {
         display,
         position,
         box_sizing,
+        overflow: get_overflow(dict)?,
+        contain: get_contain(dict)?,
         size: Size { width: get_size(dict, "width")?, height: get_size(dict, "height")? },
         min_size: Size { width: get_min_max(dict, "min_width")?, height: get_min_max(dict, "min_height")? },
         max_size: Size { width: get_min_max(dict, "max_width")?, height: get_min_max(dict, "max_height")? },

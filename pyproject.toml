@@ -29,3 +29,10 @@ Issues = "https://github.com/byteface/chromonic/issues"
 module-name = "chromonic._native"
 python-source = "python"
 features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+# tests/wpt/ is a local, gitignored web-platform-tests checkout kept as
+# reference source material for tests/layout fixtures -- it ships its own
+# pytest plugins/test suite (needing `hypothesis`, a top-level conftest,
+# etc.) that isn't meant to run here and otherwise breaks collection.
+addopts = "--ignore=tests/wpt"

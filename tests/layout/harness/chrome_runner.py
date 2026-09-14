@@ -82,7 +82,8 @@ def _instrument(source: str, fixture_name: str) -> str:
     return source[:index] + script + source[index:] if index >= 0 else source + script
 
 
-def run(fixture: Path, output: Path, screenshot: Path, *, chrome=None, viewport=VIEWPORT) -> dict:
+def run(fixture: Path, output: Path, screenshot: Path, *, chrome=None, viewport=VIEWPORT,
+        base_url: "str | None" = None, source_override: "str | None" = None) -> dict:
     global _WINDOW_HEIGHT_ADJUSTMENT
     executable = find_chrome(chrome)
     output.mkdir(parents=True, exist_ok=True)
@@ -95,14 +96,21 @@ def run(fixture: Path, output: Path, screenshot: Path, *, chrome=None, viewport=
         ]
     with tempfile.TemporaryDirectory(prefix="chromonic-layout-") as temporary:
         instrumented = Path(temporary) / fixture.name
-        source = fixture.read_text()
+        # `source_override`, when given, is already-processed markup (e.g.
+        # with extra instrumentation of its own) to probe instead of
+        # `fixture`'s own content verbatim.
+        source = source_override if source_override is not None else fixture.read_text()
         # The probe lives in a temporary directory; retain resource resolution
         # against the fixture, including an authored relative <base href>.
-        base = f'<base href="{html.escape(fixture.resolve().as_uri(), quote=True)}">'
+        # `base_url`, when given, overrides this with an explicit URL instead
+        # (an absolute-root resource reference like `/fonts/ahem.css`, common
+        # in the real web-platform-tests suite, only resolves correctly
+        # against a real HTTP(S) origin -- `file://` has no such root).
+        base = f'<base href="{html.escape(base_url if base_url is not None else fixture.resolve().as_uri(), quote=True)}" />'
         existing_base = re.search(r'<base\b[^>]*href=["\'](.*?)["\'][^>]*>', source, re.I)
-        if existing_base:
+        if existing_base and base_url is None:
             import urllib.parse
-            base = f'<base href="{html.escape(urllib.parse.urljoin(fixture.resolve().as_uri(), existing_base.group(1)), quote=True)}">'
+            base = f'<base href="{html.escape(urllib.parse.urljoin(fixture.resolve().as_uri(), existing_base.group(1)), quote=True)}" />'
         insertion = (re.search(r"<head\b[^>]*>", source, re.I)
                      or re.search(r"<html\b[^>]*>", source, re.I)
                      or re.search(r"<!doctype\b[^>]*>", source, re.I))
