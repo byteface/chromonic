@@ -875,6 +875,74 @@ def _apply_svg_intrinsic_size(style: dict, element) -> None:
             style["height"] = float(width / ratio)
 
 
+def _measure_intrinsic_width(element, computed_cache) -> "float | None":
+    """The natural (max-content, unconstrained-width) width `element` would
+    take with no line wrapping -- built and computed in a disposable,
+    throwaway Taffy tree so real, already-correct layout (nested tags, mixed
+    fonts/weights, inline-block children, ...) does the measuring instead of
+    a hand-rolled approximation limited to plain text (contrast
+    `_apply_button_intrinsic_width`, which only needs a single font run).
+    `tree.Tree.compute()`'s `available_width=None` is Taffy's own
+    `AvailableSpace::MaxContent`, exactly this. `None` on any failure (an
+    empty/degenerate subtree) -- the caller falls back to today's behaviour
+    rather than guessing."""
+    scratch = Tree()
+    try:
+        root_id = build(scratch, element, {}, computed_cache=computed_cache, reuse_styles=False)
+        boxes = scratch.compute(root_id, None, None)
+        box = boxes.get(root_id)
+        return float(box[2]) if box is not None else None
+    except Exception:
+        return None
+
+
+def _compute_table_column_widths(table_element, computed_cache) -> dict:
+    """`{id(cell_element): intrinsic_width}` for every colspan-1 cell in
+    `table_element`, where `intrinsic_width` is the *widest* same-column
+    cell's own max-content width across every row -- the measurement half of
+    CSS's real 'auto' table-layout algorithm: a column is exactly as wide as
+    its widest cell needs, not an equal share of the row (`tree.build()`'s
+    previous, and still the fallback, behaviour for any cell not covered
+    here -- see the `establishes_new_bfc`-style comment at its call site).
+    A colspan'd cell (ambiguous which single column it belongs to) is
+    skipped entirely rather than guessed at; it falls back to the old
+    equal-share sizing, same as if this measurement pass never ran."""
+    per_column: dict[int, float] = {}
+    cell_column: dict[int, int] = {}
+    try:
+        rows = table_element.querySelectorAll("tr")
+    except Exception:
+        return {}
+    for row in rows:
+        # Skip a row that actually belongs to a *nested* table (its nearest
+        # table ancestor isn't this one) -- `querySelectorAll` matches at any
+        # depth, including inside a `<td>`'s own inner table.
+        ancestor = row.parentElement
+        while ancestor is not None and (getattr(ancestor, "tagName", "") or "").lower() != "table":
+            ancestor = ancestor.parentElement
+        if ancestor is not table_element:
+            continue
+        col_index = 0
+        for cell in row.childNodes or ():
+            if not _is_element(cell):
+                continue
+            tag = (getattr(cell, "tagName", "") or "").lower()
+            if tag not in ("td", "th"):
+                continue
+            colspan_raw = cell.getAttribute("colspan") if hasattr(cell, "getAttribute") else None
+            try:
+                colspan = max(1, int(colspan_raw)) if colspan_raw else 1
+            except ValueError:
+                colspan = 1
+            if colspan == 1:
+                cell_column[id(cell)] = col_index
+                width = _measure_intrinsic_width(cell, computed_cache)
+                if width is not None:
+                    per_column[col_index] = max(per_column.get(col_index, 0.0), width)
+            col_index += colspan
+    return {cell_id: per_column[col] for cell_id, col in cell_column.items() if col in per_column}
+
+
 def _apply_button_intrinsic_width(style: dict, element) -> None:
     if style["width"] != "auto":
         return
@@ -1219,17 +1287,47 @@ def build(
             # an outer border on each side gives rows the same 359px inner
             # grid inside a 360px border box that Chrome reports.
             style.update({"box_sizing": "border-box", "padding": [0.5] * 4})
+        # Real "auto" table layout (CSS 2.1 17.5.2.2, the initial/default
+        # `table-layout` -- *not* `table-layout: fixed`, which by definition
+        # ignores cell content and *should* keep the old equal-share
+        # behaviour) sizes each column to its widest cell's own content, not
+        # an equal share of the row -- measured once per table (not per
+        # cell) so every same-column cell agrees on one width. Found on a
+        # real page (news.ycombinator.com): a fixed-width "rank number"/
+        # "vote arrow" column and a long, wrapping title column, split into
+        # three dead-equal thirds, pushed every title ~180px right of where
+        # Chrome puts it. See `_compute_table_column_widths`.
+        element._chromonic_table_column_widths = (
+            _compute_table_column_widths(element, computed_cache)
+            if computed.tableLayout != "fixed" else {}
+        )
     if tag_name == "tr":
         # Taffy has no table formatting mode. A row is nevertheless a
         # horizontal formatting context, and this retained projection gives
         # ordinary fixed/equal-column tables the right fundamental geometry.
         style.update({"display": "flex", "flex_direction": "row", "flex_wrap": "nowrap"})
     elif tag_name in ("td", "th") and style["width"] == "auto":
-        style.update({"flex_grow": 1.0, "flex_shrink": 1.0,
-                      "flex_basis": 0.0, "min_width": 0.0})
         ancestor = getattr(element, "parentElement", None)
         while ancestor is not None and getattr(ancestor, "_chromonic_tag_name", None) != "table":
             ancestor = getattr(ancestor, "parentElement", None)
+        column_width = None
+        if ancestor is not None:
+            column_width = getattr(ancestor, "_chromonic_table_column_widths", {}).get(id(element))
+        if column_width is not None:
+            # `flex_grow` proportional to the column's own intrinsic width
+            # (not a uniform `1.0`) so any space *beyond* every column's
+            # natural content width -- a table given more room than its
+            # content strictly needs, the common case -- still goes mostly
+            # to the column that actually wants it (a wrapping title column)
+            # rather than inflating a small, fixed-content column (a rank
+            # number, an icon) by the same absolute amount.
+            style.update({"flex_grow": column_width, "flex_shrink": 1.0,
+                          "flex_basis": column_width, "min_width": 0.0})
+        else:
+            # Colspan'd, or intrinsic measurement failed -- fall back to the
+            # original equal-share behaviour rather than guessing.
+            style.update({"flex_grow": 1.0, "flex_shrink": 1.0,
+                          "flex_basis": 0.0, "min_width": 0.0})
         if ancestor is not None and getattr(ancestor, "_chromonic_border_collapse", False):
             style["border"] = [value / 2.0 if isinstance(value, (int, float)) else value
                                for value in style["border"]]
