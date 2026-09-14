@@ -26,6 +26,7 @@ _VIEWPORT = ContextVar("chromonic_style_viewport", default=(None, None))
 _VIEWPORT_LENGTH = re.compile(
     r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(vw|vh|vmin|vmax)$", re.I
 )
+_SIMPLE_VAR_FALLBACK = re.compile(r"^var\([^,]+,\s*([^)]+)\)$", re.I)
 
 
 @contextmanager
@@ -110,7 +111,12 @@ def _tracks(tracks: list) -> list:
 
 
 def _display(kw: Keyword) -> str:
-    value = kw.value
+    value = kw.value.strip()
+    fallback = _SIMPLE_VAR_FALLBACK.match(value)
+    if fallback:
+        value = fallback.group(1).strip()
+    if value in ("-ms-flexbox", "-webkit-flex"):
+        return "flex"
     if value in ("flex", "grid", "none"):
         return value
     return "block"  # inline, inline-block, list-item, table, ... -- not modelled here

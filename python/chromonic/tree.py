@@ -275,6 +275,7 @@ def _extract_paint_style(computed) -> dict:
 
     return {
         "background_color": computed.backgroundColor,
+        "background_image": computed.backgroundImage,
         "border_top_color": computed.borderTopColor,
         "color": computed.color,
         "font_size": computed.fontSize,
@@ -290,7 +291,51 @@ def _extract_paint_style(computed) -> dict:
         "word_spacing": computed.wordSpacing,
         "line_height": computed.lineHeight,
         "white_space": computed.whiteSpace,
+        "text_align": computed.textAlign,
+        "text_transform": computed.textTransform,
     }
+
+
+def _css_generated_content_text(value: "str | None") -> str:
+    """Decode the simple string form of CSS generated `content`.
+
+    This deliberately handles only the common, layout-relevant case:
+    quoted strings, including CSS escapes such as Font Awesome's "\\f03e".
+    Keywords like `none`, `normal`, counters, images, and attributes remain
+    out of scope for now.
+    """
+    if not value:
+        return ""
+    text = str(value).strip()
+    if text in ("none", "normal", "initial", "inherit"):
+        return ""
+    if len(text) < 2 or text[0] not in ("'", '"') or text[-1] != text[0]:
+        return ""
+    inner = text[1:-1]
+    inner = re.sub(r"\\\\(?=[0-9a-fA-F]{1,6}(?:\s|$))", r"\\", inner)
+
+    def replace_escape(match):
+        escaped = match.group(1)
+        if not escaped:
+            return ""
+        if re.fullmatch(r"[0-9a-fA-F]{1,6}\s?", escaped):
+            return chr(int(escaped.strip(), 16))
+        return escaped[-1]
+
+    return re.sub(r"\\([0-9a-fA-F]{1,6}\s?|.)", replace_escape, inner)
+
+
+def _extract_generated_content(element, computed_cache) -> "tuple[str, str]":
+    before = ComputedStyleDeclaration(
+        element, "::before", _chain_cache=computed_cache.setdefault("_chromonic_chain_cache", {})
+    )
+    after = ComputedStyleDeclaration(
+        element, "::after", _chain_cache=computed_cache.setdefault("_chromonic_chain_cache", {})
+    )
+    return (
+        _css_generated_content_text(before.content),
+        _css_generated_content_text(after.content),
+    )
 
 
 def _describe(element, computed_cache=None, *, reuse_styles=False):
@@ -358,6 +403,7 @@ def _describe(element, computed_cache=None, *, reuse_styles=False):
     style_obj = LayoutStyle._from_computed(computed)
     element._chromonic_computed_style = computed
     element._chromonic_paint_style = _extract_paint_style(computed)
+    element._chromonic_before_text, element._chromonic_after_text = _extract_generated_content(element, cache)
     from . import webfonts
     webfonts.resolve_style(element, element._chromonic_paint_style)
     # Give Parley and Skia the same platform choice for CSS monospace.
@@ -397,12 +443,28 @@ def _child_elements(element, computed_cache=None, *, reuse_styles=False) -> list
     return result
 
 
+def _apply_text_transform(text: str, transform: str | None) -> str:
+    transform = (transform or "none").strip().lower()
+    if transform == "uppercase":
+        return text.upper()
+    if transform == "lowercase":
+        return text.lower()
+    if transform == "capitalize":
+        return re.sub(r"\b(\w)", lambda match: match.group(1).upper(), text)
+    return text
+
+
 def _own_text(element) -> str:
     # Mixed content (text alongside child *elements*) is out of this POC's
     # scope -- an element with any child element is a Taffy branch, full
     # stop; only a childless element's own text is ever measured.
-    text = element.textContent or ""
+    text = (
+        getattr(element, "_chromonic_before_text", "")
+        + (element.textContent or "")
+        + getattr(element, "_chromonic_after_text", "")
+    )
     style = element.__dict__.get("_chromonic_paint_style", {})
+    text = _apply_text_transform(text, style.get("text_transform"))
     if style.get("white_space") in ("pre", "pre-wrap", "break-spaces"):
         return text
     return " ".join(text.split())
@@ -504,7 +566,7 @@ def _make_inline_formatting_plan(element, inline_items, style):
             native = style_bridge.to_dict(child_style)
             item._chromonic_native_style = native
         raw = getattr(source, "textContent", "") or collapsed or ""
-        text = re.sub(r"\s+", " ", raw)
+        text = _apply_text_transform(re.sub(r"\s+", " ", raw), paint_style.get("text_transform"))
         if not text.strip():
             continue
         # Whitespace collapses across run boundaries. Keep a single leading
@@ -708,6 +770,19 @@ def _make_measure(paint_style: dict, text: str, element):
     return measure
 
 
+def _form_control_display_text(element) -> str:
+    tag_name = (getattr(element, "tagName", "") or "").lower()
+    if tag_name == "textarea":
+        return getattr(element, "value", "") or element.textContent or ""
+    input_type = (element.getAttribute("type") or "text").lower()
+    if input_type in {"checkbox", "radio", "button", "submit", "reset", "file", "hidden"}:
+        return ""
+    value = getattr(element, "value", "") or ""
+    text = str(value) if value else element.getAttribute("placeholder") or ""
+    style = element.__dict__.get("_chromonic_paint_style", {})
+    return _apply_text_transform(text, style.get("text_transform"))
+
+
 def _select_display_text(element) -> str:
     """`<select>` is a native, *closed* dropdown: a real browser shows only
     its currently-selected option's text, never all of them stacked as
@@ -828,7 +903,12 @@ def _is_inline_level(element, style_obj) -> bool:
     if (getattr(element, "tagName", "") or "").lower() not in _USUALLY_INLINE_TAGS:
         return False
     display = style_obj.display
-    return getattr(display, "value", display) in ("inline", "inline-block")
+    value = getattr(display, "value", display)
+    if isinstance(value, str):
+        match = style_bridge._SIMPLE_VAR_FALLBACK.match(value.strip())
+        if match:
+            value = match.group(1).strip()
+    return value in ("inline", "inline-block")
 
 
 def _is_floated(child_computed) -> bool:
@@ -1183,6 +1263,20 @@ def build(
         element.__dict__.pop("_chromonic_inline_plan", None)
         element._chromonic_inline_fragments = []
         text = _select_display_text(element)
+        if text:
+            measure_key = _measure_key(element._chromonic_paint_style, text)
+            measure = (_make_measure(element._chromonic_paint_style, text, element)
+                       if projection is None or projection.measure_changed(element, measure_key) else None)
+            node_id = (projection.upsert(element, style, [], measure, measure_key)
+                       if projection else tree.new_text_leaf(style, measure))
+        else:
+            element._chromonic_text_lines = []
+            node_id = (projection.upsert(element, style, [], None, None)
+                       if projection else tree.new_leaf(style))
+    elif tag_name in ("input", "textarea"):
+        element.__dict__.pop("_chromonic_inline_plan", None)
+        element._chromonic_inline_fragments = []
+        text = _form_control_display_text(element)
         if text:
             measure_key = _measure_key(element._chromonic_paint_style, text)
             measure = (_make_measure(element._chromonic_paint_style, text, element)

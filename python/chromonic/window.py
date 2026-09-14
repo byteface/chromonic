@@ -28,6 +28,14 @@ class Interaction:
         self.width = width
         self.height = height
         self.on_tick = on_tick
+        self.focused_element = None
+
+    def relayout(self) -> None:
+        tree.layout(
+            self.root,
+            width=self.width,
+            height=self.height,
+        )
 
     def tick(self) -> None:
         if self.on_tick is not None:
@@ -57,6 +65,8 @@ class Interaction:
         element = hittest.hit_test(self.root, x, y)
 
         if element is not None:
+            if getattr(element, "tagName", "").lower() in {"input", "textarea", "select", "button"}:
+                self.focused_element = element
             element.dispatchEvent(
                 MouseEvent(
                     "click",
@@ -68,12 +78,36 @@ class Interaction:
                 )
             )
 
-        tree.layout(
-            self.root,
-            width=self.width,
-            height=self.height,
-        )
+        self.relayout()
 
+        return element
+
+    def handle_text(self, text: str):
+        element = self.focused_element
+        if element is None or getattr(element, "tagName", "").lower() not in {"input", "textarea"}:
+            return None
+        element.value = getattr(element, "value", "") + text
+        self.relayout()
+        return element
+
+    def handle_key(self, key: str):
+        from domonic.events import KeyboardEvent
+
+        element = self.focused_element
+        if element is None:
+            return None
+        if key == "Backspace" and getattr(element, "tagName", "").lower() in {"input", "textarea"}:
+            element.value = getattr(element, "value", "")[:-1]
+        element.dispatchEvent(
+            KeyboardEvent(
+                "keydown",
+                {
+                    "bubbles": True,
+                    "key": key,
+                },
+            )
+        )
+        self.relayout()
         return element
 
 
@@ -171,7 +205,25 @@ def run(
             if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
                 interaction.handle_click(*glfw.get_cursor_pos(win))
 
+        def char_callback(_win, codepoint):
+            interaction.handle_text(chr(codepoint))
+
+        def key_callback(_win, key, scancode, action, mods):
+            if action not in (glfw.PRESS, glfw.REPEAT):
+                return
+            names = {
+                glfw.KEY_ENTER: "Enter",
+                glfw.KEY_BACKSPACE: "Backspace",
+                glfw.KEY_ESCAPE: "Escape",
+                glfw.KEY_TAB: "Tab",
+            }
+            name = names.get(key)
+            if name is not None:
+                interaction.handle_key(name)
+
         glfw.set_mouse_button_callback(win, mouse_button)
+        glfw.set_char_callback(win, char_callback)
+        glfw.set_key_callback(win, key_callback)
         glfw.set_window_size_callback(
             win,
             lambda _win, w, h: view.resize(w, h),

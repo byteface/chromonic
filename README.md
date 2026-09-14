@@ -20,6 +20,74 @@ Needs a Rust toolchain (`cargo`/`rustc`) on `PATH`; `skia-python` installs
 from a prebuilt wheel (no C++ build needed on macOS/Linux/Windows x86_64 or
 macOS arm64).
 
+## Public API
+
+Chromonic exposes a small layered surface. The engine functions are useful for
+headless rendering and tests; `App` is the native desktop application wrapper;
+`Browser` opens a URL in the native browser shell.
+
+```python
+from domonic.html import body, h1
+import chromonic
+
+root = body(h1("Headless render"))
+chromonic.layout(root)
+png = chromonic.render(root)
+```
+
+```python
+from chromonic import App
+from domonic.html import body, button, h1, p
+
+root = body(
+    h1("Counter"),
+    button("Increment", _id="inc"),
+    p("0", _id="value"),
+)
+
+app = App(root, width=700, height=500)
+
+@app.click("#inc")
+def increment(event):
+    app.document.querySelector("#value").textContent = "1"
+
+app.run()
+```
+
+`App` keeps the Domonic DOM as the application state. Event handlers can use
+normal Domonic APIs such as `querySelector`, `appendChild`, `remove`,
+`textContent`, `value`, `checked`, and `addEventListener`. The convenience
+decorators delegate through the document, so they also match elements created
+after startup.
+
+```python
+@app.click(".delete")
+def delete_task(event):
+    event.currentTarget.parentNode.remove()
+
+@app.key("#new-task", "Enter")
+def add_with_enter(event):
+    app.trigger("#add", "click")
+```
+
+The public attributes are:
+
+```python
+app.document  # Domonic Document
+app.window    # Domonic defaultView
+```
+
+The native GLFW window and Skia renderer stay internal for now. See
+`examples/counter_app.py` and `examples/todo_app.py` for small apps that only
+import Domonic HTML tags and `chromonic.App`.
+
+```python
+from chromonic import Browser
+
+browser = Browser("https://eventual.technology")
+browser.run()
+```
+
 
 ## Direct GPU browser (`browse2.py`)
 
@@ -45,6 +113,20 @@ rules. `local()` sources, `@import`, conditional font-face rules, variable-font
 descriptor ranges, `unicode-range` and `font-display` policies are not yet
 implemented. Failed downloads retain fallback text; diagnostic errors are
 available on `page.document._chromonic_webfonts.errors`.
+
+
+## Comparing a live page with Chrome
+
+For real sites, first capture what Chrome actually rendered. Open the page in
+Chrome, then paste `tools/chrome_probe.js` into DevTools Console. It downloads
+a JSON file containing loaded stylesheets, accessible CSS rules, resource
+timing, web font status, image natural sizes, visible element rectangles, and
+focused computed styles.
+
+That dump is the quickest way to answer whether Chromonic missed an external
+stylesheet, missed a background image/font resource, or parsed the CSS but
+resolved a different computed value. For fixture-sized cases, use the permanent
+Chrome-vs-Chromonic harness below.
 
 ## Chrome layout conformance
 

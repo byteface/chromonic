@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import functools
 import re
+import urllib.parse
 
 import skia
 
@@ -37,6 +38,7 @@ from . import fonts
 ELEMENT_NODE = 1
 _RGB_RE = re.compile(r"rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)")
 _HEX_RE = re.compile(r"^#([0-9a-fA-F]{6})$")
+_URL_RE = re.compile(r"url\(\s*(?:\"([^\"]*)\"|\'([^\']*)\'|([^)^\"\'\s][^)]*?))\s*\)", re.I)
 
 
 @functools.lru_cache(maxsize=2048)
@@ -86,6 +88,34 @@ def _font(size_px: float, *, bold: bool = False, italic: bool = False, family: "
 
 def _is_element(node) -> bool:
     return getattr(node, "nodeType", None) == ELEMENT_NODE
+
+
+def _background_image_url(value: "str | None") -> "str | None":
+    match = _URL_RE.search(value or "")
+    if not match:
+        return None
+    return next((group.strip() for group in match.groups() if group is not None), None)
+
+
+def _paint_background_image(canvas: "skia.Canvas", element, box, style: dict) -> None:
+    url = _background_image_url(style.get("background_image"))
+    if not url:
+        return
+    if not urllib.parse.urlsplit(url).scheme:
+        doc = getattr(element, "ownerDocument", None)
+        base = getattr(doc, "_chromonic_base_url", "")
+        url = urllib.parse.urljoin(base, url)
+    from . import browser_images
+
+    image = browser_images.load_image(url)
+    if image is None:
+        return
+    canvas.save()
+    try:
+        canvas.clipRect(skia.Rect.MakeXYWH(box.x, box.y, box.width, box.height))
+        canvas.drawImage(image, box.x, box.y)
+    finally:
+        canvas.restore()
 
 
 def _paint_image(canvas: "skia.Canvas", element, box) -> None:
@@ -143,6 +173,7 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
             skia.Rect.MakeXYWH(box.x, box.y, box.width, box.height),
             skia.Paint(Color4f=background, AntiAlias=True),
         )
+    _paint_background_image(canvas, element, box, style)
 
     tag_name = getattr(element, "_chromonic_tag_name", None)
     if tag_name is None:
@@ -203,12 +234,21 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
             text_color = _color(style["color"]) or skia.Color4f(0, 0, 0, 1)
             text_x = box.x + box.border_left + pad_left
             paint_ = skia.Paint(Color4f=text_color, AntiAlias=True)
+            line_widths = getattr(element, "_chromonic_text_line_widths", [])
+            content_width = box.client_width - pad_left - _pad_right
+            align = (style.get("text_align") or "").strip().lower()
             for index, line in enumerate(lines):
                 if not line:
                     continue
+                line_x = text_x
+                if index < len(line_widths):
+                    if align == "center":
+                        line_x += max(0.0, (content_width - line_widths[index]) / 2.0)
+                    elif align in ("right", "end"):
+                        line_x += max(0.0, content_width - line_widths[index])
                 # a simple top-aligned baseline per line, line_height apart
                 baseline_y = box.y + box.border_top + pad_top + font_size + index * line_height
-                canvas.drawString(line, text_x, baseline_y, font, paint_)
+                canvas.drawString(line, line_x, baseline_y, font, paint_)
 
     # Direct text nodes in mixed inline content have retained anonymous
     # layout fragments. They are not DOM Elements, so paint them here; real

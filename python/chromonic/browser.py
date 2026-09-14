@@ -117,6 +117,7 @@ def load(url: str):
     from . import browser_images, ua_style, webfonts
 
     page = _load_remote(url) if _is_url(url) else _load_local(url)
+    page.document._chromonic_base_url = page.url
 
     webfonts.prepare(
         page,
@@ -137,20 +138,25 @@ def load(url: str):
 
 
 def set_viewport(page, width, height) -> None:
-    window_obj = getattr(getattr(page, "session", None), "window", None)
-    if window_obj is None:
-        window_obj = getattr(getattr(page, "document", None), "defaultView", None)
-    if window_obj is None:
-        return
-    state = getattr(window_obj, "_own", None)
-    if isinstance(state, dict):
-        state["innerWidth"] = width
-        state["innerHeight"] = height
-    elif hasattr(window_obj, "resizeTo"):
-        window_obj.resizeTo(width, height)
-    else:
-        window_obj.innerWidth = width
-        window_obj.innerHeight = height
+    windows = [
+        getattr(getattr(page, "session", None), "window", None),
+        getattr(getattr(page, "document", None), "defaultView", None),
+    ]
+    try:
+        from domonic.window import window as domonic_window
+        windows.append(domonic_window)
+    except Exception:
+        pass
+    for window_obj in {id(obj): obj for obj in windows if obj is not None}.values():
+        state = getattr(window_obj, "_own", None)
+        if isinstance(state, dict):
+            state["innerWidth"] = width
+            state["innerHeight"] = height
+        elif hasattr(window_obj, "resizeTo"):
+            window_obj.resizeTo(width, height)
+        else:
+            window_obj.innerWidth = width
+            window_obj.innerHeight = height
 
 
 class BrowserInteraction(window.Interaction):
@@ -191,10 +197,29 @@ class BrowserInteraction(window.Interaction):
         page = load(url)
 
         self.url = url
+        self.page = page
         self.root = page.document.body
 
         if record:
             self._history.append(url)
+
+    def relayout(self) -> None:
+        self._prepare_viewport()
+        super().relayout()
+
+    def render(self, *, relayout: bool = True, reuse_styles: bool = False) -> bytes:
+        if relayout or self.root.get_layout_box() is None:
+            self._prepare_viewport()
+        return super().render(relayout=relayout, reuse_styles=reuse_styles)
+
+    def _prepare_viewport(self) -> None:
+        page = getattr(self, "page", None)
+        if page is None:
+            return
+        set_viewport(page, self.width, self.height)
+        doc = page.document
+        if hasattr(doc, "_cssom_rule_index"):
+            doc._cssom_rule_index = None
 
     def navigate(self, href: str) -> None:
         url = urllib.parse.urljoin(
@@ -207,11 +232,7 @@ class BrowserInteraction(window.Interaction):
             record=True,
         )
 
-        tree.layout(
-            self.root,
-            width=self.width,
-            height=self.height,
-        )
+        self.relayout()
 
     def go_back(self) -> bool:
         if len(self._history) < 2:
@@ -224,11 +245,7 @@ class BrowserInteraction(window.Interaction):
             record=False,
         )
 
-        tree.layout(
-            self.root,
-            width=self.width,
-            height=self.height,
-        )
+        self.relayout()
 
         return True
 

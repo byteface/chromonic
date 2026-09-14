@@ -18,7 +18,7 @@ import skia  # noqa: E402
 from domonic.html import div, img, p  # noqa: E402
 
 import chromonic  # noqa: E402
-from chromonic import hittest, style_bridge, tree  # noqa: E402
+from chromonic import hittest, paint, style_bridge, tree  # noqa: E402
 from chromonic._native import Tree  # noqa: E402
 from domonic.layout import layout_style  # noqa: E402
 
@@ -53,6 +53,14 @@ def test_style_bridge_translates_lengths_and_keywords():
     assert style["display"] == "flex"
     assert style["flex_direction"] == "row-reverse"
     assert style["gap"] == (4.0, 8.0)
+
+
+def test_style_bridge_treats_bootstrap_prefixed_flex_as_flex():
+    element = div(_style="display:-ms-flexbox; align-items:center;")
+    style = style_bridge.to_dict(layout_style(element))
+
+    assert style["display"] == "flex"
+    assert style["align_items"] == "center"
 
 
 def test_style_bridge_expands_simple_grid_repeat_tracks():
@@ -151,6 +159,91 @@ def test_render_produces_a_png():
     png = chromonic.render(root, width=200)
 
     assert png[:8] == b"\x89PNG\r\n\x1a\n"  # the PNG magic bytes
+
+
+def test_public_app_and_browser_wrap_existing_runtime(monkeypatch):
+    from domonic.html import body, button
+
+    root = body(button("Increment", _id="inc"), p("0", _id="value"))
+    calls = []
+    monkeypatch.setattr(chromonic.window, "run", lambda *args, **kw: calls.append(("app", args, kw)))
+    monkeypatch.setattr(chromonic.browser, "run", lambda *args, **kw: calls.append(("browser", args, kw)))
+
+    app = chromonic.App(root, width=320, height=200, title="Settings")
+    assert app.root is root
+    assert app.document.body is root
+    assert app.window is app.document.defaultView
+
+    @app.click("#inc")
+    def increment(event):
+        app.document.querySelector("#value").textContent = "1"
+
+    assert app.render().startswith(b"\x89PNG")
+    button_box = app.document.querySelector("#inc").get_layout_box()
+    app.interaction.handle_click(button_box.x + 1, button_box.y + 1)
+    assert app.document.querySelector("#value").textContent == "1"
+    app.run()
+
+    browser = chromonic.Browser("https://eventual.technology", width=640, height=480)
+    browser.run()
+
+    assert calls[0] == ("app", (root,), {"width": 320, "height": 200, "title": "Settings", "on_tick": None, "fps": 30.0})
+    assert calls[1] == ("browser", ("https://eventual.technology",), {"width": 640, "height": 480, "title": "chromonic"})
+
+
+def test_public_todo_app_features():
+    from domonic.html import body, button, div, h1, input, li, span, ul
+
+    root = body(
+        h1("Tasks"),
+        div(input(_id="new-task", _placeholder="Add task..."), button("Add", _id="add")),
+        ul(_id="tasks"),
+    )
+    app = chromonic.App(root, width=700, height=500)
+
+    @app.click("#add")
+    def add_task(event):
+        field = app.document.querySelector("#new-task")
+        text = field.value.strip()
+        if not text:
+            return
+        app.document.querySelector("#tasks").appendChild(
+            li(input(_type="checkbox"), span(text), button("Delete", _class="delete"))
+        )
+        field.value = ""
+
+    @app.key("#new-task", "Enter")
+    def add_with_enter(event):
+        app.trigger("#add", "click")
+
+    @app.click(".delete")
+    def delete_task(event):
+        event.currentTarget.parentNode.remove()
+
+    assert app.render().startswith(b"\x89PNG")
+    field = app.document.querySelector("#new-task")
+    field_box = field.get_layout_box()
+    app.interaction.handle_click(field_box.x + 1, field_box.y + 1)
+    for char in "Ship":
+        app.interaction.handle_text(char)
+    assert field.value == "Ship"
+    assert field._chromonic_text_lines == ["Ship"]
+
+    app.interaction.handle_key("Enter")
+    assert field.value == ""
+    assert app.document.querySelector("#tasks span").textContent == "Ship"
+
+    delete = app.document.querySelector(".delete")
+    delete_box = delete.get_layout_box()
+    app.interaction.handle_click(delete_box.x + 1, delete_box.y + 1)
+    assert app.document.querySelector("#tasks span") is None
+
+    field.value = "Again"
+    app.trigger("#add", "click")
+    checkbox = app.document.querySelector("#tasks input")
+    assert checkbox is not None
+    checkbox.checked = True
+    assert checkbox.checked is True
 
 
 # -- phase 2: interactivity (chromonic.window.Interaction) -----------------
@@ -319,6 +412,34 @@ def test_browser_interaction_loads_a_page_with_css_applied():
         assert box.textContent == "hello"
         from domonic.style import ComputedStyleDeclaration
         assert ComputedStyleDeclaration(box).color == "rgb(1, 2, 3)"
+    finally:
+        srv.shutdown()
+
+
+def test_generated_content_pseudo_elements_contribute_text_layout():
+    from chromonic.browser import BrowserInteraction
+
+    files = {
+        "/index.html": (
+            b"<!doctype html><html><head>"
+            b"<style>"
+            b".fa { font-family: Arial; font-size: 20px; }"
+            b".fa-image::before { content: '\\\\f03e'; }"
+            b"</style>"
+            b"</head><body><i class='fa fa-image'></i></body></html>",
+            "text/html",
+        ),
+    }
+    srv = _serve(files)
+    port = srv.server_address[1]
+    try:
+        interaction = BrowserInteraction(f"http://127.0.0.1:{port}/index.html", width=300.0, height=200.0)
+        interaction.render()
+        icon = interaction.root.getElementsByTagName("i")[0]
+
+        assert icon._chromonic_before_text == "\uf03e"
+        assert icon._chromonic_text_lines == ["\uf03e"]
+        assert icon.get_layout_box().width > 0
     finally:
         srv.shutdown()
 
@@ -933,6 +1054,53 @@ def test_an_img_with_an_explicit_css_size_ignores_intrinsic_size(monkeypatch):
     assert (box.width, box.height) == (50.0, 50.0)  # CSS size wins over the image's own 20x20
 
 
+
+
+def test_text_transform_changes_layout_text_and_text_align_offsets_paint():
+    root = div(
+        p("welcome", _style="width:200px; text-transform:uppercase; text-align:center; color:rgb(0,0,0);"),
+        _style="width:200px; background-color:rgb(255,255,255);",
+    )
+    tree.layout(root, width=200.0)
+    child = root.childNodes[0]
+
+    assert child._chromonic_text_lines == ["WELCOME"]
+    assert child._chromonic_text_line_widths[0] < child.get_layout_box().client_width
+
+    png = paint.render_png(root, width=200, height=40)
+    image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(png))
+    pixels = image.toarray()
+    left_band_has_ink = bool((pixels[5:30, 0:25, :3] < 250).any())
+    center_band_has_ink = bool((pixels[5:30, 70:130, :3] < 250).any())
+
+    assert left_band_has_ink is False
+    assert center_band_has_ink is True
+
+def test_paint_draws_css_background_image(monkeypatch):
+    from chromonic import browser_images
+
+    browser_images.clear_cache()
+    png_image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(_tiny_png(skia.ColorBLUE, size=10)))
+    seen = []
+
+    def load_image(url):
+        seen.append(url)
+        return png_image
+
+    monkeypatch.setattr(browser_images, "load_image", load_image)
+    root = div(_style="width:20px; height:20px; background-image:url('assets/bg.png')")
+    from domonic.dom import DOMImplementation
+    document = DOMImplementation().createHTMLDocument("bg")
+    document._chromonic_base_url = "https://example.com/pages/index.html"
+    document.body.replaceWith(root)
+    tree.layout(root, width=20.0, height=20.0)
+    png = paint.render_png(root, width=20, height=20)
+    image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(png))
+    pixel = image.toarray()[5, 5]
+
+    assert seen == ["https://example.com/pages/assets/bg.png"]
+    assert pixel[2] > 200  # BGRA array, blue channel
+
 def test_paint_draws_the_decoded_image_pixels(monkeypatch):
     from chromonic import browser_images
 
@@ -1255,6 +1423,21 @@ def test_a_run_of_links_lays_out_horizontally_not_one_per_line():
     # side by side (increasing x, same row) -- not stacked (increasing y)
     assert all(boxes[i + 1].x > boxes[i].x for i in range(3))
     assert len({round(box.y) for box in boxes}) == 1
+
+
+def test_inline_display_var_fallback_participates_in_inline_text_layout():
+    from domonic.html import h5, i
+
+    icon = i("x", _style="display:var(--fa-display, inline-block); font-size:20px; margin-right:8px;")
+    heading = h5(icon, "Media pipelines", _style="width:700px; font-size:20px;")
+
+    tree.layout(heading, width=700.0)
+
+    icon_box = icon.get_layout_box()
+    heading_box = heading.get_layout_box()
+    assert 0 < icon_box.width < 40
+    assert icon_box.x == heading_box.x
+    assert icon_box.y == heading_box.y
 
 
 def test_inline_flow_approximation_tolerates_a_minority_of_exceptions():
