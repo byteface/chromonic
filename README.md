@@ -5,14 +5,34 @@ be the DOM/CSSOM behind a native rendering pipeline:
 
 <img src="https://raw.githubusercontent.com/byteface/chromonic/master/chromonic.png" alt="Chromonic rendering preview" width="900">
 
+> Browser compatibility is incomplete and the rendering engine is still under active development. You can help evolve Chromonic by contributing to conformance and layout tests. Check the repo for open issues to join in.
+
+
+## Install
+
+Install with pipx to use the command line:
+
+```bash
+chromonic https://csszengarden.com/
+
+# local page
+chromonic ./test.html
+chromonic .                    # serves ./index.html
+
+# run an example file
+chromonic example interactive_canvas
+```
+
 
 ## Build & run
+
+Pull the repo to build and run the Python API examples:
 
 ```bash
 cd chromonic
 make venv
-make develop                         # compiles the Rust extension and installs chromonic editable
-python examples/poc.py     # -> examples/poc.png, examples/poc_mutated.png
+make develop # compiles the Rust extension and installs chromonic editable
+python examples/poc.py # -> examples/poc.png, examples/poc_mutated.png
 make test
 ```
 
@@ -20,11 +40,16 @@ Needs a Rust toolchain (`cargo`/`rustc`) on `PATH`; `skia-python` installs
 from a prebuilt wheel (no C++ build needed on macOS/Linux/Windows x86_64 or
 macOS arm64).
 
+
 ## Public API
 
 Chromonic exposes a small layered surface. The engine functions are useful for
 headless rendering and tests; `App` is the native desktop application wrapper;
 `Browser` opens a URL in the native browser shell.
+
+```bash
+pip install chromonic
+```
 
 ```python
 from domonic.html import body, h1

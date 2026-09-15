@@ -36,6 +36,7 @@ whole page waiting for the slowest one.
 
 from __future__ import annotations
 
+import time
 import base64
 import threading
 import urllib.parse
@@ -44,6 +45,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import skia
 
+from .animated_gif import AnimatedGIF, decode_animated_gif
+
 _UA = "chromonic/images (+https://github.com/byteface/domonic-libs)"
 _TIMEOUT = 10.0
 
@@ -51,10 +54,18 @@ _TIMEOUT = 10.0
 # caching the failure too, so a broken image URL is retried at most once per
 # process, not once per relayout.
 _cache: "dict[str, skia.Image | None]" = {}
+_animations: dict[str, AnimatedGIF] = {}
 _pending: "set[str]" = set()
 _lock = threading.Lock()
 _generation = 0
 _executor: "ThreadPoolExecutor | None" = None
+
+
+def _decode_resource(data: bytes):
+    animation = decode_animated_gif(data)
+    if animation is not None:
+        return animation.frames[0], animation
+    return _decode_image(data), None
 
 
 def _get_executor() -> ThreadPoolExecutor:
@@ -87,24 +98,39 @@ def _fetch_bytes(url: str) -> bytes:
 
 
 def _decode_image(data: bytes) -> "skia.Image | None":
-    image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(data))
+    image = skia.Image.MakeFromEncoded(
+        skia.Data.MakeWithCopy(data)
+    )
+
     if image is not None:
         return image
+
     try:
-        stream = skia.MemoryStream(skia.Data.MakeWithCopy(data))
+        stream = skia.MemoryStream.MakeCopy(data)
         svg = skia.SVGDOM.MakeFromStream(stream)
+
+        if svg is None:
+            return None
+
+        size = svg.containerSize()
+
+        width = max(1, int(round(size.width())))
+        height = max(1, int(round(size.height())))
+
+        svg.setContainerSize(
+            skia.Size(width, height)
+        )
+
+        surface = skia.Surface(width, height)
+        canvas = surface.getCanvas()
+        canvas.clear(skia.ColorTRANSPARENT)
+
+        svg.render(canvas)
+
+        return surface.makeImageSnapshot()
+
     except Exception:
-        svg = None
-    if svg is None:
         return None
-    size = svg.containerSize()
-    width = max(1, int(round(size.width())))
-    height = max(1, int(round(size.height())))
-    surface = skia.Surface(width, height)
-    canvas = surface.getCanvas()
-    canvas.clear(skia.ColorTRANSPARENT)
-    svg.render(canvas)
-    return surface.makeImageSnapshot()
 
 
 def _fetch_and_decode(url: str) -> None:
@@ -115,7 +141,9 @@ def _fetch_and_decode(url: str) -> None:
     global _generation
     try:
         data = _fetch_bytes(url)
-        image = _decode_image(data)
+        image, animation = _decode_resource(data)
+        if animation is not None:
+            _animations[url] = animation
     except Exception:
         image = None
     _cache[url] = image
@@ -137,6 +165,16 @@ def resolve_image_sources(document, base_url: str) -> None:
         img.setAttribute("src", urllib.parse.urljoin(base_url, src))
 
 
+def advance_animations() -> bool:
+    """Advance GIF clocks; True means pixels changed and repaint is needed."""
+    now = time.monotonic()
+    return any(animation.advance(now) for animation in tuple(_animations.values()))
+
+
+def has_active_animations() -> bool:
+    return any(animation.active for animation in tuple(_animations.values()))
+
+
 def load_image(url: str) -> "skia.Image | None":
     """The decoded image for `url` if it's already been fetched, `None`
     otherwise -- and if `None`, a background fetch is started (unless one
@@ -155,10 +193,13 @@ def load_image(url: str) -> "skia.Image | None":
     if not url:
         return None
     if url in _cache:
-        return _cache[url]
+        animation = _animations.get(url)
+        return animation.frame() if animation is not None else _cache[url]
     if url.startswith("data:"):
         try:
-            image = _decode_image(_decode_data_uri(url))
+            image, animation = _decode_resource(_decode_data_uri(url))
+            if animation is not None:
+                _animations[url] = animation
         except Exception:
             image = None
         _cache[url] = image
@@ -193,6 +234,7 @@ def clear_cache() -> None:
     """Forget every cached (and pending) image -- tests use this so one
     test's fetch doesn't silently satisfy another's from the shared
     process-wide cache."""
+    _animations.clear()
     _cache.clear()
     with _lock:
         _pending.clear()

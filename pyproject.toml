@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "chromonic"
-version = "0.0.3"
+version = "0.0.4"
 description = "Experimental POC: domonic DOM/CSSOM backed browser"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,9 @@ dependencies = [
     "pytest>=8.0",
     "skia-python>=87.0",
 ]
+
+[project.scripts]
+chromonic = "chromonic.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/byteface/chromonic/"

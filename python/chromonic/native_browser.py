@@ -168,6 +168,8 @@ class View:
             reg = webfonts.registry(self.page.document.body)
             if reg is not None and reg.poll():
                 self.relayout()
+        if browser_images.advance_animations():
+            self.dirty = True
         current = browser_images.generation()
         if current == self._image_generation:
             return
@@ -408,8 +410,30 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
             if action not in (glfw.PRESS, glfw.REPEAT):
                 return
             command = mods & (glfw.MOD_CONTROL | glfw.MOD_SUPER)
+
+            reload_key = (
+                (command and key == glfw.KEY_R)
+                or key == glfw.KEY_F5
+            )
+
+            back_key = (
+                ((mods & glfw.MOD_ALT) and key == glfw.KEY_LEFT)
+                or (
+                    (mods & glfw.MOD_SUPER)
+                    and key == glfw.KEY_LEFT_BRACKET
+                )
+            )
+
             if command and key == glfw.KEY_L:
                 view.focus_address()
+
+            elif reload_key:
+                if view.url:
+                    view.navigate(view.url)
+
+            elif back_key:
+                view.back()
+
             elif view.editing:
                 if key == glfw.KEY_ENTER:
                     view.navigate(view.address)
@@ -452,7 +476,12 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
                 reg = webfonts.registry(view.page.document.body) if view.page is not None else None
                 if frames is not None and drawn >= frames and navigation.pending is None and not (reg and reg.pending()):
                     break
-            eager = navigation.pending is not None or frames is not None or browser_images.has_pending()
+            eager = (
+                navigation.pending is not None
+                or frames is not None
+                or browser_images.has_pending()
+                or browser_images.has_active_animations()
+            )
             glfw.wait_events_timeout(.02 if eager else .25)
         return view
     finally:

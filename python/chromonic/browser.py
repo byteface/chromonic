@@ -11,6 +11,9 @@ import base64
 import json
 from types import SimpleNamespace
 import urllib.parse
+from pathlib import Path
+import urllib.request
+
 
 from . import domonic_layout_calc_var_patch, domonic_logical_properties_patch, hittest, tree, window
 
@@ -23,11 +26,29 @@ def _is_url(s: str) -> bool:
 
 
 def _normalize_address(value: str) -> str:
-    """Typing `example.com` becomes `https://example.com`."""
+    """Normalize common browser address-bar shorthand."""
     value = (value or "").strip()
 
     if not value:
         return value
+
+    if value.startswith("//"):
+        return "https:" + value
+
+    if value.startswith(":") and value[1:].isdigit():
+        return "http://127.0.0.1" + value
+
+    lowered = value.lower()
+
+    if lowered.startswith(
+        (
+            "localhost:",
+            "127.0.0.1:",
+            "0.0.0.0:",
+            "[::1]:",
+        )
+    ):
+        return "http://" + value
 
     parsed = urllib.parse.urlparse(value)
 
@@ -38,6 +59,21 @@ def _normalize_address(value: str) -> str:
         return "https://" + value
 
     return value
+
+
+def _local_path(value: str) -> Path:
+    """Convert a plain filename or file:// URI to a filesystem path."""
+    parsed = urllib.parse.urlparse(value)
+
+    if parsed.scheme.lower() != "file":
+        return Path(value).expanduser().resolve()
+
+    path = urllib.request.url2pathname(parsed.path)
+
+    if parsed.netloc and parsed.netloc.lower() != "localhost":
+        path = f"//{parsed.netloc}{path}"
+
+    return Path(path).expanduser().resolve()
 
 
 def _validate_navigable(url: str) -> None:
@@ -134,10 +170,15 @@ def _load_local(url: str):
 
             return css
 
+    source = _local_path(url)
+
     page = FontAwarePage.load(
-        url,
+        source,
         run=False,
     )
+
+    # Keep a URL-shaped base for relative CSS/images/fonts.
+    page.url = source.as_uri()
 
     return page
 
