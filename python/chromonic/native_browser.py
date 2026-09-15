@@ -46,6 +46,7 @@ class View:
         self.width, self.height = width, height
         self.loader = loader or browser.load
         self.page = None
+        self.page_title = ""
         self.url = self.address = ''
         self.history = []
         self.scroll_y = 0.0
@@ -88,6 +89,8 @@ class View:
 
     def commit_page(self, page, url, *, back=False):
         self.page, self.url, self.address = page, url, url
+        titles = page.document.getElementsByTagName("title")
+        self.page_title = (titles[0].textContent or "").strip() if titles else ""
         self.caret = len(url)
         if back:
             self.history.pop()
@@ -464,9 +467,14 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
         glfw.set_framebuffer_size_callback(win, lambda *args: setattr(view, 'dirty', True))
         glfw.set_window_refresh_callback(win, lambda w: setattr(view, 'dirty', True))
         drawn = 0
+        current_title = title
         while not glfw.window_should_close(win):
             sync_window_size(view, win, glfw)
             navigation.poll()
+            wanted_title = view.page_title or title
+            if wanted_title != current_title:
+                glfw.set_window_title(win, wanted_title)
+                current_title = wanted_title
             view.poll_images()
             if view.dirty or frames is not None:
                 renderer.draw(view, glfw.get_framebuffer_size(win))
