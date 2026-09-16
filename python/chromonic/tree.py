@@ -114,11 +114,23 @@ class _InlineFormattingPlan:
         self.fragments = []
         self.owner_boxes = {}
         self.height = 0.0
+        # CSS 2.1 9.10: a `direction: rtl` block's own line boxes start from
+        # its *right* edge -- glyph order within a same-direction run (plain
+        # Latin text here; full bidi reordering across mixed-direction runs
+        # is out of scope) stays untouched, only each line's *position*
+        # mirrors. `element` is the block establishing this inline
+        # formatting context (never a nested wrapper's own `direction` --
+        # that would need a real embedding, `unicode-bidi: embed/isolate`,
+        # not implemented), so its own computed `direction` governs every
+        # plan built for it, split or not.
+        computed = getattr(element, "_chromonic_computed_style", None)
+        self.rtl = (getattr(computed, "direction", "ltr") or "ltr").strip().lower() == "rtl"
 
     def measure(self, available_width, _available_height):
         width = float(available_width or 0.0)
         if width <= 0 or width > 1_000_000:
             width = sum(run.get("intrinsic_width", 0.0) for run in self.runs)
+        self._measured_width = width  # `publish()` needs this to mirror a `<br>`'s own box for RTL
         base_height = _resolved_line_height(self.parent_style["line_height"])
         base_font = _fontmetrics.parse_length(self.parent_style["font_size"], default=16.0)
         base_ascent, base_descent, normal = fonts.text_metrics(
@@ -129,27 +141,34 @@ class _InlineFormattingPlan:
         base_above = base_ascent + math.floor((base_height - base_ascent - base_descent) / 2)
         base_below = base_height - base_above
         x = y = 0.0
+        line_margin_start = 0.0  # how much of the current line's `x` is `margin_start`, not content
+        line_leading_total = 0.0  # and how much is a leading border/padding edge
         above, below = base_above, base_below
         self._line_baselines = {}
-        self._break_positions = {}  # run index → (x, y) at which the break occurred
+        # run index -> (x, y, line height, line's own margin_start, line's own leading edge)
+        self._break_positions = {}
         placed = []
         for run_index, run in enumerate(self.runs):
             if run.get("break"):
                 # Forced line-break: flush the current line and move to the next.
                 self._line_baselines[y] = above
-                self._break_positions[run_index] = (x, y, above + below)
+                self._break_positions[run_index] = (x, y, above + below, line_margin_start, line_leading_total)
                 y += above + below
                 x = 0.0
+                line_margin_start = 0.0
+                line_leading_total = 0.0
                 above, below = base_above, base_below
                 continue
             tokens = run["tokens"]
             for index, (text, token_width) in enumerate(tokens):
                 leading = run["leading"] if index == 0 else 0.0
                 trailing = run["trailing"] if index == len(tokens) - 1 else 0.0
+                line_leading_total += leading
                 # margin-start shifts the whole run right on the first token
                 # only — not carried onto subsequent lines after a <br>.
                 if index == 0:
                     x += run.get("margin_start", 0.0)
+                    line_margin_start += run.get("margin_start", 0.0)
                 advance_width = (max(token_width, run["atomic_width"])
                                  if len(tokens) == 1 else token_width)
                 total = leading + advance_width + trailing
@@ -167,6 +186,8 @@ class _InlineFormattingPlan:
                     self._line_baselines[y] = above
                     y += above + below
                     x = 0.0
+                    line_margin_start = 0.0
+                    line_leading_total = 0.0
                     above, below = base_above, base_below
                 token_height = run["box_height"]
                 above = max(above, run["above"])
@@ -176,11 +197,59 @@ class _InlineFormattingPlan:
                 x += total
         self._line_baselines[y] = above
         self.height = y + above + below if placed else 0.0
+        content_width = min(width, max(
+            (px + advance for _r, _t, px, _y, _pw, _h, _l, _tr, advance in placed), default=0.0))
+        if self.rtl and placed:
+            # Mirror every placed token's position against the same `width`
+            # each was placed within -- reflecting a whole line as a rigid
+            # group (not each token independently) preserves their relative
+            # spacing/order while moving the group as a whole to the
+            # container's right edge, exactly `direction: rtl`'s effect on
+            # a line shorter than its container (the common case: each
+            # split segment here is its own single-fragment line). Computed
+            # from the *original* (pre-mirror) `placed` above, so the
+            # intrinsic-width return value isn't affected by this.
+            #
+            # Margin is never part of a fragment's own box -- only its
+            # position -- so it must not be fed into the mirror as if it
+            # were: `margin_start` (physical margin-left, baked into the
+            # very first token's `x` before mirroring, index 0 only) is
+            # subtracted back out of `outer_left` here so mirroring doesn't
+            # drag it along, landing the box `margin_start` px further
+            # right than a naive mirror would (the margin stays on its own
+            # physical left, outside the box, wherever the box ends up).
+            # Symmetrically, the *last* token's owner's physical margin-
+            # right (never added to `x` at all above, since ordinary LTR
+            # placement never needed to) is subtracted from its mirrored
+            # position afterward, pushing that fragment away from the
+            # line's right edge by that amount -- the RTL mirror of margin-
+            # left doing the same for the first fragment.
+            # A plan built for a *leading* or *interior* split segment
+            # (`_split_inline_flow_around_blocks`, a block interruption
+            # follows it) is explicitly marked `False` -- margin-right
+            # belongs only to the wrapper's true trailing segment, never
+            # one of these, even though each is alone in its own `placed`
+            # list and so would otherwise look "last" too. Absent for an
+            # ordinary (non-split) plan, where the true last entry always
+            # legitimately owns the trailing margin -- default `True`.
+            is_final_segment = getattr(self, "_chromonic_final_split_fragment", True)
+            last_index = len(placed) - 1
+            mirrored = []
+            for index, (run, text, px, y, token_width, token_height, leading, trailing, advance) in enumerate(placed):
+                margin_start = run.get("margin_start", 0.0)
+                outer_left = px - leading - margin_start
+                outer_width = leading + advance + trailing
+                new_px = (width - outer_left - outer_width) + leading
+                if index == last_index and is_final_segment:
+                    owner_style = getattr(run.get("owner"), "_chromonic_native_style", None) or {}
+                    owner_margin = owner_style.get("margin") or (0.0, 0.0, 0.0, 0.0)
+                    new_px -= _numeric_edge(owner_margin[1])
+                mirrored.append((run, text, new_px, y, token_width, token_height, leading, trailing, advance))
+            placed = mirrored
         self._placed = placed
-        return (min(width, max((px + advance for _r, _t, px, _y, _pw, _h, _l, _tr, advance in placed), default=0.0)),
-                self.height)
+        return (content_width, self.height)
 
-    def publish(self, box, padding):
+    def publish(self, box, padding, owner_accum, element_fragments_accum):
         origin_x = box.x + box.border_left + padding[3]
         origin_y = box.y + box.border_top + padding[0]
         self.fragments = []
@@ -225,50 +294,80 @@ class _InlineFormattingPlan:
             owner_y = origin_y + (y if run["atomic_width"] else glyph_y - run["top_edge"])
             rect = (origin_x + x - leading, owner_y,
                     visual_advance + leading + trailing, token_height)
-            owner_rects.setdefault(owner, []).append(rect)
+            # `run.get("split_group")` (set by `_split_wrapping_inline_
+            # element`) is which segment, in split/document order, this rect
+            # belongs to -- `None` for an ordinary (non-split) owner, where
+            # there's only ever one segment. Carried through so
+            # `_finalize_inline_owner_boxes` can place interruption-marker
+            # rects at their logical position instead of a geometric sort.
+            owner_rects.setdefault(owner, []).append((rect, run.get("split_group")))
         # When the plan owner is exactly `display:inline` it participates in
         # fragmentation just like any child inline owner: its rects come from
         # `owner_rects[self.element]` (already built above with correct
         # padding/border edges) and must be merged per-line then unioned for
         # getBoundingClientRect().  `inline-block` and block owners are atomic
         # and must keep the Taffy container box unchanged.
+        #
+        # Accumulate into `owner_accum` rather than finalizing here directly:
+        # an inline element split around an in-flow block child (CSS 2.1
+        # 9.2.1.1, `_split_wrapping_inline_element`) contributes fragments
+        # from *multiple*, independently-published `_InlineFormattingPlan`s
+        # (one per split segment, each its own Taffy leaf) that all still
+        # belong to the same original owner -- writing the owner's box here
+        # directly, once per plan, would have whichever plan happens to
+        # publish last silently overwrite every earlier plan's fragments
+        # instead of the two together forming the owner's real (multi-
+        # fragment) bounding box. `_finalize_inline_owner_boxes` does that
+        # union once, after every plan sharing `owner_accum` has run.
         owner_is_inline = self.owner_display == "inline"
-        for owner, rects in owner_rects.items():
+        for owner, rect_group_pairs in owner_rects.items():
             if owner is self.element and not owner_is_inline:
                 continue
-            merged = []
-            for rect in rects:
-                if merged and abs(merged[-1][1] - rect[1]) < 0.01:
-                    previous = merged[-1]
-                    merged[-1] = (previous[0], previous[1],
-                                  rect[0] + rect[2] - previous[0],
-                                  max(previous[3], rect[3]))
-                else:
-                    merged.append(rect)
-            rects = merged
-            left = min(r[0] for r in rects); top = min(r[1] for r in rects)
-            right = max(r[0] + r[2] for r in rects); bottom = max(r[1] + r[3] for r in rects)
-            owner.__dict__["_chromonic_inline_boxes"] = rects
-            owner.__dict__["_layout_box"] = LayoutBox(
-                x=left, y=top, width=right-left, height=bottom-top,
-                client_width=right-left, client_height=bottom-top,
-            )
-            owner._chromonic_has_layout_children = True
-            owner._chromonic_owned_fragments = [
-                fragment for fragment in self.fragments if fragment.owner is owner
-            ]
+            entry = owner_accum.get(id(owner))
+            if entry is None:
+                entry = owner_accum[id(owner)] = (owner, {}, [])
+            groups = entry[1]
+            for rect, group in rect_group_pairs:
+                groups.setdefault(group, []).append(rect)
+            entry[2].extend(fragment for fragment in self.fragments if fragment.owner is owner)
         # Publish layout boxes for <br> elements sized to the line-box height
         # so the harness reports the correct height (Chrome: 18px, not 0).
         for run_index, run in enumerate(self.runs):
             if run.get("break"):
-                br_x, br_y, line_h = self._break_positions.get(run_index, (0.0, 0.0, 0.0))
+                br_x, br_y, line_h, line_margin_start, line_leading_total = self._break_positions.get(
+                    run_index, (0.0, 0.0, 0.0, 0.0, 0.0))
+                if self.rtl:
+                    # `_break_positions` is captured mid-`measure()`, before
+                    # the RTL mirror pass below runs on `placed` -- mirror
+                    # it here too against that same measured width, or a
+                    # `<br>`'s own marker box stays at its un-mirrored (LTR)
+                    # cursor position while the real text around it moves.
+                    # `<br>` marks the *cursor* position right after the
+                    # line's real content -- excluding `line_margin_start`
+                    # (this line's own `margin_start`, already baked into
+                    # `br_x`, and which sits *outside* the fragment on
+                    # mirror, same as for a real text token) but *including*
+                    # `line_leading_total` back in (a leading border/padding
+                    # edge, unlike margin, is part of the fragment itself,
+                    # so the cursor continues from just past it, matching
+                    # where a hypothetical next token would be placed).
+                    br_x = (getattr(self, "_measured_width", 0.0)
+                            - (br_x - line_margin_start) + line_leading_total)
                 run["element"].__dict__["_layout_box"] = LayoutBox(
                     x=origin_x + br_x, y=origin_y + br_y,
                     width=0.0, height=line_h,
                     client_width=0.0, client_height=line_h,
                 )
                 run["element"]._chromonic_has_layout_children = False
-        self.element._chromonic_inline_fragments = self.fragments
+        # Same accumulate-not-overwrite reasoning as `owner_accum` above,
+        # for the plan's own `element` (paint.py's `_chromonic_inline_
+        # fragments` is what actually gets drawn for it) -- a split
+        # element's *other* segment(s) are published by different `plan`
+        # instances that all still share this same `self.element`.
+        elem_entry = element_fragments_accum.get(id(self.element))
+        if elem_entry is None:
+            elem_entry = element_fragments_accum[id(self.element)] = (self.element, [])
+        elem_entry[1].extend(self.fragments)
 
 # Tags that never paint a box of their own, real-page metadata/logic rather
 # than content. domonic's cascade has no UA stylesheet giving these
@@ -617,6 +716,289 @@ def _numeric_edge(value) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
+def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
+                                 leading_edge=0.0, trailing_edge=0.0,
+                                 top_edge_val=0.0, extra_height=0.0,
+                                 margin_start=0.0):
+    """Build inline-formatting-plan `runs` entries for the text/`<br>`
+    content of `child_nodes` (in DOM order, no element children other than
+    `<br>`), attributing `leading_edge` (an owning element's own
+    border-left+padding-left) to the very first text run and
+    `trailing_edge` (border-right+padding-right) to the very last, plus
+    `top_edge_val`/`extra_height` (top/bottom border+padding, added to
+    every run's box height) and `margin_start` (margin-left, applied once,
+    before the first fragment, shifting placement without being part of any
+    run's own rect). `[]` if `child_nodes` has no non-empty text.
+
+    Extracted from `_make_inline_formatting_plan`'s own "kind == 'element'"
+    branch so `_split_wrapping_inline_element` (CSS 2.1 9.2.1.1: an inline
+    element split around an in-flow block child) can reuse the exact same
+    per-run construction for each of its own fragments, passing 0 for
+    whichever edge that particular fragment doesn't own (an interior
+    fragment, between two block interruptions, owns neither)."""
+    text_node_indices = [
+        i for i, n in enumerate(child_nodes)
+        if getattr(n, "nodeType", None) == TEXT_NODE
+        and _collapsed_text_node(n).strip()
+    ]
+    if not text_node_indices:
+        return []
+    runs = []
+    for node_index, child_node in enumerate(child_nodes):
+        node_tag = (getattr(child_node, "tagName", "") or "").lower()
+        if getattr(child_node, "nodeType", None) == TEXT_NODE:
+            raw_text = _collapsed_text_node(child_node)
+            if not raw_text:
+                continue
+            is_first_text = node_index == text_node_indices[0]
+            is_last_text = node_index == text_node_indices[-1]
+            run_leading = leading_edge if is_first_text else 0.0
+            run_trailing = trailing_edge if is_last_text else 0.0
+            t = _apply_text_transform(
+                re.sub(r"\s+", " ", raw_text),
+                paint_style.get("text_transform"),
+            )
+            if not t.strip():
+                continue
+            t = t.strip()
+            font_size_i = _fontmetrics.parse_length(paint_style["font_size"], default=16.0)
+            family_i = ("" if paint_style["font_family"] == "none"
+                        else paint_style["font_family"])
+            weight_i = _parse_font_weight(paint_style["font_weight"])
+            italic_i = fonts.is_italic(paint_style["font_style"])
+            ascent_i, descent_i, normal_i = fonts.text_metrics(
+                family_i, font_size_i, weight_i >= 600, italic_i)
+            glyph_h_i = ascent_i + descent_i
+            used_lh_i = _resolved_line_height(paint_style["line_height"]) or normal_i
+            above_i = ascent_i + math.floor((used_lh_i - glyph_h_i) / 2)
+            below_i = used_lh_i - above_i
+            box_h_i = glyph_h_i + extra_height
+            one_w = layout_text("a", family_i, font_size_i,
+                                font_weight=weight_i, italic=italic_i)[0]
+            spaced_w = layout_text("a a", family_i, font_size_i,
+                                   font_weight=weight_i, italic=italic_i)[0]
+            space_w_i = max(0.0, spaced_w - 2.0 * one_w)
+            tokens_i = []
+            for tok in re.findall(r"\S+\s*|\s+", t):
+                m, _h, _ls = layout_text(
+                    tok, family_i, font_size_i,
+                    font_weight=weight_i, italic=italic_i,
+                    letter_spacing=_fontmetrics.parse_length(
+                        paint_style["letter_spacing"], default=0.0),
+                    word_spacing=_fontmetrics.parse_length(
+                        paint_style["word_spacing"], default=0.0),
+                )
+                tokens_i.append((tok, sum(l[1] for l in _ls)))
+            runs.append({
+                "source": child_node, "owner": owner,
+                "paint_style": paint_style,
+                "font_size": font_size_i, "tokens": tokens_i,
+                "leading": run_leading, "trailing": run_trailing,
+                "box_height": box_h_i,
+                "glyph_height": glyph_h_i, "ascent": ascent_i,
+                "above": above_i, "below": below_i,
+                "top_edge": top_edge_val,
+                "space_width": space_w_i,
+                "atomic_width": 0.0,
+                "margin_start": margin_start if is_first_text else 0.0,
+                "intrinsic_width": (
+                    (margin_start if is_first_text else 0.0)
+                    + run_leading + sum(w for _t, w in tokens_i)
+                    + run_trailing
+                ),
+            })
+        elif node_tag == "br":
+            runs.append({"break": True, "element": child_node})
+    return runs
+
+
+def _contains_in_flow_block(element, computed_cache) -> bool:
+    """Whether `element`'s subtree contains a genuine in-flow (not
+    absolutely positioned), block-level descendant reachable by walking
+    only through inline-level elements -- the CSS 2.1 9.2.1.1 "anonymous
+    block box" trigger: an inline element that contains an in-flow block
+    child splits around it instead of the block being (wrongly) folded
+    into the surrounding inline formatting context.
+
+    `select`/`svg` are never walked into -- `_child_elements` already
+    treats their real DOM children (`<option>`, SVG shapes) as not real
+    layout content at all (`build()`'s `tag_name in ("select", "svg")`
+    special-case), and this function must agree: found as a regression
+    (`<option>` ending up its own laid-out Taffy node, `<select>` mistaken
+    for an inline element split around one of its own `<option>`s) --
+    `element.childNodes` has no such filtering built in, unlike
+    `_child_elements`."""
+    tag_name = (getattr(element, "tagName", "") or "").lower()
+    if tag_name in ("select", "svg"):
+        return False
+    for node in element.childNodes or ():
+        if not _is_element(node):
+            continue
+        tag = (getattr(node, "tagName", "") or "").lower()
+        if tag == "br" or tag in _NON_RENDERING_TAGS:
+            continue
+        child_computed, child_style = _describe(node, computed_cache)
+        if not _renders(child_style):
+            continue
+        if _is_absolutely_positioned(child_style):
+            continue
+        if not _is_inline_level(node, child_style):
+            return True
+        if _contains_in_flow_block(node, computed_cache):
+            return True
+    return False
+
+
+def _split_wrapping_inline_element(wrapper, computed_cache):
+    """CSS 2.1 9.2.1.1: `wrapper`, an inline-level element whose own
+    children include a genuine in-flow block (`_contains_in_flow_block`),
+    splits into a sequence of fragments around each such block -- yields
+    `("run", runs)` (a `_build_text_runs_from_nodes` result, possibly
+    empty) or `("block", child, child_computed, child_style)`, in DOM
+    order. Only the first run fragment gets `wrapper`'s own left
+    border/padding/margin; only the last gets its right border/padding --
+    an interior fragment (between two block interruptions) gets neither,
+    matching how a real inline box's edges only ever show up on its
+    outermost fragments. `wrapper` itself is never built as a Taffy node --
+    the split exists only in the layout projection; its DOM (and the real
+    `wrapper` element/its children) is untouched, so a later relayout with
+    different content still walks the same real nodes."""
+    wrapper_computed, wrapper_style_obj = _describe(wrapper, computed_cache)
+    native = style_bridge.to_dict(wrapper_style_obj)
+    wrapper._chromonic_native_style = native
+    left_edge = _numeric_edge(native["padding"][3]) + _numeric_edge(native["border"][3])
+    right_edge = _numeric_edge(native["padding"][1]) + _numeric_edge(native["border"][1])
+    top_edge_val = _numeric_edge(native["padding"][0]) + _numeric_edge(native["border"][0])
+    extra_height = (top_edge_val + _numeric_edge(native["padding"][2])
+                    + _numeric_edge(native["border"][2]))
+    margin_start = _numeric_edge(native["margin"][3])
+    paint_style = wrapper._chromonic_paint_style
+
+    segments: list = [[]]
+    blocks: list = []
+    for node in wrapper.childNodes or ():
+        if _is_element(node):
+            tag = (getattr(node, "tagName", "") or "").lower()
+            if tag in _NON_RENDERING_TAGS:
+                continue
+            if tag != "br":
+                child_computed, child_style = _describe(node, computed_cache)
+                if not _renders(child_style):
+                    continue
+                if not _is_absolutely_positioned(child_style) and not _is_inline_level(node, child_style):
+                    blocks.append((node, child_computed, child_style))
+                    segments.append([])
+                    continue
+        segments[-1].append(node)
+
+    # `getClientRects()`/`getBoundingClientRect()`: Chrome exposes one extra,
+    # zero-height rect per interruption -- positioned exactly where the
+    # interrupting block sits -- alongside the real leading/trailing
+    # fragment rects (confirmed: a 2-fragment split's `element.getClientRects
+    # ()` returns *3* rects in real Chrome, not 2). `_finalize_inline_owner_
+    # boxes` adds these once boxes are final; record which blocks to use here
+    # (overwritten fresh on every relayout that reaches this branch) rather
+    # than recomputing the split there, where only `owner_accum`'s already-
+    # merged rects are visible.
+    wrapper._chromonic_interruption_blocks = [block for block, _computed, _style in blocks]
+
+    for index, seg_nodes in enumerate(segments):
+        is_first, is_last = index == 0, index == len(segments) - 1
+        runs = _build_text_runs_from_nodes(
+            seg_nodes, paint_style, wrapper,
+            leading_edge=left_edge if is_first else 0.0,
+            trailing_edge=right_edge if is_last else 0.0,
+            top_edge_val=top_edge_val, extra_height=extra_height,
+            margin_start=margin_start if is_first else 0.0,
+        )
+        if runs:
+            # Tags each run with which segment (0-based, in split/document
+            # order) it belongs to, so `_finalize_inline_owner_boxes` can
+            # place the interruption-marker rects at their *logical* split
+            # position -- Chrome preserves document order in
+            # `getClientRects()`, not a geometric top-to-bottom/left-to-
+            # right sort (which happened to put a later segment's rect
+            # before an earlier interruption's marker purely because of a
+            # couple of stray pixels in this project's own line-height
+            # rounding).
+            for run in runs:
+                if not run.get("break"):
+                    run["split_group"] = index
+            yield ("run", runs)
+        if index < len(blocks):
+            yield ("block",) + blocks[index]
+
+
+def _split_inline_flow_around_blocks(element, inline_items, style, css_display, computed_cache):
+    """`inline_items` (`_inline_mixed_content`'s own shape) contains, at
+    some depth reachable only through inline-level elements, a genuine
+    in-flow block -- CSS 2.1 9.2.1.1's "anonymous block box" case
+    (`<div><span>One<div/>Two</span></div>`: the block's presence forces
+    `span` to split into a "One" fragment, the real block, and a "Two"
+    fragment, each a sibling in normal block flow -- not one flex row, and
+    not folded into a single inline run the way `_make_inline_formatting_
+    plan` alone would (return `None`, unable to represent a block inside
+    one measured text leaf) or discarded into `build()`'s flex-row/wrap
+    fallback (loses the CSS-required block-level split entirely).
+
+    Returns an ordered list of pieces -- `("plan", _InlineFormattingPlan)`
+    or `("block", child, child_computed, child_style)` -- ready to become
+    `element`'s Taffy children as an *ordinary* block stack (the caller
+    must not use flex for this), each plan becoming one measured text leaf
+    and each block its own recursively-built subtree via `build()`. `None`
+    if nothing in `inline_items` actually needs splitting -- the caller
+    should fall back to its existing handling unchanged."""
+    pieces: list = []
+    pending: list = []
+    found_split = False
+
+    def flush_pending():
+        if pending:
+            plan = _make_inline_formatting_plan(element, list(pending), style, css_display)
+            if plan is not None:
+                pieces.append(("plan", plan))
+            pending.clear()
+
+    for kind, item, text, child_computed, child_style in inline_items:
+        if kind == "element" and _contains_in_flow_block(item, computed_cache):
+            found_split = True
+            flush_pending()
+            runs_acc: list = []
+            for sub in _split_wrapping_inline_element(item, computed_cache):
+                if sub[0] == "run":
+                    runs_acc.extend(sub[1])
+                else:
+                    if runs_acc:
+                        plan = _InlineFormattingPlan(
+                            element, runs_acc, element._chromonic_paint_style, css_display)
+                        # A block interruption follows -- this plan is a
+                        # *leading* or *interior* segment, never the
+                        # wrapper's true trailing one, regardless of
+                        # whether it happens to be the only (and so,
+                        # locally, "last") entry in its own `placed` list.
+                        # `measure()`'s RTL mirror must not apply the
+                        # wrapper's margin-right to it on that false
+                        # signal -- margin-right belongs only to the one
+                        # segment that comes after every interruption.
+                        plan._chromonic_final_split_fragment = False
+                        pieces.append(("plan", plan))
+                        runs_acc = []
+                    pieces.append(sub)
+            if runs_acc:
+                # Nothing follows this plan for `item` -- the real trailing
+                # segment, where `measure()` should apply the wrapper's
+                # margin-right normally (the default when this attribute is
+                # absent, as for every ordinary non-split plan).
+                plan = _InlineFormattingPlan(
+                    element, runs_acc, element._chromonic_paint_style, css_display)
+                plan._chromonic_final_split_fragment = True
+                pieces.append(("plan", plan))
+        else:
+            pending.append((kind, item, text, child_computed, child_style))
+    flush_pending()
+    return pieces if found_split else None
+
+
 def _make_inline_formatting_plan(element, inline_items, style, css_display):
     """Build styled text runs for a shared inline formatting context."""
     if any(kind == "element" and _is_absolutely_positioned(child_style)
@@ -645,10 +1027,19 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display):
             ]
             if non_br_element_children:
                 return None
+            # `item` is taking the ordinary (non-split) path this layout --
+            # clear any stale `_chromonic_interruption_blocks` a *previous*
+            # layout's `_split_wrapping_inline_element` may have left on it
+            # (its block child since removed/changed), so
+            # `_finalize_inline_owner_boxes` doesn't insert a phantom
+            # interruption-marker rect using now-unrelated geometry.
+            item.__dict__.pop("_chromonic_interruption_blocks", None)
             # Walk childNodes to collect text segments and <br> breaks,
             # producing runs for each and decorating them with the child
             # element's border+padding edges (CSS 2.1: first fragment gets
-            # left edge, last fragment gets right edge).
+            # left edge, last fragment gets right edge). See
+            # `_build_text_runs_from_nodes` -- also reused, with a real
+            # split, by `_split_wrapping_inline_element`.
             native = style_bridge.to_dict(child_style)
             item._chromonic_native_style = native
             left_edge = (_numeric_edge(native["padding"][3])
@@ -663,85 +1054,12 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display):
             # margin-left applies before the first LTR fragment only; it
             # shifts placement but is not part of the fragment rect.
             margin_start = _numeric_edge(native["margin"][3])
-            # Collect child nodes in DOM order; text nodes and <br>s only.
-            child_nodes = list(item.childNodes or [])
-            # Identify which text-producing child nodes are first/last so
-            # we know which runs get the left/right decoration.
-            text_node_indices = [
-                i for i, n in enumerate(child_nodes)
-                if getattr(n, "nodeType", None) == TEXT_NODE
-                and _collapsed_text_node(n).strip()
-            ]
-            if not text_node_indices:
-                continue
-            paint_style = item._chromonic_paint_style
-            owner = item
-            for node_index, child_node in enumerate(child_nodes):
-                node_tag = (getattr(child_node, "tagName", "") or "").lower()
-                if getattr(child_node, "nodeType", None) == TEXT_NODE:
-                    raw_text = _collapsed_text_node(child_node)
-                    if not raw_text:
-                        continue
-                    is_first_text = node_index == text_node_indices[0]
-                    is_last_text = node_index == text_node_indices[-1]
-                    run_leading = left_edge if is_first_text else 0.0
-                    run_trailing = right_edge if is_last_text else 0.0                    # Build a full run inline rather than falling through to
-                    # the shared code below (source/owner/paint_style differ).
-                    t = _apply_text_transform(
-                        re.sub(r"\s+", " ", raw_text),
-                        paint_style.get("text_transform"),
-                    )
-                    if not t.strip():
-                        continue
-                    t = t.strip()
-                    font_size_i = _fontmetrics.parse_length(paint_style["font_size"], default=16.0)
-                    family_i = ("" if paint_style["font_family"] == "none"
-                                else paint_style["font_family"])
-                    weight_i = _parse_font_weight(paint_style["font_weight"])
-                    italic_i = fonts.is_italic(paint_style["font_style"])
-                    ascent_i, descent_i, normal_i = fonts.text_metrics(
-                        family_i, font_size_i, weight_i >= 600, italic_i)
-                    glyph_h_i = ascent_i + descent_i
-                    used_lh_i = _resolved_line_height(paint_style["line_height"]) or normal_i
-                    above_i = ascent_i + math.floor((used_lh_i - glyph_h_i) / 2)
-                    below_i = used_lh_i - above_i
-                    box_h_i = glyph_h_i + extra_height
-                    one_w = layout_text("a", family_i, font_size_i,
-                                        font_weight=weight_i, italic=italic_i)[0]
-                    spaced_w = layout_text("a a", family_i, font_size_i,
-                                           font_weight=weight_i, italic=italic_i)[0]
-                    space_w_i = max(0.0, spaced_w - 2.0 * one_w)
-                    tokens_i = []
-                    for tok in re.findall(r"\S+\s*|\s+", t):
-                        m, _h, _ls = layout_text(
-                            tok, family_i, font_size_i,
-                            font_weight=weight_i, italic=italic_i,
-                            letter_spacing=_fontmetrics.parse_length(
-                                paint_style["letter_spacing"], default=0.0),
-                            word_spacing=_fontmetrics.parse_length(
-                                paint_style["word_spacing"], default=0.0),
-                        )
-                        tokens_i.append((tok, sum(l[1] for l in _ls)))
-                    runs.append({
-                        "source": child_node, "owner": owner,
-                        "paint_style": paint_style,
-                        "font_size": font_size_i, "tokens": tokens_i,
-                        "leading": run_leading, "trailing": run_trailing,
-                        "box_height": box_h_i,
-                        "glyph_height": glyph_h_i, "ascent": ascent_i,
-                        "above": above_i, "below": below_i,
-                        "top_edge": top_edge_val,
-                        "space_width": space_w_i,
-                        "atomic_width": 0.0,
-                        "margin_start": margin_start if is_first_text else 0.0,
-                        "intrinsic_width": (
-                            (margin_start if is_first_text else 0.0)
-                            + run_leading + sum(w for _t, w in tokens_i)
-                            + run_trailing
-                        ),
-                    })
-                elif node_tag == "br":
-                    runs.append({"break": True, "element": child_node})
+            runs.extend(_build_text_runs_from_nodes(
+                list(item.childNodes or []), item._chromonic_paint_style, item,
+                leading_edge=left_edge, trailing_edge=right_edge,
+                top_edge_val=top_edge_val, extra_height=extra_height,
+                margin_start=margin_start,
+            ))
             continue
         raw = getattr(source, "textContent", "") or collapsed or ""
         text = _apply_text_transform(re.sub(r"\s+", " ", raw), paint_style.get("text_transform"))
@@ -1522,12 +1840,67 @@ def build(
     if tag_name == "button":
         _apply_button_intrinsic_width(style, element)
     inline_items = _inline_mixed_content(element, children) if children else None
-    inline_plan = (_make_inline_formatting_plan(
-                       element, inline_items, style,
-                       getattr(style_obj.display, "value", "").strip() or "block")
-                   if inline_items else None)
+    css_display_value = getattr(style_obj.display, "value", "").strip() or "block"
+    split_pieces = (_split_inline_flow_around_blocks(
+                         element, inline_items, style, css_display_value, computed_cache)
+                     if inline_items else None)
+    inline_plan = (_make_inline_formatting_plan(element, inline_items, style, css_display_value)
+                   if inline_items and split_pieces is None else None)
 
-    if inline_plan is not None:
+    if split_pieces is not None:
+        # CSS 2.1 9.2.1.1: an inline element split around an in-flow block
+        # child -- see `_split_inline_flow_around_blocks`. Each piece
+        # becomes its own ordinary block-flow child of `element` (never a
+        # flex row): a "plan" piece is one measured text leaf (same
+        # machinery as the single-inline-plan case below, just built once
+        # per piece instead of once for the whole element), a "block" piece
+        # is that child's own real, recursively-built subtree.
+        element.__dict__.pop("_chromonic_inline_plan", None)
+        element._chromonic_inline_fragments = []
+        owner_cache = element.__dict__.setdefault("_chromonic_split_plan_owners", {})
+        piece_ids = []
+        plan_index = 0
+        for kind, *payload in split_pieces:
+            if kind == "plan":
+                (plan,) = payload
+                owner = owner_cache.get(plan_index)
+                if owner is None:
+                    owner = owner_cache[plan_index] = _AnonymousInlineRun(None, element)
+                plan_index += 1
+                plan_style = _inline_text_style(style)
+                plan_style["width"] = ("pct", 1.0) if style["display"] == "block" else "auto"
+                measure_key = ("inline-context", tuple(element._chromonic_paint_style.items()), tuple(
+                    ("break", id(run["element"])) if run.get("break") else
+                    (id(run["source"]), id(run["owner"]), tuple(run["paint_style"].items()),
+                     tuple(run["tokens"]), run["above"], run["below"], run["box_height"],
+                     run["leading"], run["trailing"], run["top_edge"], run["atomic_width"],
+                     run.get("margin_start", 0.0))
+                    for run in plan.runs
+                ))
+                if projection is not None and not projection.measure_changed(owner, measure_key):
+                    plan = owner._chromonic_inline_plan
+                owner._chromonic_inline_plan = plan
+                owner._chromonic_native_style = plan_style
+                measure = (plan.measure
+                           if projection is None or projection.measure_changed(owner, measure_key) else None)
+                piece_id = (projection.upsert(owner, plan_style, [], measure, measure_key)
+                            if projection else tree.new_text_leaf(plan_style, measure))
+                node_map[piece_id] = owner
+            else:
+                child, child_computed, child_style = payload
+                child_is_cb = _establishes_containing_block(child_style)
+                piece_id = build(
+                    tree, child, node_map, computed=child_computed, style_obj=child_style,
+                    computed_cache=computed_cache, is_containing_block=child_is_cb, escapees=own_escapees,
+                    reuse_styles=reuse_styles, projection=projection,
+                )
+            piece_ids.append(piece_id)
+        for stale in [key for key in owner_cache if key >= plan_index]:
+            owner_cache.pop(stale)
+        all_child_ids = piece_ids + (own_escapees if is_containing_block else [])
+        node_id = (projection.upsert(element, style, all_child_ids, None, None)
+                   if projection else tree.new_with_children(style, all_child_ids))
+    elif inline_plan is not None:
         element._chromonic_has_layout_children = True
         if style["display"] == "block" and style["width"] == "auto":
             style["width"] = ("pct", 1.0)
@@ -1896,9 +2269,87 @@ def _write_boxes(boxes, node_map):
         state["_chromonic_padding"] = (pt, pr, pb, pl)
 
 
+def _merge_adjacent_same_line_rects(rects) -> list:
+    """Combine consecutive rects (already in the order they were placed --
+    left-to-right within one line) that share a `y` into one wider rect,
+    the way multiple runs on the same line (e.g. text either side of a
+    nested `<b>`) collapse into a single `getClientRects()` entry."""
+    merged = []
+    for rect in rects:
+        if merged and abs(merged[-1][1] - rect[1]) < 0.01:
+            previous = merged[-1]
+            merged[-1] = (previous[0], previous[1],
+                          rect[0] + rect[2] - previous[0],
+                          max(previous[3], rect[3]))
+        else:
+            merged.append(rect)
+    return merged
+
+
+def _finalize_inline_owner_boxes(owner_accum) -> None:
+    """Merge each inline owner's accumulated fragment rects -- raw,
+    pre-merge, gathered across every `_InlineFormattingPlan` that published
+    fragments for it (CSS 2.1 9.2.1.1: an element split around an in-flow
+    block child, `_split_wrapping_inline_element`, contributes fragments
+    from multiple, independently-published plans, one per split segment,
+    that all still belong to the same original owner) -- into that owner's
+    final `_chromonic_inline_boxes`/`_layout_box`/`_chromonic_owned_
+    fragments`, exactly once per owner per layout pass regardless of how
+    many plans it was split across.
+
+    Rects are grouped by `run["split_group"]` (`None` for an ordinary,
+    non-split owner -- always exactly one group) rather than merged as one
+    undifferentiated, re-sorted list: `getClientRects()` preserves *document*
+    order, not a geometric top-to-bottom sort, and re-sorting previously
+    placed a later real segment before an *earlier* interruption's marker
+    purely from a couple of stray pixels in this project's own line-height
+    rounding -- wrong even though the numeric `y` values technically sorted
+    that way. Each group is merged internally in its own natural (already
+    left-to-right/top-to-bottom) order; groups themselves are emitted in
+    split order (0, 1, 2, ...), interleaved with that group's following
+    interruption-marker rect, if any."""
+    for owner, groups, fragments in owner_accum.values():
+        if not groups:
+            continue
+        group_keys = sorted(groups, key=lambda key: (key is not None, key))
+        merged_groups = [_merge_adjacent_same_line_rects(groups[key]) for key in group_keys]
+        all_merged = [rect for group in merged_groups for rect in group]
+        # Bounding geometry comes from the real (text) fragment rects only --
+        # computed *before* any interruption-marker rects are added below, so
+        # inserting one can never change `getBoundingClientRect()`.
+        left = min(r[0] for r in all_merged); top = min(r[1] for r in all_merged)
+        right = max(r[0] + r[2] for r in all_merged); bottom = max(r[1] + r[3] for r in all_merged)
+        owner.__dict__["_layout_box"] = LayoutBox(
+            x=left, y=top, width=right-left, height=bottom-top,
+            client_width=right-left, client_height=bottom-top,
+        )
+        owner._chromonic_has_layout_children = True
+        owner._chromonic_owned_fragments = fragments
+        # `getClientRects()`: real Chrome exposes one extra, zero-height rect
+        # per in-flow block interruption (CSS 2.1 9.2.1.1), positioned
+        # exactly at that block's own box -- on top of, not merged with, the
+        # real leading/trailing fragment rects either side of it, and at its
+        # *logical* split position (between the segment before it and the
+        # segment after), not wherever a geometric sort would place it.
+        interruption_blocks = getattr(owner, "_chromonic_interruption_blocks", None) or ()
+        if not interruption_blocks:
+            owner.__dict__["_chromonic_inline_boxes"] = all_merged
+            continue
+        final_rects: list = []
+        for index, group in enumerate(merged_groups):
+            final_rects.extend(group)
+            if index < len(interruption_blocks):
+                box = interruption_blocks[index].__dict__.get("_layout_box")
+                if box is not None:
+                    final_rects.append((box.x, box.y, box.width, 0.0))
+        owner.__dict__["_chromonic_inline_boxes"] = final_rects
+
+
 def _publish_inline_formatting(node_map) -> None:
     """Project shared line fragments after parent boxes reach final positions."""
     seen = set()
+    owner_accum: dict = {}
+    element_fragments_accum: dict = {}
     for element in node_map.values():
         if id(element) in seen:
             continue
@@ -1906,7 +2357,11 @@ def _publish_inline_formatting(node_map) -> None:
         plan = getattr(element, "_chromonic_inline_plan", None)
         box = element.__dict__.get("_layout_box")
         if plan is not None and box is not None:
-            plan.publish(box, element.__dict__.get("_chromonic_padding", (0.0,) * 4))
+            plan.publish(box, element.__dict__.get("_chromonic_padding", (0.0,) * 4),
+                         owner_accum, element_fragments_accum)
+    _finalize_inline_owner_boxes(owner_accum)
+    for element, fragments in element_fragments_accum.values():
+        element._chromonic_inline_fragments = fragments
 
 
 def _adjust_body_collapsed_margins(root_element):

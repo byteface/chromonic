@@ -15,7 +15,14 @@ from pathlib import Path
 import urllib.request
 
 
-from . import domonic_layout_calc_var_patch, domonic_logical_properties_patch, hittest, tree, window
+from . import (
+    domonic_cdata_style_patch,
+    domonic_layout_calc_var_patch,
+    domonic_logical_properties_patch,
+    hittest,
+    tree,
+    window,
+)
 
 
 def _is_url(s: str) -> bool:
