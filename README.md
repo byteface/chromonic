@@ -123,6 +123,11 @@ python chromonic/benchmarks/smoke_native.py
 python chromonic/examples/browse2.py https://example.com/ --frames 2
 ```
 
+Press `F12` for a devtools-style console (green-on-black, drops down from the
+toolbar). It evaluates input as Python against the loaded page's `document`/
+`window`, so JS-style one-liners like `document.getElementById('x').textContent`
+work as-is since domonic's DOM mirrors the real API.
+
 
 ## Web fonts
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-VIEWPORT = (800, 600)
+VIEWPORT = (800, 512)
 RECT_FIELDS = ("x", "y", "width", "height")
 STYLE_PROPERTIES = (
     "display", "position", "box-sizing", "overflow-x", "overflow-y",

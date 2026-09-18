@@ -69,6 +69,51 @@ def _accepts_pointer(element) -> bool:
     return True
 
 
+def cursor_for_element(element) -> str:
+    """Return the cursor shape ('pointer', 'text', or 'arrow') for a hovered
+    element -- walking up through ancestors the same way `click()` already
+    does to find an enclosing `<a href>`, so hovering text nested inside a
+    link still shows the hand cursor. Computed `cursor: pointer`/`text`
+    wins over tag-based defaults when the author set one explicitly."""
+
+    node = element
+
+    while node is not None and _is_element(node):
+        cursor = _style_keyword(node, "cursor")
+
+        if cursor == "pointer":
+            return "pointer"
+
+        if cursor == "text":
+            return "text"
+
+        tag = (getattr(node, "tagName", "") or "").lower()
+
+        if tag == "a" and node.getAttribute("href"):
+            return "pointer"
+
+        if tag in ("button", "select"):
+            return "pointer"
+
+        if tag == "input":
+            input_type = (node.getAttribute("type") or "text").lower()
+
+            if input_type in ("button", "submit", "reset", "checkbox", "radio"):
+                return "pointer"
+
+            return "text"
+
+        if tag == "textarea":
+            return "text"
+
+        if (node.getAttribute("contenteditable") or "").lower() in ("", "true"):
+            return "text"
+
+        node = getattr(node, "parentElement", None)
+
+    return "arrow"
+
+
 def hit_test(root_element, x: float, y: float):
     """Return the innermost painted element under (x, y)."""
 

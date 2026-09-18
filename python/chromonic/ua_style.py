@@ -105,6 +105,7 @@ hr { margin: 0.5em 0; border: 1px solid; height: 0; }
 button, input { display: inline-block; font: 13.3333px Arial; margin: 0; }
 button { height: 21px; padding: 1px 6px; border: 2px solid; box-sizing: border-box; text-align: center; }
 input { width: 145px; height: 15px; padding: 1px 2px; border: 2px solid; box-sizing: content-box; overflow: clip; }
+iframe { display: inline-block; width: 300px; height: 150px; border: 2px solid; box-sizing: content-box; }
 """.strip()
 
 STYLESHEET = f"@layer chromonic-ua {{\n{_RULES}\n}}"

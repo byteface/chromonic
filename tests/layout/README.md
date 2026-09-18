@@ -66,6 +66,44 @@ Known upstream or deliberately unfixed gaps live under `known_issues/`. Run
 them explicitly with `harness.run_suite tests/layout/known_issues/<name>.html`
 when working that issue, but they are not part of the default green baseline.
 
+## Running the real web-platform-tests suite
+
+`harness.run_wpt` (see `PLAN.md` for the objective) runs fixtures straight out
+of a local `web-platform-tests` checkout at `tests/wpt/` instead of the
+handwritten `tests/layout/fixtures/`:
+
+```sh
+git clone --depth=1 https://github.com/web-platform-tests/wpt.git tests/wpt
+```
+
+Both Chrome and chromonic load each test over real HTTP rather than from
+disk, because many WPT fixtures reference absolute-root paths (`/fonts/
+ahem.css`, `/resources/testharness.js`, etc.) that only resolve correctly
+against a server whose document root is `tests/wpt/`. `harness.run_wpt`
+does not start that server itself — start it first, in its own terminal,
+and leave it running for the duration of the run:
+
+```sh
+make layout-wpt-server
+# or directly:
+.venv/bin/python -m http.server 8943 --directory tests/wpt --bind 127.0.0.1
+```
+
+Then, from a second terminal, run the WPT harness against any folder under
+the checkout:
+
+```sh
+PYTHONPATH=tests/layout .venv/bin/python -m harness.run_wpt \
+  tests/wpt/css/CSS2/linebox \
+  --limit 20
+```
+
+If the harness prints `ConnectionError: ... Connection refused` on port
+8943, the server above either isn't running or was stopped (e.g. by a
+terminal restart) — start it again before re-running. `--base-url` overrides
+the default `http://127.0.0.1:8943` if you serve `tests/wpt/` on a different
+port.
+
 The original eleven fixtures remain as regression coverage. The expanded
 suite now has a zero-geometry-mismatch baseline across all 21 fixtures,
 including the realistic pages, and should stay green unless a fixture is added

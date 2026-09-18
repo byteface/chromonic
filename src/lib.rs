@@ -622,14 +622,52 @@ fn layout_text(
             layout.break_all_lines(max_width);
             layout.align(Alignment::Start, AlignmentOptions::default());
 
-            let width = layout.width();
             let height = layout.height();
+            let mut width: f32 = 0.0;
             let mut lines = Vec::new();
             for line in layout.lines() {
                 let range = line.text_range();
                 let line_text = text.get(range).unwrap_or("").to_string();
                 let metrics = line.metrics();
-                lines.push((line_text, metrics.advance, metrics.line_height));
+                let mut line_width = metrics.advance;
+                // Parley trims a line's *measured* width down to its last
+                // non-whitespace glyph (any Unicode whitespace, matching how
+                // most text-layout engines treat trailing whitespace for
+                // alignment purposes) -- but CSS 2.1 16.6.1 only ever
+                // collapses/trims plain ASCII space/tab/newline/CR/FF;
+                // U+00A0 (`&nbsp;`) always renders as a real glyph and must
+                // never be trimmed from the box's width. `line_text` itself
+                // already includes the trailing NBSPs (`text_range()` spans
+                // the whole line's source text regardless), so only the
+                // numeric width needs correcting: re-measure the trailing
+                // NBSP run on its own and add it back. Found on
+                // `wpt/css/CSS2/positioning/abspos-011.xht`:
+                // `<p>FAIL&nbsp;&nbsp;&nbsp;&nbsp;</p>` measured 4
+                // characters wide instead of 9.
+                let trailing_nbsp: String =
+                    line_text.chars().rev().take_while(|&c| c == '\u{00A0}').collect();
+                if !trailing_nbsp.is_empty() {
+                    let mut run_builder =
+                        layout_cx.ranged_builder(&mut font_cx, &trailing_nbsp, 1.0, true);
+                    run_builder.push_default(StyleProperty::FontFamily(font_family.into()));
+                    run_builder.push_default(StyleProperty::FontSize(font_size));
+                    run_builder
+                        .push_default(StyleProperty::FontWeight(ParleyFontWeight::new(font_weight)));
+                    if italic {
+                        run_builder.push_default(StyleProperty::FontStyle(ParleyFontStyle::Italic));
+                    }
+                    if letter_spacing != 0.0 {
+                        run_builder.push_default(StyleProperty::LetterSpacing(letter_spacing));
+                    }
+                    if word_spacing != 0.0 {
+                        run_builder.push_default(StyleProperty::WordSpacing(word_spacing));
+                    }
+                    let mut run_layout: parley::Layout<()> = run_builder.build(&trailing_nbsp);
+                    run_layout.break_all_lines(None);
+                    line_width += run_layout.width();
+                }
+                width = width.max(line_width);
+                lines.push((line_text, line_width, metrics.line_height));
             }
             Ok((width, height, lines))
         })

@@ -97,25 +97,215 @@ def _background_image_url(value: "str | None") -> "str | None":
     return next((group.strip() for group in match.groups() if group is not None), None)
 
 
-def _paint_background_image(canvas: "skia.Canvas", element, box, style: dict) -> None:
-    url = _background_image_url(style.get("background_image"))
-    if not url:
-        return
-    if not urllib.parse.urlsplit(url).scheme:
-        doc = getattr(element, "ownerDocument", None)
-        base = getattr(doc, "_chromonic_base_url", "")
-        url = urllib.parse.urljoin(base, url)
+def _split_top_level(text: "str | None") -> "list[str]":
+    """Split a CSS value on commas that aren't inside `url(...)`/`fn(...)`
+    -- `background-image`/`-size`/`-position`/`-repeat` are each their own
+    comma-separated list, one entry per layer, and a `url(...)` can itself
+    contain a comma (a `data:` URI) that must not split it."""
+    parts, current, depth = [], [], 0
+    for char in text or "":
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        if char == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current).strip())
+    return parts
+
+
+def _layer_value(values: "list[str]", index: int, default: str) -> str:
+    """CSS repeats a shorter `background-*` list to match the number of
+    `background-image` layers (spec: "if there are more comma-separated
+    images than values for a property, the values are repeated")."""
+    return values[index % len(values)] if values else default
+
+
+_BG_SIZE_KEYWORDS = {"cover", "contain"}
+
+
+def _resolve_layer_size(size_token: str, natural_w: float, natural_h: float,
+                         box_w: float, box_h: float) -> "tuple[float, float]":
+    token = (size_token or "auto").strip().lower()
+    if not natural_w or not natural_h:
+        return (box_w, box_h) if token in _BG_SIZE_KEYWORDS else (natural_w, natural_h)
+    if token == "cover":
+        scale = max(box_w / natural_w, box_h / natural_h)
+        return natural_w * scale, natural_h * scale
+    if token == "contain":
+        scale = min(box_w / natural_w, box_h / natural_h)
+        return natural_w * scale, natural_h * scale
+
+    def component(part: "str | None", axis_box: float) -> "float | None":
+        if not part or part == "auto":
+            return None
+        if part.endswith("%"):
+            try:
+                return axis_box * float(part[:-1]) / 100.0
+            except ValueError:
+                return None
+        try:
+            return float(part.rstrip("px"))
+        except ValueError:
+            return None
+
+    parts = token.split()
+    width = component(parts[0] if parts else None, box_w)
+    height = component(parts[1] if len(parts) > 1 else None, box_h)
+    if width is None and height is None:
+        return float(natural_w), float(natural_h)
+    if width is None:
+        width = natural_w * (height / natural_h)
+    if height is None:
+        height = natural_h * (width / natural_w)
+    return width, height
+
+
+_BG_POS_H_KEYWORDS = {"left": "0%", "right": "100%", "center": "50%"}
+_BG_POS_V_KEYWORDS = {"top": "0%", "bottom": "100%", "center": "50%"}
+
+
+def _resolve_layer_position(pos_token: str, layer_w: float, layer_h: float,
+                             box_w: float, box_h: float) -> "tuple[float, float]":
+    tokens = (pos_token or "0% 0%").strip().lower().split() or ["0%", "0%"]
+    if len(tokens) == 1:
+        tokens = [tokens[0], "center"]
+    x_token, y_token = tokens[0], tokens[1]
+    # Keyword pairs are order-independent ("top right" as well as "right
+    # top"); a lone vertical keyword in the first slot (or horizontal in
+    # the second) means they were written swapped from the usual x-then-y.
+    if x_token in ("top", "bottom") or y_token in ("left", "right"):
+        x_token, y_token = y_token, x_token
+    x_value = _BG_POS_H_KEYWORDS.get(x_token, x_token)
+    y_value = _BG_POS_V_KEYWORDS.get(y_token, y_token)
+
+    def offset(value: str, axis_box: float, axis_layer: float) -> float:
+        if value.endswith("%"):
+            try:
+                fraction = float(value[:-1]) / 100.0
+            except ValueError:
+                return 0.0
+            return (axis_box - axis_layer) * fraction
+        try:
+            return float(value.rstrip("px"))
+        except ValueError:
+            return 0.0
+
+    return offset(x_value, box_w, layer_w), offset(y_value, box_h, layer_h)
+
+
+def _background_image_candidate_urls(url: str, doc) -> "list[str]":
+    """Absolute URLs `url` could resolve to, most-likely-correct first.
+
+    A CSS `url()` resolves relative to the stylesheet it was written in,
+    not the page -- `webfonts.py` already gets this right for `@font-face
+    src` (using `sheet.href` as the base), but `background-image` had no
+    such handling at all and just resolved against the *page's* URL
+    unconditionally, silently wrong the moment a site's stylesheet and its
+    referenced images live in different directories (i.e. almost any real
+    site with more than a bare `index.html` + one flat folder). Found on
+    `csszengarden.com`: `header`'s `background-image: url(huntington.jpg)`
+    lives in `/214/214.css`, so the real image is at `/214/huntington.jpg`
+    -- resolved against the page's own `/` URL it 404s outright.
+
+    Since a computed style's resolved string has no record of *which*
+    stylesheet's rule actually won, this tries the plausible candidates
+    instead of guessing one: every stylesheet with an `href` (most likely
+    real source first, page URL last as the correct answer for an inline
+    `style=""` background-image, and as an original-behaviour fallback).
+    `browser_images.load_image` caches a failed fetch permanently and is
+    cheap to call for an already-cached URL, so asking it about several
+    candidates costs at most a handful of harmless extra requests -- once,
+    ever, per broken guess, not per paint."""
+    if urllib.parse.urlsplit(url).scheme:
+        return [url]
+    bases = []
+    for sheet in getattr(doc, "styleSheets", None) or ():
+        href = getattr(sheet, "href", None)
+        if href:
+            bases.append(href)
+    bases.append(getattr(doc, "_chromonic_base_url", ""))
+    seen = set()
+    candidates = []
+    for base in bases:
+        resolved = urllib.parse.urljoin(base, url)
+        if resolved not in seen:
+            seen.add(resolved)
+            candidates.append(resolved)
+    return candidates
+
+
+def _paint_background_layer(canvas: "skia.Canvas", box, doc,
+                             url_token: str, size_token: str, pos_token: str,
+                             repeat_token: str) -> None:
     from . import browser_images
 
-    image = browser_images.load_image(url)
+    raw_url = _background_image_url(url_token)
+    if not raw_url:
+        return
+    image = None
+    for candidate in _background_image_candidate_urls(raw_url, doc):
+        image = browser_images.load_image(candidate)
+        if image is not None:
+            break
     if image is None:
         return
+    natural_w, natural_h = float(image.width()), float(image.height())
+    if natural_w <= 0 or natural_h <= 0:
+        return
+    layer_w, layer_h = _resolve_layer_size(size_token, natural_w, natural_h, box.width, box.height)
+    if layer_w <= 0 or layer_h <= 0:
+        return
+    x, y = _resolve_layer_position(pos_token, layer_w, layer_h, box.width, box.height)
+    repeat = (repeat_token or "repeat").strip().lower()
     canvas.save()
     try:
         canvas.clipRect(skia.Rect.MakeXYWH(box.x, box.y, box.width, box.height))
-        canvas.drawImage(image, box.x, box.y)
+        if repeat == "no-repeat":
+            canvas.drawImageRect(image, skia.Rect.MakeXYWH(box.x + x, box.y + y, layer_w, layer_h))
+            return
+        tile_x = skia.TileMode.kRepeat if repeat in ("repeat", "repeat-x") else skia.TileMode.kDecal
+        tile_y = skia.TileMode.kRepeat if repeat in ("repeat", "repeat-y") else skia.TileMode.kDecal
+        matrix = skia.Matrix()
+        matrix.setTranslate(box.x + x, box.y + y)
+        matrix.preScale(layer_w / natural_w, layer_h / natural_h)
+        shader = image.makeShader(tile_x, tile_y, skia.SamplingOptions(), matrix)
+        canvas.drawRect(skia.Rect.MakeXYWH(box.x, box.y, box.width, box.height),
+                         skia.Paint(Shader=shader, AntiAlias=True))
     finally:
         canvas.restore()
+
+
+def _paint_background_image(canvas: "skia.Canvas", element, box, style: dict) -> None:
+    """`background-image` is a comma-separated list of independent layers
+    (the first listed paints *on top*), each with its own `-size`/
+    `-position`/`-repeat` -- a shorter list of any of those three repeats
+    to match however many image layers there are (CSS Backgrounds 3 §3.7).
+    Painted back-to-front (`reversed`) so the first-listed layer really
+    does end up on top of the rest, the same stacking a real browser uses.
+    Found on `csszengarden.com`'s `<header>`: `background-image: url(a),
+    url(b), url(c), url(d)` (a decorative overlay pattern stacked on the
+    real, `background-size: cover`'d photo as the *last* layer) -- painting
+    only the first `url(...)` match (the old, single-layer-only behaviour)
+    painted the subtle overlay texture alone and never the actual photo,
+    which looked indistinguishable from "no background image at all"."""
+    images = _split_top_level(style.get("background_image"))
+    if not images or images == ["none"]:
+        return
+    doc = getattr(element, "ownerDocument", None)
+    sizes = _split_top_level(style.get("background_size"))
+    positions = _split_top_level(style.get("background_position"))
+    repeats = _split_top_level(style.get("background_repeat"))
+    for index in reversed(range(len(images))):
+        _paint_background_layer(
+            canvas, box, doc, images[index],
+            _layer_value(sizes, index, "auto"),
+            _layer_value(positions, index, "0% 0%"),
+            _layer_value(repeats, index, "repeat"),
+        )
 
 
 def _paint_image(canvas: "skia.Canvas", element, box) -> None:
@@ -217,7 +407,8 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
         # anything painted without a prior `tree.layout()` pass.
         lines = getattr(element, "_chromonic_text_lines", None)
         if lines is None:
-            text = " ".join((element.textContent or "").split())
+            from . import tree as _tree
+            text = " ".join(_tree._rendering_text_content(element).split())
             lines = [text] if text else []
         if lines and any(lines):
             padding = getattr(element, "_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
@@ -250,11 +441,40 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
                 baseline_y = box.y + box.border_top + pad_top + font_size + index * line_height
                 canvas.drawString(line, line_x, baseline_y, font, paint_)
 
-    # Direct text nodes in mixed inline content have retained anonymous
-    # layout fragments. They are not DOM Elements, so paint them here; real
-    # inline child elements are still visited by paint_tree below.
-    for fragment in getattr(element, "_chromonic_inline_fragments", ()):
-        paint_element(canvas, fragment)
+    # Direct text nodes in mixed inline content (and any `::before`/
+    # `::after` generated-content box, see `tree.py`'s `_PseudoElement`)
+    # have retained anonymous layout fragments. They are not DOM Elements,
+    # so paint them here; real inline child elements are still visited by
+    # paint_tree below.
+    fragments = getattr(element, "_chromonic_inline_fragments", ())
+    if fragments:
+        # `overflow: hidden`/`clip` clips a box's own content to its
+        # padding edge -- real, common pattern for exactly the elements
+        # that reach this list: an icon-font `::before` deliberately
+        # positioned over text pushed below the visible box via padding,
+        # so the real (accessible, for screen readers) text never
+        # actually shows (`csszengarden.com`'s footer nav links: `<a>
+        # HTML</a>`, `overflow:hidden; height:40px; padding-top:40px`,
+        # `::before{content:"5"}` as the visible icon glyph -- without
+        # this, chromonic painted the literal word "HTML" *and* the icon,
+        # overlapping). Scoped to this element's own retained fragments,
+        # not a general clip-stack for real DOM descendants (a much larger
+        # feature this project doesn't have yet) -- sufficient for the
+        # overwhelmingly common case of an otherwise-childless element
+        # whose only "children" are text/generated-content fragments.
+        clips = style.get("overflow_x") in ("hidden", "clip") or style.get("overflow_y") in ("hidden", "clip")
+        if clips:
+            canvas.save()
+            canvas.clipRect(skia.Rect.MakeXYWH(
+                box.x + box.border_left, box.y + box.border_top,
+                box.client_width, box.client_height,
+            ))
+        try:
+            for fragment in fragments:
+                paint_element(canvas, fragment)
+        finally:
+            if clips:
+                canvas.restore()
 
 
 def paint_tree(canvas: "skia.Canvas", root_element) -> None:

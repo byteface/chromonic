@@ -71,7 +71,22 @@ def _edges(edges: Edges) -> list:
 
 
 def _non_negative(value):
-    return max(0.0, value) if isinstance(value, (int, float)) else value
+    if isinstance(value, (int, float)):
+        return max(0.0, value)
+    if isinstance(value, tuple) and len(value) == 2 and value[0] == "pct":
+        # A negative percentage padding (`padding-top: -1%`) is just as
+        # invalid as a negative pixel one -- CSS 2.1 8.4 doesn't carve out
+        # an exception for percentages -- but the plain `int`/`float`
+        # check above only ever caught a length that was *already*
+        # resolved to pixels; a percentage stays a `("pct", fraction)`
+        # tuple all the way to Taffy (resolved against the containing
+        # block at layout time), so its own negative fraction sailed
+        # through here untouched. Found on `wpt/css/CSS2/margin-padding-
+        # clear/padding-top-089.xht`: `padding-top: -1%` reached Taffy as
+        # `("pct", -0.01)` and resolved to a real `-0.96px`, instead of
+        # being discarded like any other invalid negative padding.
+        return ("pct", max(0.0, value[1]))
+    return value
 
 
 def _padding_edges(edges: Edges) -> list:

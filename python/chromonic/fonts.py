@@ -91,6 +91,44 @@ def is_italic(font_style: "str | None") -> bool:
 
 
 @lru_cache(maxsize=512)
+def x_height(family, size, bold=False, italic=False) -> float:
+    """The CSS `ex` unit's own basis (CSS 2.1 4.3.2): the resolved font's
+    real x-height, in CSS pixels, at `size` -- read straight from Skia's
+    own `FontMetrics.fXHeight`, the same font resolution `text_metrics()`
+    already uses for ascent/descent. CSS falls back to `0.5em` when a font
+    reports no x-height at all (`fXHeight <= 0`, e.g. some bitmap/synthetic
+    fonts) -- most real fonts do report one; Ahem, deliberately, reports
+    exactly `0.8em` for predictable testing (confirmed directly: Skia's
+    own `fXHeight` for the real downloaded Ahem face already comes back as
+    `0.8 * size`, so no special-casing is needed here at all -- only a
+    fallback for the rare font that reports none)."""
+    face = resolve_typeface(family, bold=bold, italic=italic)
+    metrics = skia.Font(face, size).getMetrics()
+    if metrics.fXHeight > 0:
+        return float(metrics.fXHeight)
+    return size * 0.5
+
+
+@lru_cache(maxsize=512)
+def zero_advance_width(family, size, bold=False, italic=False) -> float:
+    """The CSS `ch` unit's own basis (CSS Values 4 6.2): the resolved
+    font's real advance width of the `"0"` (U+0030 DIGIT ZERO) glyph, in
+    CSS pixels, at `size` -- `skia.Font.measureText` on that one
+    character, the same real, resolved typeface `text_metrics()`/
+    `x_height()` already use. CSS falls back to `0.5em` when the font has
+    no `"0"` glyph at all (rare; `measureText` returns `0` for a glyph
+    that doesn't exist, indistinguishable from a genuinely zero-width
+    one -- the fallback covers both, matching spec: "in the cases where
+    it is impossible or impractical to determine the measure of the
+    '0' glyph, it must be assumed to be 0.5em")."""
+    face = resolve_typeface(family, bold=bold, italic=italic)
+    width = skia.Font(face, size).measureText("0")
+    if width > 0:
+        return float(width)
+    return size * 0.5
+
+
+@lru_cache(maxsize=512)
 def text_metrics(family, size, bold=False, italic=False):
     """CSS ascent, descent and normal line height, in CSS pixels.
 

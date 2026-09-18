@@ -62,8 +62,18 @@ def _fragments(element, rect):
             family = paint_style.get("font_family", "")
             weight = tree._parse_font_weight(paint_style.get("font_weight"))
             italic = fonts.is_italic(paint_style.get("font_style"))
-            if text[-1:].isspace() and paint_style.get("white_space") not in ("pre", "pre-wrap", "break-spaces"):
-                width = tree.layout_text(text.rstrip(), family, font_size, font_weight=weight, italic=italic)[0]
+            # `.isspace()`/plain `.rstrip()` both treat U+00A0 (`&nbsp;`) as
+            # whitespace (it carries the Unicode "White_Space" property) --
+            # CSS 2.1 16.6.1 never collapses/trims it, only plain ASCII
+            # space/tab/newline/CR/FF. Found on `wpt/css/CSS2/positioning/
+            # positioning-float-001.xht`: `<span>P A&nbsp;</span>`'s text
+            # fragment measured `12px` narrower than the element's own
+            # (correctly nbsp-inclusive) shrink-to-fit width -- the trailing
+            # `&nbsp;` was silently stripped from this line's own re-measurement.
+            if (text and text[-1] in tree._CSS_WHITESPACE_STRIP_CHARS
+                    and paint_style.get("white_space") not in ("pre", "pre-wrap", "break-spaces")):
+                width = tree.layout_text(text.rstrip(tree._CSS_WHITESPACE_STRIP_CHARS),
+                                          family, font_size, font_weight=weight, italic=italic)[0]
             ascent, descent, _normal = fonts.text_metrics(family, font_size, weight >= 600, italic)
             fragment_height = ascent + descent
             text_top = math.floor((line_height - fragment_height) / 2)

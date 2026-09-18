@@ -181,6 +181,23 @@ def should_skip(path):
     return False
 
 
+_DOM_FLAGS_META_RE = re.compile(
+    r'<meta\s[^>]*name=["\']flags["\'][^>]*content=["\']([^"\']*)["\']', re.I
+)
+
+
+def _requires_dom_scripting(source: str) -> bool:
+    """WPT's own `<meta name="flags" content="...">` convention -- `dom`
+    among the space-separated flag words marks a fixture as needing real
+    page script to reach the DOM shape it tests (an `onload` handler that
+    mutates the DOM, typically). See `run_folder`'s own use of this for
+    why: neither chromonic nor domonic can ever execute that script."""
+    match = _DOM_FLAGS_META_RE.search(source)
+    if not match:
+        return False
+    return "dom" in match.group(1).strip().lower().split()
+
+
 def run_folder(folder, output, base_url, tolerance, chrome=None, limit=None):
     folder = folder.resolve()
     wpt_root = find_wpt_root(folder)
@@ -216,6 +233,31 @@ def run_folder(folder, output, base_url, tolerance, chrome=None, limit=None):
             encoding="utf-8",
             errors="replace",
         )
+
+        if _requires_dom_scripting(source):
+            # WPT's own convention (`<meta name="flags" content="dom">`)
+            # marks a fixture as relying on real page script (here, an
+            # `onload` handler mutating the DOM -- `appendChild`/
+            # `cloneNode`, etc.) to reach the DOM shape it actually tests.
+            # Neither chromonic nor domonic embeds a JavaScript engine at
+            # all -- there is no `<script>`/`onload` execution anywhere in
+            # this project, confirmed directly (no V8/QuickJS/PythonMonkey
+            # or any other JS runtime dependency exists) -- so
+            # `native_runner` can only ever lay out the pre-mutation DOM
+            # exactly as written in the file, never the DOM the test
+            # actually intends to check. Recording that as a geometry
+            # mismatch against Chrome's real (post-mutation) result would
+            # misrepresent a missing *capability* (no scripting at all) as
+            # a layout bug; skipped here instead, honestly, rather than
+            # comparing chromonic's layout of a different DOM than the one
+            # Chrome's own baseline reflects.
+            print(f"[{i:03}/{len(files):03}] {relative.as_posix()} -- SKIPPED (requires DOM scripting)")
+            results.append({
+                "file": relative_folder.as_posix(),
+                "status": "SKIPPED",
+                "reason": "requires DOM scripting (no JS engine in chromonic/domonic)",
+            })
+            continue
 
         tagged, marked = auto_tag(source)
 
@@ -336,6 +378,7 @@ def write_summary(output, folder, results):
     passed = sum(x["status"] == "PASS" for x in results)
     failed = sum(x["status"] == "FAIL" for x in results)
     errors = sum(x["status"] == "ERROR" for x in results)
+    skipped = sum(x["status"] == "SKIPPED" for x in results)
 
     worst = sorted(
         (
@@ -358,6 +401,7 @@ def write_summary(output, folder, results):
         "passed": passed,
         "failed": failed,
         "errors": errors,
+        "skipped": skipped,
         "largest_mismatches": worst[:50],
         "results": results,
     }

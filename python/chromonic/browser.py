@@ -16,9 +16,16 @@ import urllib.request
 
 
 from . import (
+    domonic_border_width_keyword_patch,
     domonic_cdata_style_patch,
+    domonic_ch_unit_patch,
+    domonic_ex_unit_patch,
     domonic_layout_calc_var_patch,
     domonic_logical_properties_patch,
+    domonic_media_query_patch,
+    domonic_presentational_hint_patch,
+    domonic_pseudo_inheritance_patch,
+    domonic_shorthand_cascade_order_patch,
     hittest,
     tree,
     window,
@@ -105,16 +112,6 @@ def warm_interpreter() -> None:
     )
 
 
-def _append_presentational_style(element, declarations: list[str]) -> None:
-    if not declarations:
-        return
-    existing = element.getAttribute("style") or ""
-    prefix = "; ".join(declarations) + ";"
-    # Put presentational attributes first so authored inline style text that
-    # follows still wins when both mention the same property.
-    element.setAttribute("style", f"{prefix} {existing}".strip())
-
-
 def _apply_presentational_attributes(document) -> None:
     """Translate the old HTML attributes real legacy pages still use.
 
@@ -123,6 +120,21 @@ def _apply_presentational_attributes(document) -> None:
     size comes from ``width``/``height`` attributes. domonic exposes those as
     attributes, not computed CSS, so normalize the narrow set Chromonic needs
     before resolving styles.
+
+    Recorded as ``element._chromonic_presentational_hints`` -- a plain
+    ``{property: value}`` dict consulted by ``domonic_presentational_hint_
+    patch`` -- rather than written into the element's real ``style=""``
+    text. A presentational attribute is the *weakest* possible declaration
+    per the real CSS cascade (conceptually the first rule of the document),
+    so it must lose to *any* later author stylesheet rule for the same
+    property regardless of specificity; real inline ``style=""`` text does
+    not work that way (it beats every non-``!important`` author rule
+    outright), so writing into it made a legacy ``width="85%"``-style
+    attribute far stronger than real browsers ever make it. Confirmed
+    directly on ``news.ycombinator.com``: `#hnmain`'s ``width="85%"``
+    attribute was beating a real, later, higher-priority ``#hnmain {
+    width: 100% }`` inside an author media query, rendering the whole
+    table (and everything inside it) ~110px too narrow.
     """
 
     def length(value):
@@ -138,18 +150,19 @@ def _apply_presentational_attributes(document) -> None:
         return f"{value}px"
 
     for element in document.getElementsByTagName("*"):
-        declarations = []
+        hints = {}
         bgcolor = element.getAttribute("bgcolor")
         if bgcolor:
-            declarations.append(f"background-color:{bgcolor}")
+            hints["background-color"] = bgcolor
         if (getattr(element, "tagName", "") or "").lower() in {"img", "table"}:
             width = length(element.getAttribute("width"))
             height = length(element.getAttribute("height"))
             if width:
-                declarations.append(f"width:{width}")
+                hints["width"] = width
             if height:
-                declarations.append(f"height:{height}")
-        _append_presentational_style(element, declarations)
+                hints["height"] = height
+        if hints:
+            element._chromonic_presentational_hints = hints
 
 
 def _load_local(url: str):
@@ -190,28 +203,81 @@ def _load_local(url: str):
     return page
 
 
-def _load_remote(url: str):
-    from domonic import domonic
+_HTTP_SESSION = None
 
-    document = domonic.scrape(
-        url,
-        css=True,
-        attach=True,
-    )
+
+def _shared_http_session():
+    """A single, process-wide `requests.Session` reused for every remote
+    load unless a caller supplies its own -- gives ordinary navigation (and
+    form submission, see `_load_remote`'s `method`/`data`) a real, persistent
+    cookie jar (plus connection reuse) across the whole browsing session,
+    the same way a real browser's cookie store outlives any one request.
+    `domonic.scrape()`'s own `fetch()` calls the stateless `requests.request`
+    directly, so nothing before this ever kept cookies between navigations
+    at all -- logging into a site would "work" (the response set a session
+    cookie) but every subsequent page acted logged-out again."""
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        import requests
+        _HTTP_SESSION = requests.Session()
+        # `requests`' own default `User-Agent` (`python-requests/x.y.z`)
+        # gets a bare `403` from Wikipedia (and plenty of other real sites)
+        # -- not a real browser-fingerprint check, just a common heuristic
+        # against unlabeled script traffic; any self-identifying, non-
+        # generic string clears it (confirmed directly: `curl -A
+        # "chromonic/1.0" https://www.wikipedia.org/` -> `200`, no other
+        # header needed). Matches `browser_images.py`'s own convention of
+        # identifying honestly rather than spoofing a real browser's UA.
+        _HTTP_SESSION.headers["User-Agent"] = "chromonic/1.0 (+https://github.com/byteface/domonic-libs)"
+    return _HTTP_SESSION
+
+
+class _RequestsResponseAdapter:
+    """Adapts a `requests.Response` to the `.text()`/`.url` surface
+    `domonic._scrape._parse` expects from its own `fetch.Response` -- lets
+    `_load_remote` reuse that function's parsing/CSS-loading/window-attach
+    logic verbatim instead of duplicating it, while doing the actual HTTP
+    fetch itself (through `_shared_http_session()`, not domonic's stateless
+    `fetch()`) so cookies and `method`/`data` (form submission) are
+    available to it at all."""
+    __slots__ = ("_response", "url")
+
+    def __init__(self, response):
+        self._response = response
+        self.url = response.url
+
+    def text(self):
+        return self._response.text
+
+
+def _load_remote(url: str, *, method: str = "GET", data=None, http_session=None):
+    from domonic._scrape import _parse
+
+    session = http_session or _shared_http_session()
+    response = session.request(method, url, data=data, timeout=30, allow_redirects=True)
+    document = _parse(_RequestsResponseAdapter(response), None, css=True, attach=True)
     default_view = getattr(document, "defaultView", None)
     page = SimpleNamespace(
         document=document,
-        url=url,
+        url=response.url,
         session=SimpleNamespace(window=default_view),
     )
     return page
 
 
-def load(url: str):
-    """Fetch + parse `url` with domonic 1.8.1 for HTTP(S), myjs for local files."""
+def load(url: str, *, method: str = "GET", data=None, http_session=None):
+    """Fetch + parse `url` with domonic 1.8.1 for HTTP(S), myjs for local files.
+
+    `method`/`data` (ignored for local files -- forms don't target them in
+    practice) let a caller submit a real HTML form: `method="POST"` with
+    `data` as the `application/x-www-form-urlencoded` pairs/string a
+    `<form>`'s fields serialize to. `http_session` overrides the shared
+    session (see `_shared_http_session`) for callers that want an isolated
+    cookie jar; almost nothing needs this."""
     from . import browser_images, ua_style, webfonts
 
-    page = _load_remote(url) if _is_url(url) else _load_local(url)
+    page = (_load_remote(url, method=method, data=data, http_session=http_session)
+            if _is_url(url) else _load_local(url))
     page.document._chromonic_base_url = page.url
 
     _apply_presentational_attributes(page.document)

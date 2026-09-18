@@ -20,6 +20,9 @@ test:
 layout-conformance:
 	PYTHONPATH=tests/layout $(PYTHON) -m harness.run_suite
 
+layout-wpt-server:
+	$(PYTHON) -m http.server 8943 --directory tests/wpt --bind 127.0.0.1
+
 check:
 	cargo check
 	$(PYTHON) -m pytest tests -q

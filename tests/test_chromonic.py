@@ -447,8 +447,15 @@ def test_generated_content_pseudo_elements_contribute_text_layout():
         interaction.render()
         icon = interaction.root.getElementsByTagName("i")[0]
 
+        # `::before` with non-empty `content` now gets a real, separately
+        # laid-out box (its own font/position/background, not text merely
+        # concatenated onto the owner's) -- see `tree._PseudoElement`.
         assert icon._chromonic_before_text == "\uf03e"
-        assert icon._chromonic_text_lines == ["\uf03e"]
+        fragments = icon._chromonic_inline_fragments
+        assert len(fragments) == 1
+        pseudo = fragments[0]
+        assert pseudo.text == "\uf03e"
+        assert pseudo.__dict__["_layout_box"].width > 0
         assert icon.get_layout_box().width > 0
     finally:
         srv.shutdown()
@@ -930,6 +937,129 @@ def test_ua_style_apply_is_idempotent():
     ua_style.apply(document)
     ua_style.apply(document)
     assert len(document.getElementsByTagName("style")) == 1
+
+
+def test_supports_rule_applies_a_true_condition():
+    from domonic.dom import DOMParser
+    from domonic.style import ComputedStyleDeclaration
+
+    document = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@supports (display: grid) { #test { display: grid; } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    assert ComputedStyleDeclaration(document.getElementById("test")).display == "grid"
+
+
+def test_supports_rule_skips_a_false_condition():
+    from domonic.dom import DOMParser
+    from domonic.style import ComputedStyleDeclaration
+
+    document = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@supports (this-property-does-not-exist: 1) { #test { display: grid; } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    assert ComputedStyleDeclaration(document.getElementById("test")).display != "grid"
+
+
+def test_supports_rule_handles_not():
+    from domonic.dom import DOMParser
+    from domonic.style import ComputedStyleDeclaration
+
+    document = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@supports not (this-property-does-not-exist: 1) { #test { display: grid; } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    assert ComputedStyleDeclaration(document.getElementById("test")).display == "grid"
+
+
+def test_supports_rule_handles_and():
+    from domonic.dom import DOMParser
+    from domonic.style import ComputedStyleDeclaration
+
+    both_real = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@supports (display: grid) and (display: flex) { #test { display: grid; } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    assert ComputedStyleDeclaration(both_real.getElementById("test")).display == "grid"
+
+    one_fake = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@supports (display: grid) and (this-property-does-not-exist: 1) { #test { display: grid; } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    assert ComputedStyleDeclaration(one_fake.getElementById("test")).display != "grid"
+
+
+def test_supports_rule_handles_or():
+    from domonic.dom import DOMParser
+    from domonic.style import ComputedStyleDeclaration
+
+    document = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@supports (this-property-does-not-exist: 1) or (display: grid) { #test { display: grid; } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    assert ComputedStyleDeclaration(document.getElementById("test")).display == "grid"
+
+
+def test_supports_rule_nested_inside_media_applies():
+    from domonic.dom import DOMParser
+    from domonic.style import ComputedStyleDeclaration
+
+    from chromonic import style_bridge
+
+    with style_bridge.viewport(1000.0, 800.0):
+        document = DOMParser().parseFromString(
+            "<html><head><style>"
+            "@media (min-width: 500px) { @supports (display: grid) { #test { display: grid; } } }"
+            "</style></head><body><div id='test'></div></body></html>",
+            "text/html",
+        )
+        assert ComputedStyleDeclaration(document.getElementById("test")).display == "grid"
+
+        narrow = DOMParser().parseFromString(
+            "<html><head><style>"
+            "@media (min-width: 5000px) { @supports (display: grid) { #test { display: grid; } } }"
+            "</style></head><body><div id='test'></div></body></html>",
+            "text/html",
+        )
+    with style_bridge.viewport(1000.0, 800.0):
+        assert ComputedStyleDeclaration(narrow.getElementById("test")).display != "grid"
+
+
+def test_media_rule_nested_inside_supports_applies():
+    from domonic.dom import DOMParser
+    from domonic.style import ComputedStyleDeclaration
+
+    from chromonic import style_bridge
+
+    with style_bridge.viewport(1000.0, 800.0):
+        document = DOMParser().parseFromString(
+            "<html><head><style>"
+            "@supports (display: grid) { @media (min-width: 500px) { #test { display: grid; } } }"
+            "</style></head><body><div id='test'></div></body></html>",
+            "text/html",
+        )
+        assert ComputedStyleDeclaration(document.getElementById("test")).display == "grid"
+
+        unsupported = DOMParser().parseFromString(
+            "<html><head><style>"
+            "@supports (this-property-does-not-exist: 1) { @media (min-width: 500px) "
+            "{ #test { display: grid; } } }"
+            "</style></head><body><div id='test'></div></body></html>",
+            "text/html",
+        )
+        assert ComputedStyleDeclaration(unsupported.getElementById("test")).display != "grid"
 
 
 def _tiny_png(color=skia.ColorRED, size=4) -> bytes:
