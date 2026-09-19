@@ -123,6 +123,74 @@ def test_display_none_clears_stale_layout_box_instead_of_freezing_it():
     assert child.get_layout_box() is not None
 
 
+def test_block_in_inline_split_marker_reports_the_blocks_border_box_not_margin_box():
+    """CSS 2.1 9.2.1.1: an inline (`<a>`) whose only content is a genuine
+    in-flow block child splits around it, generating one extra `getClient
+    Rects()` marker rect at the block's own position -- but that marker
+    must report the block's *border box*, not a margin-inflated union of
+    it. A block's margin still participates in ordinary block-flow spacing
+    (it is why the marker's own `y` sits below the line it would otherwise
+    start at), but is not part of any box's own border-box geometry or hit
+    region -- generated marker included. Confirmed against real Chrome on
+    `wpt/css/CSS2/normal-flow/block-in-inline-hittest-margin.html`: a
+    `100px`-margin, `100px`-square block reported this marker at `y=100,
+    height=100` (its own border box) inside the block's own `784px`-wide
+    containing block, not `y=0, height=300` (its full margin box, with a
+    `100px` margin on every side unioned in)."""
+    from domonic.dom import DOMParser
+
+    from chromonic import ua_style
+
+    document = DOMParser().parseFromString(
+        "<html><body><a href='#'><div style="
+        "'width:100px;height:100px;margin:100px;'></div></a></body></html>",
+        "text/html",
+    )
+    ua_style.apply(document)
+    tree.layout(document.body, width=800.0)
+
+    anchor = document.getElementsByTagName("a")[0]
+    rects = anchor.__dict__.get("_chromonic_inline_boxes")
+    marker = rects[1]
+    assert marker == (8.0, 108.0, 784.0, 100.0)
+
+
+def test_block_in_inline_survives_through_nested_empty_inline_wrappers():
+    """CSS 2.1 9.2.1.1's "anonymous block box" split must trigger for an
+    in-flow block reachable *transitively* through a chain of genuine
+    inline wrappers, not only a block that's a wrapper's own *direct*
+    child -- `_split_wrapping_inline_element`'s per-child loop used to
+    treat any inline-level child (including one that itself, one or more
+    levels deeper, wraps a real block) as ordinary inline content headed
+    for `_build_text_runs_from_nodes`, which has no notion of a block
+    anywhere inside a nested element and silently dropped it -- and
+    everything inside it -- instead of generating a real subtree. Found on
+    `wpt/css/CSS2/normal-flow/block-in-inline-hittest-001.html`: `<div>
+    <span><span style="outline:...">` (both empty, no content of their
+    own) `<div id=target><div style="width:64px;height:26px;"></div>`
+    measured `target` as `0x0`/absent from layout entirely instead of
+    Chrome's real `x=8, y=8, width=784, height=26` (the containing block's
+    own content width, `26px` tall -- `target`'s own inner `26px`-tall
+    child)."""
+    from domonic.dom import DOMParser
+
+    from chromonic import ua_style
+
+    document = DOMParser().parseFromString(
+        "<html><body><div><span><span style='outline: 1px solid blue'>"
+        "<div id='target'><div style='width: 64px; height: 26px;'></div></div>"
+        "</span></span></div></body></html>",
+        "text/html",
+    )
+    ua_style.apply(document)
+    tree.layout(document.body, width=800.0)
+
+    target = document.getElementById("target")
+    box = target.get_layout_box()
+    assert box is not None
+    assert (box.x, box.y, box.width, box.height) == (8.0, 8.0, 784.0, 26.0)
+
+
 def test_chromonic_uses_released_domonic_package():
     result = subprocess.run(
         [sys.executable, "-c",
