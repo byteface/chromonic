@@ -5,11 +5,11 @@ syntax (including a leading `+`/`-` sign: `_LENGTH_TOKEN_RE` matches any
 `_length_string_to_px`) only knows `px`/`pt`/`cm`/`mm`/`in`/`q`/`pc`/`em`/
 `rem`/`%` -- so a value like `padding-top: 6ex` falls all the way through
 to `Keyword("6ex")`, the same "left as an opaque, unresolved string" outcome
-`domonic_border_width_keyword_patch.py` documents for `thin`/`medium`/
-`thick`. `style_bridge._len()` then has no idea what to do with that
-`Keyword` (it only special-cases `vw`/`vh`/`vmin`/`vmax`) and falls back to
-`default` -- silently discarding the declared value instead of resolving
-it.
+a bare `thin`/`medium`/`thick` `border-width` keyword used to hit before
+domonic 1.8.2 started resolving those natively. `style_bridge._len()` then
+has no idea what to do with that `Keyword` (it only special-cases
+`vw`/`vh`/`vmin`/`vmax`) and falls back to `default` -- silently
+discarding the declared value instead of resolving it.
 
 Unlike a physical unit (`cm`, ...) or `em`/`rem` (both resolved purely from
 font-*size*, already known during the cascade), `ex` needs the resolved
@@ -28,13 +28,13 @@ across `style.py`/`layout.py` with only `em_px`/`rem_px`, never the
 `_parse_length_or_percent` already receives the full `ComputedStyleDeclaration`
 for every `width`/`height`/`min-*`/`max-*`/`margin-*`/`padding-*`/`border-*-
 width`/`inset`/`gap`/`flex-basis`/grid-track value LayoutStyle resolves
-(`layout.py`'s own `_from_computed`, `dim()`/`edges()` closures) -- patching
-this one function generically covers all of them in one place, exactly the
-"do not special-case one property" the underlying CSS behaviour already
-implies (`ex` is a length unit like any other, not a padding-specific
-concept).
+(`layout.py`'s own `LayoutStyle.from_computed`, `dim()`/`edges()` closures)
+-- patching this one function generically covers all of them in one place,
+exactly the "do not special-case one property" the underlying CSS
+behaviour already implies (`ex` is a length unit like any other, not a
+padding-specific concept).
 
-Only this one function is patched: `LayoutStyle._from_computed` (the
+Only this one function is patched: `LayoutStyle.from_computed` (the
 cascade -> layout path chromonic's own `style_bridge.to_dict()` actually
 consumes) is what needs `ex` for real layout geometry; `getComputedStyle()`
 (`ComputedStyleDeclaration._to_used_length`) is a separate path chromonic
@@ -87,7 +87,7 @@ def _resolve_ex_px(text: str, computed) -> "float | None":
     # painting. This patch runs *inside* domonic's own cascade, well
     # before chromonic's own per-element paint style exists at all, so it
     # repeats that same alias lookup here directly -- `computed._element`
-    # (set by `LayoutStyle._from_computed` itself) is enough to find this
+    # (set by `LayoutStyle.from_computed` itself) is enough to find this
     # document's own font registry. Confirmed necessary directly: without
     # this, `resolve_typeface("Ahem")` silently fell back to a system
     # font and every Ahem `ex` fixture measured a completely wrong

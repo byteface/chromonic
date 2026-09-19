@@ -432,6 +432,17 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
             # line uses this instead, when set to something other than the
             # `auto` default (which just means "same as text-align").
             align_last = (style.get("text_align_last") or "auto").strip().lower()
+            if align in ("start", "", "end") or align_last in ("start", "end"):
+                from . import tree as _tree
+                is_rtl = _tree._element_direction(element) == "rtl"
+                if align in ("start", ""):
+                    align = "right" if is_rtl else "left"
+                elif align == "end":
+                    align = "left" if is_rtl else "right"
+                if align_last == "start":
+                    align_last = "right" if is_rtl else "left"
+                elif align_last == "end":
+                    align_last = "left" if is_rtl else "right"
             for index, line in enumerate(lines):
                 if not line:
                     continue

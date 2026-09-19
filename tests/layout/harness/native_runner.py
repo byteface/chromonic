@@ -78,8 +78,22 @@ def _fragments(element, rect):
             fragment_height = ascent + descent
             text_top = math.floor((line_height - fragment_height) / 2)
             content_width = element.get_layout_box().client_width - padding[1] - padding[3]
-            text_align = getattr(getattr(element, "_chromonic_computed_style", None),
-                                 "textAlign", "start")
+            computed_style = getattr(element, "_chromonic_computed_style", None)
+            text_align = getattr(computed_style, "textAlign", "start")
+            # CSS Text 3 `text-align-last`: the element's own final line uses
+            # this instead, unless it's `auto` (same as `text-align`, except
+            # `justify` -- whose last line is never itself justified).
+            text_align_last = getattr(computed_style, "textAlignLast", "auto") or "auto"
+            if index == len(lines) - 1 and text_align_last != "auto":
+                text_align = text_align_last
+            if text_align in ("start", "end"):
+                # `start`/`end` resolve to a physical side based on
+                # `direction` -- domonic's own cascade has no UA mapping for
+                # HTML's `dir` attribute (`tree._element_direction` walks
+                # the DOM for it directly; see its own docstring).
+                is_rtl = tree._element_direction(element, computed_style) == "rtl"
+                text_align = ("right" if is_rtl else "left") if text_align == "start" else (
+                    "left" if is_rtl else "right")
             align_offset = ((content_width - width) / 2 if text_align == "center"
                             else content_width - width if text_align in ("right", "end") else 0.0)
             text_rects.append(_rect_dict(

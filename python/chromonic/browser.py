@@ -17,16 +17,10 @@ import urllib.request
 
 
 from . import (
-    domonic_border_width_keyword_patch,
-    domonic_cdata_style_patch,
     domonic_ch_unit_patch,
     domonic_ex_unit_patch,
-    domonic_layout_calc_var_patch,
-    domonic_logical_properties_patch,
     domonic_media_query_patch,
     domonic_presentational_hint_patch,
-    domonic_pseudo_inheritance_patch,
-    domonic_shorthand_cascade_order_patch,
     hittest,
     tree,
     window,

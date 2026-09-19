@@ -1,45 +1,45 @@
-"""Legacy HTML presentational attributes (`<table width="85%">`,
-`<img height="40">`, `<body bgcolor="...">`, ...) are converted to real
-inline `style=""` text by `browser._apply_presentational_attributes` --
-which, per the real CSS cascade, makes them beat *any* author stylesheet
-declaration regardless of specificity (inline style only loses to an
-`!important` author rule). Real browsers treat a presentational attribute
-as the *weakest* possible declaration instead -- conceptually the very
-first rule of the document, so literally any later author rule for the
-same property (even a plain, non-`!important`, equal-or-lower-specificity
-one) overrides it.
+"""Translate the old HTML attributes real legacy pages still use.
 
-Confirmed directly on `news.ycombinator.com` at a 733px viewport:
-`#hnmain`'s HTML `width="85%"` attribute, real `news.css` has both a
-desktop `#hnmain { min-width: 796px; }` and, inside `@media (min-width:
-300px) and (max-width: 750px)`, `#hnmain { width: 100%; min-width: 0; }`
--- real Chrome (733px is inside that range) renders `#hnmain` at the full
-733px. chromonic instead rendered it at `623.05px` (exactly 85% of 733):
-the mobile media query's `min-width: 0` *did* win (an author rule beating
-another author rule, ordinary cascade), but its `width: 100%` lost to the
-literal inline `style="width:85%"` chromonic had synthesized from the HTML
-attribute -- a real, if legacy, per-attribute regression this project's
-own presentational-attribute support had introduced. With `#hnmain` stuck
-89 fewer content-columns wide than real Chrome, nearly everything in every
-row wrapped onto extra lines it shouldn't have, visibly inflating the
-whole page's height (measured ~3458px vs Chrome's ~1451px) -- a single
-`width` mismatch on one ancestor cascading into hundreds of descendants.
+Hacker News is the canonical small repro: the orange bar is
+``<td bgcolor="#ff6600">`` and the logo is an SVG ``<img>`` whose layout
+size comes from ``width``/``height`` attributes. domonic exposes those as
+attributes, not computed CSS, so normalize the narrow set Chromonic needs
+before resolving styles.
 
-Patched by moving where chromonic's own presentational-attribute
-declarations get read into the cascade at all, not by touching domonic's
-inline-style handling (real inline `style=""` text must keep winning
-normally -- an author-written `<table style="...">` on the very same
-element is still supposed to beat what the `width=`/`height=`/`bgcolor=`
-attributes ask for, exactly like today). `browser._apply_presentational_
-attributes` now records `element._chromonic_presentational_hints` (a plain
-`{property: value}` dict) instead of writing into `style=""`; `_resolve`
-is wrapped to seed the cascade's `resolved` dict from those hints *before*
-author declarations are applied, so the existing `for name, (value, _) in
-author.items(): resolved[name] = value` loop -- completely unmodified --
-already overwrites a hint for any covering author declaration regardless
-of its specificity, the same way it already overwrites one lower-priority
-author declaration with a higher-priority one. Real inline `style=""` text
-is applied after that, exactly as before -- unaffected by this patch."""
+Recorded as ``element._chromonic_presentational_hints`` -- a plain
+``{property: value}`` dict, populated by ``browser._apply_presentational_
+attributes`` -- rather than written into the element's real ``style=""``
+text. A presentational attribute is the *weakest* possible declaration per
+the real CSS cascade (conceptually the first rule of the document), so it
+must lose to *any* later author stylesheet rule for the same property
+regardless of specificity; real inline ``style=""`` text does not work
+that way (it beats every non-``!important`` author rule outright), so
+writing into it made a legacy ``width="85%"``-style attribute far stronger
+than real browsers ever make it. Confirmed directly on
+``news.ycombinator.com``: `#hnmain`'s ``width="85%"`` attribute was beating
+a real, later, higher-priority ``#hnmain { width: 100% }`` inside an
+author media query, rendering the whole table (and everything inside it)
+~110px too narrow.
+
+Patched by wrapping ``_collect_author_declarations`` (not ``_resolve``
+itself) -- that's the one function both the original ``_resolve`` and
+domonic 1.8.2's rewritten one (shorthand-vs-longhand cascade-order fix,
+pseudo-element inheritance fix, `!important`-aware merging) already call
+unmodified to gather what a real author stylesheet declared, so hooking
+in here means every later improvement to ``_resolve`` itself keeps
+applying for free -- an earlier version of this patch replaced ``_resolve``
+outright and silently regressed both of those domonic 1.8.2 fixes the
+moment it landed, since its own from-scratch reimplementation never
+picked either one up. A hint is merged in only for a property name
+``_collect_author_declarations`` found *no* real declaration for at all
+(non-``important``, so a later real declaration for it -- author or
+inline -- still overrides normally downstream in ``_resolve``) -- this
+can still lose to a `ua_style.py` UA-stylesheet default for the same
+property (that default *is* a real declaration `_collect_author_
+declarations` returns, from this same function's own point of view,
+indistinguishable here from genuine author CSS) -- a known, narrower
+limitation than the real cascade's UA-loses-to-hint priority, unchanged
+from this patch's original behaviour, not attempted here."""
 from __future__ import annotations
 
 import sys
@@ -55,43 +55,19 @@ _style = sys.modules["domonic.style"]
 ComputedStyleDeclaration = _style.ComputedStyleDeclaration
 
 _INSTALLED = False
-_ORIGINAL_RESOLVE = ComputedStyleDeclaration._resolve
+_ORIGINAL_COLLECT_AUTHOR_DECLARATIONS = ComputedStyleDeclaration._collect_author_declarations
 
 
-def _resolve_with_presentational_hints(self):
-    element = self._element
-    resolved: dict = {}
-
-    hints = getattr(element, "_chromonic_presentational_hints", None)
-    if hints:
-        resolved.update(hints)
-
-    author = self._collect_author_declarations()
-    important_author = {name for name, (_, imp) in author.items() if imp}
-    for name, (value, _) in author.items():
-        resolved[name] = value
-    inline = getattr(element, "getAttribute", lambda *_: "")("style") or ""
-    for name, value, priority in _style._parse_css_declarations(inline):
-        if priority != "important":
-            covering = _style._cssom.LONGHAND_TO_SHORTHANDS.get(name, ())
-            if name in important_author or any(shorthand in important_author for shorthand in covering):
-                continue
-        resolved[name] = value
-
-    for name in list(resolved):
-        if _style._cssom.is_shorthand(name):
-            for long_name, long_value in _style._cssom.expand_shorthand(name, resolved[name]) or []:
-                resolved.setdefault(long_name, long_value)
-
-    parent = getattr(element, "parentNode", None)
-    parent_computed = None
-    if parent is not None and getattr(parent, "nodeType", None) == 1:
-        cache = self._chain_cache
-        parent_computed = cache.get(id(parent))
-        if parent_computed is None:
-            parent_computed = ComputedStyleDeclaration(parent, None, _chain_cache=cache)
-            cache[id(parent)] = parent_computed
-    return _style._ResolvedView(resolved, parent_computed)
+def _collect_author_declarations_with_hints(self):
+    result = _ORIGINAL_COLLECT_AUTHOR_DECLARATIONS(self)
+    hints = getattr(self._element, "_chromonic_presentational_hints", None)
+    if not hints:
+        return result
+    merged = dict(result)
+    for name, value in hints.items():
+        if name not in merged:
+            merged[name] = (value, False)
+    return merged
 
 
 def install() -> bool:
@@ -99,7 +75,7 @@ def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
         return False
-    ComputedStyleDeclaration._resolve = _resolve_with_presentational_hints
+    ComputedStyleDeclaration._collect_author_declarations = _collect_author_declarations_with_hints
     _INSTALLED = True
     return True
 
@@ -108,7 +84,7 @@ def uninstall() -> bool:
     global _INSTALLED
     if not _INSTALLED:
         return False
-    ComputedStyleDeclaration._resolve = _ORIGINAL_RESOLVE
+    ComputedStyleDeclaration._collect_author_declarations = _ORIGINAL_COLLECT_AUTHOR_DECLARATIONS
     _INSTALLED = False
     return True
 
