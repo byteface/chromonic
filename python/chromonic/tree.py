@@ -127,6 +127,14 @@ class _InlineFormattingPlan:
         # plan built for it, split or not.
         computed = getattr(element, "_chromonic_computed_style", None)
         self.rtl = (getattr(computed, "direction", "ltr") or "ltr").strip().lower() == "rtl"
+        # `text-align`/`text-align-last` inherit normally through domonic's
+        # own cascade -- `element` here is the block establishing this
+        # formatting context (the split wrapper, or the plan's own element
+        # for a non-split plan), so its computed value already reflects
+        # whatever an ancestor (e.g. the real containing block a split
+        # wrapper's own anonymous-block pieces belong to) declared.
+        self.text_align = (getattr(computed, "textAlign", "") or "start").strip().lower()
+        self.text_align_last = (getattr(computed, "textAlignLast", "") or "auto").strip().lower()
 
     def measure(self, available_width, _available_height):
         width = float(available_width or 0.0)
@@ -239,7 +247,11 @@ class _InlineFormattingPlan:
             ]
         content_width = min(width, max(
             (px + advance for _r, _t, px, _y, _pw, _h, _l, _tr, advance in placed), default=0.0))
-        if self.rtl and placed:
+        # An explicit physical `text-align:left` overrides `direction:rtl`'s
+        # own default right-mirroring below -- CSS 2.1 9.10's own initial
+        # `start` value is what resolves to "right" for rtl, not `left`.
+        rtl_mirror_suppressed = self.text_align == "left"
+        if self.rtl and not rtl_mirror_suppressed and placed:
             # `direction:rtl` mirrors each line, as a rigid group, against
             # the same `width` it was placed within. Margin isn't part of a
             # fragment's own box, so `margin_start`/margin-right are
@@ -261,8 +273,77 @@ class _InlineFormattingPlan:
                     new_px -= _numeric_edge(owner_margin[1])
                 mirrored.append((run, text, new_px, y, token_width, token_height, leading, trailing, advance))
             placed = mirrored
+        elif not self.rtl:
+            placed = self._apply_text_align(placed, width)
         self._placed = placed
         return (content_width, self.height)
+
+    def _apply_text_align(self, placed, width):
+        """CSS Text 3 `text-align`/`text-align-last`: shift each line's
+        placed tokens to reflect the block's own alignment, physical
+        `left`/`right`/`center` only (no `direction`-aware `start`/`end`
+        remapping -- not needed for LTR, and `direction:rtl` is handled
+        separately above, via the mirror). `justify` distributes leftover
+        space as extra spacing at each token boundary that ends in real
+        whitespace, on every line but the last -- CSS's own line box is
+        never justified unless `text-align-last:justify` says otherwise;
+        each split segment is its own anonymous block box (CSS 2.1
+        9.2.1.1), so its own last physical line gets this treatment
+        independently of any other segment's."""
+        if not placed:
+            return placed
+        text_align = "left" if self.text_align in ("start", "") else (
+            "right" if self.text_align == "end" else self.text_align)
+        text_align_last = self.text_align_last
+        if text_align_last in ("auto", ""):
+            # CSS Text 3: `auto` means "ordinary `text-align`", except a
+            # `justify` block's own last line is never force-justified by
+            # this default -- it aligns `start` (left) instead.
+            text_align_last = "left" if text_align == "justify" else text_align
+        text_align_last = "left" if text_align_last in ("start", "") else (
+            "right" if text_align_last == "end" else text_align_last)
+        if text_align == "left" and text_align_last == "left":
+            return placed
+        lines: list = []
+        current: list = []
+        current_y = None
+        for entry in placed:
+            if current_y is None or abs(entry[3] - current_y) > 0.01:
+                if current:
+                    lines.append(current)
+                current = []
+                current_y = entry[3]
+            current.append(entry)
+        if current:
+            lines.append(current)
+        result: list = []
+        for line_index, line_entries in enumerate(lines):
+            align = text_align_last if line_index == len(lines) - 1 else text_align
+            if align == "left":
+                result.extend(line_entries)
+                continue
+            line_start = min(e[2] - e[6] for e in line_entries)
+            line_end = max(e[2] + e[8] + e[7] for e in line_entries)
+            slack = width - (line_end - line_start)
+            if align == "justify":
+                gap_after = [i for i, e in enumerate(line_entries[:-1]) if e[1][-1:].isspace()]
+                if not gap_after or slack <= 0:
+                    result.extend(line_entries)
+                    continue
+                extra_per_gap = slack / len(gap_after)
+                gap_set = set(gap_after)
+                cumulative = 0.0
+                for index, (run, text, px, y, token_width, token_height, leading, trailing, advance) in enumerate(line_entries):
+                    result.append((run, text, px + cumulative, y, token_width, token_height, leading, trailing, advance))
+                    if index in gap_set:
+                        cumulative += extra_per_gap
+                continue
+            shift = max(0.0, slack) if align == "right" else max(0.0, slack) / 2.0
+            result.extend(
+                (run, text, px + shift, y, token_width, token_height, leading, trailing, advance)
+                for run, text, px, y, token_width, token_height, leading, trailing, advance in line_entries
+            )
+        return result
 
     def publish(self, box, padding, owner_accum, element_fragments_accum):
         origin_x = box.x + box.border_left + padding[3]
@@ -425,6 +506,7 @@ def _extract_paint_style(computed) -> dict:
         "line_height": computed.lineHeight,
         "white_space": computed.whiteSpace,
         "text_align": computed.textAlign,
+        "text_align_last": computed.textAlignLast,
         "text_transform": computed.textTransform,
     }
 

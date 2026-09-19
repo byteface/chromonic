@@ -428,14 +428,19 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
             line_widths = getattr(element, "_chromonic_text_line_widths", [])
             content_width = box.client_width - pad_left - _pad_right
             align = (style.get("text_align") or "").strip().lower()
+            # CSS Text 3 `text-align-last`: a block's own final formatted
+            # line uses this instead, when set to something other than the
+            # `auto` default (which just means "same as text-align").
+            align_last = (style.get("text_align_last") or "auto").strip().lower()
             for index, line in enumerate(lines):
                 if not line:
                     continue
+                line_align = align_last if (index == len(lines) - 1 and align_last != "auto") else align
                 line_x = text_x
                 if index < len(line_widths):
-                    if align == "center":
+                    if line_align == "center":
                         line_x += max(0.0, (content_width - line_widths[index]) / 2.0)
-                    elif align in ("right", "end"):
+                    elif line_align in ("right", "end"):
                         line_x += max(0.0, content_width - line_widths[index])
                 # a simple top-aligned baseline per line, line_height apart
                 baseline_y = box.y + box.border_top + pad_top + font_size + index * line_height
