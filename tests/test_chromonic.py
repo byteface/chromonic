@@ -90,6 +90,39 @@ def test_root_percentage_height_resolves_against_viewport_height():
     assert child.get_layout_box().height == 600.0
 
 
+def test_display_none_clears_stale_layout_box_instead_of_freezing_it():
+    """`display:none` gives an element (and everything inside it) no box
+    at all in real CSS -- `tree.py`'s own build/adjust pipeline already
+    knew to exclude such an element from `node_map` and never touch it
+    again, but never actually cleared the `_layout_box` a *previous* pass
+    published for it back when it still rendered. `paint_tree` walks the
+    real DOM, not `node_map`, so it never itself learns an element was
+    excluded -- it kept drawing a hidden element at that frozen, stale
+    position forever, and `getBoundingClientRect()`/hit-testing read the
+    same stale box for the same reason. Found via a live `chromonic.App`
+    run (`examples/kanban.py`): clicking a `.filter` button set matching
+    cards' own `display` to `none`, layout heights changed accordingly,
+    but the hidden cards never actually disappeared from the screen."""
+    child = div("hi", _style="height:20px;")
+    element = div(child, _style="height:40px;")
+    root = div(element, _style="width:200px;")
+
+    tree.layout(root, width=200.0)
+    assert element.get_layout_box() is not None
+    assert child.get_layout_box() is not None
+
+    element.style.display = "none"
+    tree.layout(root, width=200.0)
+    assert element.get_layout_box() is None
+    assert child.get_layout_box() is None
+
+    element.style.display = ""
+    tree.layout(root, width=200.0)
+    assert element.get_layout_box() is not None
+    assert element.get_layout_box().height == 40.0
+    assert child.get_layout_box() is not None
+
+
 def test_chromonic_uses_released_domonic_package():
     result = subprocess.run(
         [sys.executable, "-c",
@@ -111,6 +144,100 @@ def test_content_box_size_includes_padding_and_border_in_layout_geometry():
     box = element.get_layout_box()
     assert style_bridge.to_dict(layout_style(element))["box_sizing"] == "content-box"
     assert (box.width, box.height) == (124.0, 64.0)
+
+
+def test_flex_toolbar_auto_height_is_not_shortened_by_bfc_float_correction():
+    """`_fix_nested_bfc_float_auto_height` (CSS 2.1 10.6.3/10.6.7: an
+    auto-height BFC's own bottom must include a descendant float that
+    escaped a non-BFC wrapper) treated every flex container as eligible
+    too, since `_establishes_bfc` correctly reports that a flex container
+    establishes a BFC -- but CSS Flexbox computes `float` to `none` on
+    every flex item regardless of its author value, so a flex container
+    can never actually contain a floated child for this pass to find. It
+    still recomputed the row's height from `max(child bottom margin
+    edge)`, ordinary block-flow style, instead of leaving Taffy's own
+    (already-correct) native flex cross-size alone -- children kept at
+    their own height via `align-items:flex-start` (not the default
+    `stretch`, which would mask this) land short of the row's real height,
+    so the "correction" came out smaller than Taffy's own number and
+    shifted every later sibling up to match.
+
+    Two flex rows stacked directly, each followed only by pixel-height
+    children (no font metrics involved), give an unambiguous expected
+    answer any spec-compliant browser (Chrome included) would also
+    produce: each row's height is its tallest child, and each later
+    element sits exactly at the previous one's real border-box bottom
+    edge. Mirrors `examples/kanban.py`'s two `.toolbar { display:flex }`
+    rows, where this previously shifted the `.board` below both of them
+    (and everything painted inside it) up by 8px -- 4px per row -- on
+    every single relayout."""
+    toolbar_a = div(
+        div(_style="height:24px;"),
+        div(_style="height:40px;"),
+        _style="display:flex; align-items:flex-start; height:auto;",
+    )
+    toolbar_b = div(
+        div(_style="height:10px;"),
+        div(_style="height:30px;"),
+        _style="display:flex; align-items:flex-start; height:auto;",
+    )
+    board = div(_style="height:5px;")
+    root = div(toolbar_a, toolbar_b, board, _style="width:200px;")
+
+    shifted = []
+    original = tree._shift_later_siblings_for_height_delta
+
+    def recording(element, delta):
+        shifted.append(element)
+        original(element, delta)
+
+    tree._shift_later_siblings_for_height_delta = recording
+    try:
+        tree.layout(root, width=200.0)
+    finally:
+        tree._shift_later_siblings_for_height_delta = original
+
+    assert toolbar_a.get_layout_box().height == 40.0
+    assert toolbar_b.get_layout_box().height == 30.0
+    assert toolbar_b.get_layout_box().y == toolbar_a.get_layout_box().y + 40.0
+    assert board.get_layout_box().y == toolbar_b.get_layout_box().y + 30.0
+    # Neither flex row should ever reach `_shift_later_siblings_for_height_
+    # delta` at all -- not "corrected once instead of twice", corrected
+    # zero times, since Taffy's own native flex sizing already owns it.
+    assert toolbar_a not in shifted
+    assert toolbar_b not in shifted
+
+
+def test_bfc_float_correction_still_applies_once_to_a_real_block_bfc():
+    """Positive control for the fix above: excluding flex/grid containers
+    from `_fix_nested_bfc_float_auto_height`'s eligibility must narrow
+    *which* boxes it corrects, not disable the pass itself. A genuine
+    `display:flow-root` block (no flex/grid involved) whose only content
+    is a wrapper div holding one `float:left` child is exactly the shape
+    this function's own docstring cites (found on `wpt/css/CSS2/normal-
+    flow/block-formatting-context-height-002.xht`): Chrome's real answer
+    is `48px` (float height) `+ 48px` (its escaped bottom margin) `=
+    96px`, not the `0px` Taffy's native block layout gives a BFC with no
+    ordinary in-flow content of its own (a float is never in-flow)."""
+    wrapper = div(div(_style="float:left; height:48px; margin-bottom:48px;"))
+    bfc = div(wrapper, _style="display:flow-root; height:auto;")
+    root = div(bfc, _style="width:200px;")
+
+    shifted = []
+    original = tree._shift_later_siblings_for_height_delta
+
+    def recording(element, delta):
+        shifted.append(element)
+        original(element, delta)
+
+    tree._shift_later_siblings_for_height_delta = recording
+    try:
+        tree.layout(root, width=200.0)
+    finally:
+        tree._shift_later_siblings_for_height_delta = original
+
+    assert bfc.get_layout_box().height == 96.0
+    assert shifted.count(bfc) == 1
 
 
 def test_layout_writes_geometry_that_matches_getBoundingClientRect():
@@ -939,6 +1066,51 @@ def test_ua_style_apply_is_idempotent():
     assert len(document.getElementsByTagName("style")) == 1
 
 
+def test_outline_never_perturbs_geometry_across_repeated_classlist_cycles():
+    """CSS `outline` is paint-only (CSS2.1 8.5.4/CSS UI 4 -- it never
+    participates in the box model, Taffy layout, or document flow, only
+    drawn on top of the element's own already-final box). Regression test
+    for the chromonic showcase's `.card.selected { outline: 2px solid
+    #333 }` -- reported as the clicked card visually drifting ~4-5px per
+    click (`inspect_card` toggles `.selected` on/off on every click).
+    Extensive manual reproduction across both layout engines (`tree.
+    layout()` and `LayoutProjection`, single- and multi-card documents,
+    real dispatched click events, and a 40-step randomized stress
+    sequence) found no drift with the code as it stands -- this test
+    locks that invariant in going forward, exactly as specified: x/y/
+    width/height must stay byte-for-byte identical through 20 add/remove
+    cycles, whether or not `.selected` is currently applied."""
+    from domonic.dom import DOMParser
+
+    from chromonic import tree
+
+    document = DOMParser().parseFromString(
+        "<html><head><style>"
+        ".card { background: white; border: 1px solid #ccc; margin-bottom: 10px; padding: 12px; }"
+        ".card.selected { outline: 2px solid #333; }"
+        "</style></head><body style='margin:0;display:block'>"
+        "<div class='card' id='x'>hello</div>"
+        "<div class='card' id='y'>world</div>"
+        "</body></html>",
+        "text/html",
+    )
+    el = document.getElementById("x")
+    tree.layout(document.body, width=800.0, height=None, viewport_height=600.0)
+    baseline = el.get_layout_box()
+    expected = (baseline.x, baseline.y, baseline.width, baseline.height)
+
+    for _ in range(20):
+        el.classList.add("selected")
+        tree.layout(document.body, width=800.0, height=None, viewport_height=600.0)
+        selected_box = el.get_layout_box()
+        assert (selected_box.x, selected_box.y, selected_box.width, selected_box.height) == expected
+
+        el.classList.remove("selected")
+        tree.layout(document.body, width=800.0, height=None, viewport_height=600.0)
+        unselected_box = el.get_layout_box()
+        assert (unselected_box.x, unselected_box.y, unselected_box.width, unselected_box.height) == expected
+
+
 def test_supports_rule_applies_a_true_condition():
     from domonic.dom import DOMParser
     from domonic.style import ComputedStyleDeclaration
@@ -1015,51 +1187,57 @@ def test_supports_rule_handles_or():
 def test_supports_rule_nested_inside_media_applies():
     from domonic.dom import DOMParser
     from domonic.style import ComputedStyleDeclaration
+    from domonic.window import Window
 
-    from chromonic import style_bridge
+    # `style_bridge.viewport(...)` is a chromonic-internal contextvar used
+    # only to resolve `vw`/`vh` CSS units during *layout* -- domonic's own
+    # cascade (`_collect_author_declarations`, what actually evaluates
+    # `@media`) reads the viewport from the document's real `window.
+    # innerWidth`/`innerHeight` instead, entirely unrelated to that
+    # contextvar. `Window(doc=...).resizeTo(...)` is the real mechanism
+    # (`browser.set_viewport` uses the same one for real pages).
+    document = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@media (min-width: 500px) { @supports (display: grid) { #test { display: grid; } } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    Window(doc=document).resizeTo(1000, 800)
+    assert ComputedStyleDeclaration(document.getElementById("test")).display == "grid"
 
-    with style_bridge.viewport(1000.0, 800.0):
-        document = DOMParser().parseFromString(
-            "<html><head><style>"
-            "@media (min-width: 500px) { @supports (display: grid) { #test { display: grid; } } }"
-            "</style></head><body><div id='test'></div></body></html>",
-            "text/html",
-        )
-        assert ComputedStyleDeclaration(document.getElementById("test")).display == "grid"
-
-        narrow = DOMParser().parseFromString(
-            "<html><head><style>"
-            "@media (min-width: 5000px) { @supports (display: grid) { #test { display: grid; } } }"
-            "</style></head><body><div id='test'></div></body></html>",
-            "text/html",
-        )
-    with style_bridge.viewport(1000.0, 800.0):
-        assert ComputedStyleDeclaration(narrow.getElementById("test")).display != "grid"
+    narrow = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@media (min-width: 5000px) { @supports (display: grid) { #test { display: grid; } } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    Window(doc=narrow).resizeTo(1000, 800)
+    assert ComputedStyleDeclaration(narrow.getElementById("test")).display != "grid"
 
 
 def test_media_rule_nested_inside_supports_applies():
     from domonic.dom import DOMParser
     from domonic.style import ComputedStyleDeclaration
+    from domonic.window import Window
 
-    from chromonic import style_bridge
+    document = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@supports (display: grid) { @media (min-width: 500px) { #test { display: grid; } } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    Window(doc=document).resizeTo(1000, 800)
+    assert ComputedStyleDeclaration(document.getElementById("test")).display == "grid"
 
-    with style_bridge.viewport(1000.0, 800.0):
-        document = DOMParser().parseFromString(
-            "<html><head><style>"
-            "@supports (display: grid) { @media (min-width: 500px) { #test { display: grid; } } }"
-            "</style></head><body><div id='test'></div></body></html>",
-            "text/html",
-        )
-        assert ComputedStyleDeclaration(document.getElementById("test")).display == "grid"
-
-        unsupported = DOMParser().parseFromString(
-            "<html><head><style>"
-            "@supports (this-property-does-not-exist: 1) { @media (min-width: 500px) "
-            "{ #test { display: grid; } } }"
-            "</style></head><body><div id='test'></div></body></html>",
-            "text/html",
-        )
-        assert ComputedStyleDeclaration(unsupported.getElementById("test")).display != "grid"
+    unsupported = DOMParser().parseFromString(
+        "<html><head><style>"
+        "@supports (this-property-does-not-exist: 1) { @media (min-width: 500px) "
+        "{ #test { display: grid; } } }"
+        "</style></head><body><div id='test'></div></body></html>",
+        "text/html",
+    )
+    Window(doc=unsupported).resizeTo(1000, 800)
+    assert ComputedStyleDeclaration(unsupported.getElementById("test")).display != "grid"
 
 
 def _tiny_png(color=skia.ColorRED, size=4) -> bytes:
@@ -1126,7 +1304,21 @@ def _await_image(browser_images, url, timeout=5.0):
     deadline = time.perf_counter() + timeout
     while time.perf_counter() < deadline:
         if url in browser_images._cache:
-            return browser_images._cache[url]
+            # `_cache[url]` is the internal `_CacheEntry` record (its own
+            # `.width`/`.height` are plain ints, used for cache-size
+            # accounting, not a `skia.Image`/animation frame) -- a cache
+            # hit through `load_image()` itself already unwraps that to
+            # the real decoded image (or the current animation frame),
+            # exactly what a caller actually wants back here.
+            return browser_images.load_image(url)
+        if url in browser_images._failures:
+            # A failed fetch is never added to `_cache` at all -- it's
+            # recorded in the separate `_failures` dict instead (with its
+            # own retry-backoff timing), so a permanently-failing URL
+            # would otherwise never satisfy the check above and this
+            # helper would just spin until `timeout` even though
+            # `load_image()` has already resolved (to `None`).
+            return None
         browser_images.load_image(url)  # a no-op once the fetch is already in flight or cached
         time.sleep(0.02)
     raise TimeoutError(f"image never resolved within {timeout}s: {url}")
@@ -1177,7 +1369,12 @@ def test_load_image_caches_a_failed_fetch_as_none():
     url = "http://127.0.0.1:1/does-not-exist.png"
     assert browser_images.load_image(url) is None
     assert _await_image(browser_images, url) is None
-    assert url in browser_images.__dict__["_cache"]
+    # A failed fetch is never added to `_cache` (only a successful decode
+    # goes there) -- it's remembered in the separate `_failures` dict
+    # instead, with its own retry-backoff timing (`_finish`'s own `else`
+    # branch), so a request for the same URL doesn't hammer an
+    # unreachable/broken source on every relayout.
+    assert url in browser_images.__dict__["_failures"]
 
 
 def test_load_image_decodes_a_data_uri():
@@ -1977,11 +2174,18 @@ def test_generation_increments_only_once_a_background_fetch_finishes():
     from chromonic import browser_images
 
     browser_images.clear_cache()
-    before = browser_images.generation()
-    assert browser_images.load_image("data:image/png;base64,not-valid-base64===") is None
-    # a data: URI is decoded synchronously (see the module docstring) -- no
-    # polling needed, but generation() is only for the async (network) path
-    assert browser_images.generation() == before
+    # A *successful* small data: URI decodes synchronously (see the module
+    # docstring) with no `_generation` bump at all -- but a *failed* one
+    # (this URI's base64 payload is deliberately invalid) still falls
+    # through to the same background pipeline every other failure uses
+    # (`load_image`'s own comment: "let the normal background pipeline
+    # record/cache a useful failure rather than giving synchronous data
+    # URIs a separate error path"), so `_generation` does still advance
+    # for it, just asynchronously -- not immediately inline, the way a
+    # bare `generation() == before` right after the call would assume.
+    bad_uri = "data:image/png;base64,not-valid-base64==="
+    assert browser_images.load_image(bad_uri) is None
+    assert _await_image(browser_images, bad_uri) is None
 
     server_generation_before = browser_images.generation()
     url = "http://127.0.0.1:1/unreachable.png"  # nothing listens on port 1 -- fails fast
@@ -2010,28 +2214,44 @@ def test_an_img_still_loading_lays_out_as_a_zero_sized_box_not_a_blocked_one(mon
 
 
 def test_native_browser_view_poll_images_relayouts_only_when_generation_changes(monkeypatch):
+    # `poll_images()` no longer reads `browser_images.generation()` (or
+    # calls `view.relayout()`) directly at all -- it diffs `events_since()`
+    # against the generation *this view* last consumed, filters for events
+    # that are (a) successful, (b) for a URL this page's own `<img>`
+    # actually references, and (c) intrinsic-size-dependent, and only then
+    # *schedules* a relayout via `request_relayout()` (coalesced, not
+    # immediate -- `poll_deferred_work()`/the throttle test below cover
+    # that separately). This test now drives `events_since()` directly
+    # instead of the no-longer-consulted `generation()`.
     from chromonic import browser_images, native_browser
     from myjs import Page
 
     def loader(url):
-        return Page("<html><body><p>hi</p></body></html>", run=False, css=False)
+        return Page('<html><body><img src="pic.png"></body></html>', run=False, css=False)
 
     view = native_browser.View(200, 200, loader=loader)
     view.navigate("https://example.com/")
+    assert "pic.png" in view._page_image_urls
 
-    relayouts = []
-    monkeypatch.setattr(view, "relayout", lambda **kwargs: relayouts.append(1))
+    scheduled = []
+    monkeypatch.setattr(view, "request_relayout", lambda **kwargs: scheduled.append(1))
 
-    monkeypatch.setattr(browser_images, "generation", lambda: 0)
-    view.poll_images()
-    assert relayouts == []  # unchanged -- no relayout triggered
-
-    monkeypatch.setattr(browser_images, "generation", lambda: 1)
-    view.poll_images()
-    assert relayouts == [1]  # changed -- exactly one relayout
+    state = {"generation": 0, "events": ()}
+    monkeypatch.setattr(browser_images, "events_since", lambda _last: (state["generation"], state["events"]))
 
     view.poll_images()
-    assert relayouts == [1]  # still 1 -- generation() didn't change again
+    assert scheduled == []  # unchanged -- no relayout scheduled
+
+    event = browser_images.ImageEvent(
+        generation=1, url="pic.png", success=True, width=10, height=10,
+        animated=False, encoded_bytes=64, fetch_ms=1.0, decode_ms=1.0,
+    )
+    state["generation"], state["events"] = 1, (event,)
+    view.poll_images()
+    assert scheduled == [1]  # changed, relevant, and intrinsic-size-dependent -- exactly one schedule
+
+    view.poll_images()
+    assert scheduled == [1]  # still 1 -- this view already consumed generation 1
 
 
 def test_native_browser_view_throttles_a_burst_of_image_arrivals_into_one_relayout(monkeypatch):
@@ -2039,34 +2259,47 @@ def test_native_browser_view_throttles_a_burst_of_image_arrivals_into_one_relayo
     # close together (a real thread pool draining a real queue) used to
     # relayout the *entire* tree once per arrival -- measured, a 40-image
     # page produced 34 separate relayouts for one burst, spiking CPU enough
-    # to beachball the window. A burst within one throttle window must
-    # collapse into a single relayout.
+    # to beachball the window. The throttling now lives entirely in
+    # `request_relayout()`'s own deadline coalescing (shared with every
+    # other relayout trigger, not image-specific): each `poll_images()`
+    # call in the burst *schedules* one (pushing the same deadline out
+    # further), but only one *actual* `relayout()` execution happens once
+    # that deadline is finally reached via `poll_deferred_work()`.
     from chromonic import browser_images, native_browser
     from myjs import Page
 
     def loader(url):
-        return Page("<html><body><p>hi</p></body></html>", run=False, css=False)
+        return Page('<html><body><img src="pic.png"></body></html>', run=False, css=False)
 
     view = native_browser.View(200, 200, loader=loader)
     view.navigate("https://example.com/")
+    assert "pic.png" in view._page_image_urls
 
     relayouts = []
     monkeypatch.setattr(view, "relayout", lambda **kwargs: relayouts.append(1))
-    generation = [0]
-    monkeypatch.setattr(browser_images, "generation", lambda: generation[0])
+
+    state = {"generation": 0, "events": ()}
+    monkeypatch.setattr(browser_images, "events_since", lambda _last: (state["generation"], state["events"]))
 
     # ten "arrivals" in immediate succession (no real time passing) --
     # simulating several images finishing within the same loop tick
-    for _ in range(10):
-        generation[0] += 1
+    for i in range(10):
+        state["generation"] = i + 1
+        state["events"] = (
+            browser_images.ImageEvent(
+                generation=i + 1, url="pic.png", success=True, width=10, height=10,
+                animated=False, encoded_bytes=64, fetch_ms=1.0, decode_ms=1.0,
+            ),
+        )
         view.poll_images()
-    assert len(relayouts) == 1  # the first one relayouts immediately; the rest are within the throttle window
+    assert view.poll_deferred_work() is False  # still within the throttle window -- not due yet
+    assert relayouts == []
 
-    # advancing real time past the throttle window lets the next arrival through
-    view._last_image_relayout -= native_browser._IMAGE_RELAYOUT_INTERVAL + 0.01
-    generation[0] += 1
-    view.poll_images()
-    assert len(relayouts) == 2
+    # advancing real time past the throttle window lets the coalesced
+    # relayout fire, exactly once, regardless of how many arrivals fed it
+    view._deferred_layout_at -= native_browser._IMAGE_RELAYOUT_INTERVAL + 0.01
+    assert view.poll_deferred_work() is True
+    assert len(relayouts) == 1
 
 
 def test_browser_api_tick_pushes_a_frame_only_when_an_image_arrived(monkeypatch):

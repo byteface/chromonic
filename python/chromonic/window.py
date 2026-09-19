@@ -157,6 +157,16 @@ class _View:
         canvas.clear(0xFFFFFFFF)
         paint.paint_tree(canvas, self.interaction.root)
 
+    def record_frame_time(self, elapsed_ms):
+        # `GLRenderer.draw()` (native_browser.py, shared with this
+        # simpler run loop) always reports its own paint time back onto
+        # whatever `view` it was given -- `native_browser.View` has real
+        # perf-metrics fields (`last_frame_ms`/`avg_frame_ms`) for this;
+        # this "tiny adapter" deliberately has none, so there is nothing
+        # useful to record it into, but the call still has to land
+        # somewhere or every frame raises `AttributeError`.
+        pass
+
 
 def run(
     root_element,
@@ -203,7 +213,8 @@ def run(
 
         def mouse_button(_win, button, action, mods):
             if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
-                interaction.handle_click(*glfw.get_cursor_pos(win))
+                cursor = glfw.get_cursor_pos(win)
+                interaction.handle_click(*cursor)
 
         def char_callback(_win, codepoint):
             interaction.handle_text(chr(codepoint))
@@ -221,13 +232,13 @@ def run(
             if name is not None:
                 interaction.handle_key(name)
 
+        def on_window_size(_win, w, h):
+            view.resize(w, h)
+
         glfw.set_mouse_button_callback(win, mouse_button)
         glfw.set_char_callback(win, char_callback)
         glfw.set_key_callback(win, key_callback)
-        glfw.set_window_size_callback(
-            win,
-            lambda _win, w, h: view.resize(w, h),
-        )
+        glfw.set_window_size_callback(win, on_window_size)
 
         last_tick = time.perf_counter()
         interval = 1.0 / fps if fps > 0 else 0.0

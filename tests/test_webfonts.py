@@ -132,6 +132,12 @@ def test_arrival_relayouts_native_view_and_document_aliases_do_not_leak(tmp_path
     future.set_result(font_bytes())
     view.poll_images()
     assert view.dirty
+    # `poll_images()` only *schedules* the relayout now (`request_relayout`,
+    # coalesced with every other relayout trigger), it never calls
+    # `relayout()` directly -- force that deadline into the past and let
+    # it fire before checking geometry that depends on it having run.
+    view._deferred_layout_at -= 1.0
+    assert view.poll_deferred_work()
     assert el.get_layout_box().width == pytest.approx(360)
     assert before != el.get_layout_box().width
     assert not reg.errors

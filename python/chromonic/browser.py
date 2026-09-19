@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from types import SimpleNamespace
 import urllib.parse
 from pathlib import Path
@@ -63,6 +64,20 @@ def _normalize_address(value: str) -> str:
         )
     ):
         return "http://" + value
+
+    # A typo'd single slash (`http:/example.com`, missing the second `/`)
+    # parses as scheme="http", netloc="" -- indistinguishable, to the
+    # `parsed.scheme in (...) and parsed.netloc` check below, from a bare
+    # host string that never had a scheme at all. Falling through to the
+    # generic "add a scheme" branch then prepends a *second* scheme in
+    # front of the one already there (`https://http:/example.com`), not
+    # fixing the missing slash. Repaired directly here, before that check,
+    # by inserting the missing slash rather than layering another scheme
+    # on top -- found happening twice to a real user typing quickly in the
+    # address bar.
+    typo_match = re.match(r"^(https?):/(?!/)(.+)$", value, re.I)
+    if typo_match:
+        return f"{typo_match.group(1)}://{typo_match.group(2)}"
 
     parsed = urllib.parse.urlparse(value)
 

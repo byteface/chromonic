@@ -92,6 +92,14 @@ def test_settled_glfw_size_is_applied_before_the_next_draw():
 
     assert sync_window_size(view, object(), FakeGlfw)
     assert (view.width, view.height) == (640, 360)
+    # `resize(..., defer=True)` (what `sync_window_size` calls) only
+    # *schedules* the relayout now (`request_relayout`, coalesced with
+    # every other relayout trigger) -- the real run loop settles it via
+    # `poll_deferred_work()` before its next `draw()` (this test's own
+    # name), which needs real time to have actually reached the deadline;
+    # force that here rather than sleeping the test.
+    view._deferred_layout_at -= 1.0
+    assert view.poll_deferred_work()
     assert box.get_layout_box().width == 640
     assert not sync_window_size(view, object(), FakeGlfw)
 
@@ -208,7 +216,13 @@ class _ManualExecutor:
     def __init__(self):
         self.futures = []
 
-    def submit(self, fn, url):
+    def submit(self, fn, *args, **kwargs):
+        # Matches the real `Executor.submit(fn, *args, **kwargs)` signature
+        # -- `Navigation.request()` calls this with a single, already-
+        # bound closure (`lambda: self.view.loader(url)`), never a
+        # separate `url` argument, so a mandatory second positional
+        # parameter here always raised a `TypeError` before `submit` ever
+        # got a chance to record anything.
         from concurrent.futures import Future
         future = Future()
         future.set_running_or_notify_cancel()

@@ -762,7 +762,32 @@ def _child_elements(element, computed_cache=None, *, reuse_styles=False) -> list
         computed, style_obj = _describe(child, computed_cache, reuse_styles=reuse_styles)
         if _renders(style_obj):
             result.append((child, computed, style_obj))
+        else:
+            _clear_stale_layout_geometry(child)
     return result
+
+
+def _clear_stale_layout_geometry(element) -> None:
+    """`element` just resolved to `display:none` (or still is) -- real CSS
+    gives it, and everything inside it, no box at all. Without this, any
+    `_layout_box`/`_chromonic_inline_fragments` published for it on some
+    *earlier* pass, back when it still rendered, was simply left in place:
+    excluded from `node_map` (so nothing here ever touches it again), but
+    not cleared either, so it kept reading as "has a box" to every piece of
+    code that isn't `tree.py`'s own build/adjust pipeline -- `paint_tree`
+    walks the real DOM, not `node_map`, so it never itself learns this
+    subtree was excluded, and kept drawing it at that frozen position
+    forever; `getBoundingClientRect()`/hit-testing read the same stale box
+    for the same reason. Found via a live `chromonic.App` run (`examples/
+    kanban.py`): clicking a `.filter` button set a card's own `display` to
+    `none` (or reset it to `""`), and the layout heights genuinely changed
+    accordingly, but the card being hidden never itself became visible on
+    screen -- it just kept painting at its last real position."""
+    element.__dict__.pop("_layout_box", None)
+    element.__dict__.pop("_chromonic_inline_fragments", None)
+    for child in element.childNodes or []:
+        if _is_element(child):
+            _clear_stale_layout_geometry(child)
 
 
 # CSS 2.1 16.6.1's white-space collapsing only ever touches ASCII space,
@@ -3910,7 +3935,9 @@ def _shift_later_siblings_for_height_delta(element, delta: float) -> None:
     flow needs the same vertical shift -- Taffy positioned each one
     immediately after the previous sibling's own (now-stale) box.
     Absolutely/fixed-positioned siblings are excluded: their own position
-    doesn't derive from preceding-sibling flow at all."""
+    doesn't derive from preceding-sibling flow at all. A `display:none`
+    sibling is excluded too, by `_shift_subtree` itself -- see its
+    docstring."""
     parent = getattr(element, "parentNode", None)
     if parent is None or not _is_element(parent):
         return
@@ -3996,6 +4023,29 @@ def _fix_nested_bfc_float_auto_height(node_map: dict) -> None:
             continue  # _adjust_body_collapsed_margins owns body
         native = getattr(element, "_chromonic_native_style", None)
         if native is None or native.get("height") != "auto":
+            continue
+        if native.get("display") in ("flex", "grid"):
+            # CSS floats compute to `float: none` on a flex/grid item
+            # regardless of their author value (CSS Flexbox 3 sect. 2, CSS
+            # Grid sect. 3) -- a flex/grid container can *never* actually
+            # have a floated child, so this function's whole premise (an
+            # auto-height box whose real content-bottom needs recomputing
+            # to account for an escaped/BFC-contained float) never applies
+            # to one. `_establishes_bfc` returns `True` for every flex/grid
+            # container regardless (a real, separate CSS fact -- they do
+            # establish a BFC), which let every one of them reach the
+            # child-scanning code below anyway and get "corrected" by it.
+            # That recompute (`max` of each child's own bottom margin edge,
+            # ordinary block-flow style) isn't equivalent to Taffy's own
+            # flexbox/grid sizing at all -- a flex row's auto-height is its
+            # own cross-axis extent (`align-items`, `gap`, baseline
+            # alignment all included), not simply the lowest child's
+            # bottom edge -- so it produced a different, wrong height
+            # instead of leaving Taffy's already-correct one alone. Found
+            # on `examples/kanban.py`: `.toolbar { display: flex; }`
+            # measured `4px` shorter than Taffy's own flex-row height,
+            # shifting every later sibling (and everything painted inside
+            # them) up by that much.
             continue
         if not getattr(element, "_chromonic_has_layout_children", False):
             # A genuine leaf -- no element children at all, only its own
@@ -4872,7 +4922,7 @@ def _adjust_body_collapsed_margins(root_element):
     # child) regardless, ignoring `#div1`'s now-irrelevant extra 1px.
     top = boxes[0].y
     bottom = boxes[-1].y + boxes[-1].height
-    old = root_element.__dict__.get("_layout_box")
+    old = root_element.__dict__.get("_chromonic_pristine_box") or root_element.__dict__.get("_layout_box")
     if old is not None:
         # The escaped final margin still contributes to the document's scroll
         # extent even though it is outside body.getBoundingClientRect() --
@@ -5335,7 +5385,25 @@ def _shift_subtree(element, dx: float, dy: float) -> None:
     corrected element's own position through to its descendants, whose
     boxes Taffy computed as offsets from `element`'s own (now-corrected)
     origin. A uniform shift preserves every internal relationship Taffy
-    already got right; only the subtree's absolute origin moves."""
+    already got right; only the subtree's absolute origin moves.
+
+    Skips `element` (and, since there's nothing to descend into, its own
+    subtree) entirely when it's currently `display:none` -- such an
+    element generates no box at all in real CSS, was never given a real
+    Taffy node this pass, and so was never repositioned by whatever
+    correction is calling this function in the first place. Its own
+    `_layout_box` is simply whatever was last published for it, potentially
+    several relayouts ago; shifting it anyway compounds this same
+    correction on top of the last one, forever, since -- unlike every
+    sibling Taffy *did* just lay out fresh -- nothing ever resets it back
+    to a pristine baseline first. Found via a live `chromonic.App` run
+    (`examples/kanban.py`): repeatedly clicking a `.filter` button that
+    leaves a `.card` at `display:none` (already `none`, reset to the same
+    `none` every click) walked its stale box further up by a few pixels on
+    every single click, unbounded."""
+    resolved = getattr(element, "_chromonic_resolved_style", None)
+    if resolved is not None and not _renders(resolved[1]):
+        return
     _shift_box(element, dx, dy)
     for fragment in getattr(element, "_chromonic_inline_fragments", None) or ():
         _shift_box(fragment, dx, dy)
@@ -5564,6 +5632,16 @@ def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_hei
     crash.html`: fixed by editing this function alone, verified `0`, still
     measured `0` through `LayoutProjection.layout()` -- the fix was real but
     two of the three entry points never called it."""
+    # `_adjust_body_collapsed_margins` runs more than once in this same
+    # pass (below, again after the float-flow height fixes) -- its own
+    # `_chromonic_scroll_extent` computation needs Taffy's real, still-
+    # uncorrected box (specifically `old.y + old.height`, which is where
+    # a root-escaped trailing margin Taffy's own native collapsing already
+    # folded in still shows up) as its baseline; on a *second* call that
+    # box would otherwise already be the first call's own corrected
+    # (smaller) one, silently losing that escaped margin from the
+    # document's scroll extent. Stashed once, here, before either call.
+    root_element.__dict__["_chromonic_pristine_box"] = root_element.__dict__.get("_layout_box")
     _fix_nested_split_flow_extent(node_map)
     _adjust_body_collapsed_margins(root_element)
     _apply_root_margin_offset(root_element, node_map)
