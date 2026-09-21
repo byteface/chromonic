@@ -175,3 +175,23 @@ rule-index cache or the per-element computed-style cache, both keyed on
 `replace(Sync)` bump. Patched in `domonic_stylesheet_disabled_patch.py`:
 `_build_rule_index` now skips disabled sheets, and `disabled` is a real
 property that bumps the epoch when it actually changes.
+
+
+
+5
+
+------
+
+Found running `tests/wpt/css/CSS2/colors/colors-007.xht`: `Computed
+StyleDeclaration._to_used_color` resolves `currentcolor` via `re.sub(
+r"...currentcolor...", current, value)`, passing the resolved color
+straight through as `re.sub`'s *replacement* string -- a raw backslash-
+digit sequence in it (`\45` survives unescaped from a CSS identifier hex
+escape domonic's tokenizer doesn't resolve, e.g. `color: g\re\45n`) is
+read by Python's `re` as a backreference to a nonexistent capture group,
+raising `re.PatternError` and aborting the whole layout pass over one
+CSS declaration. Patched in `domonic_currentcolor_replace_patch.py`: the
+same substitution via `re.sub`'s function form, never interpreted as a
+backreference template regardless of content. The escape-sequence gap
+that leaves `\45` unresolved in the first place is separate and deeper
+(domonic's CSS tokenizer), not fixed.

@@ -20,6 +20,7 @@ import urllib.request
 
 from . import (
     domonic_ch_unit_patch,
+    domonic_currentcolor_replace_patch,
     domonic_ex_unit_patch,
     domonic_flex_flow_patch,
     domonic_presentational_hint_patch,

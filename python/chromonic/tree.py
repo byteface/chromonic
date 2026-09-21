@@ -589,8 +589,20 @@ class _InlineFormattingPlan:
         elem_entry[1].extend(self.fragments)
 
 # Metadata/logic tags a real browser hardcodes as never painting a box;
-# domonic's cascade gives these no such default on its own.
-_NON_RENDERING_TAGS = frozenset({"script", "style", "head", "title", "meta", "link", "noscript", "template"})
+# domonic's cascade gives these no such default on its own. `colgroup`/`col`
+# (CSS 2.1 17.2.1: `display:table-column-group`/`table-column` "are not
+# rendered" -- they exist purely as column-styling/-sizing metadata, never a
+# box) belong here too: without it, they fell through to ordinary block
+# treatment, taking a real flow position and height between a table's
+# `<caption>` and its row-groups -- confirmed directly on a `<colgroup>` +
+# `<thead>`/`<tbody>`/`<tfoot>` table, where the extra slot corrupted the
+# header/body/footer reordering (CSS 2.1 17.5.3) badly enough that `<tbody>`
+# ended up overlapping `<colgroup>`'s claimed position and `<thead>` landed
+# *above* the caption instead of below it.
+_NON_RENDERING_TAGS = frozenset({
+    "script", "style", "head", "title", "meta", "link", "noscript", "template",
+    "colgroup", "col",
+})
 
 
 def _is_element(node) -> bool:
@@ -810,14 +822,27 @@ def _describe(element, computed_cache=None, *, reuse_styles=False):
     return result
 
 
+#: CSS 2.1 17.2.1: `table-column`/`table-column-group` "are not rendered"
+#: -- no box at all, same as `display:none` for box-generation purposes,
+#: whether reached via a literal `<colgroup>`/`<col>` tag (already excluded
+#: earlier, by tag, in `_NON_RENDERING_TAGS`) or an arbitrary element
+#: authored with one of these two `display` values directly (`_renders`
+#: is the computed-style-driven check for exactly that latter case, since
+#: `_NON_RENDERING_TAGS`'s tag-based check runs *before* any style is even
+#: resolved and so can't see it).
+_NON_RENDERING_DISPLAYS = frozenset({"table-column", "table-column-group"})
+
+
 def _renders(style_obj) -> bool:
     """Whether an element already known to be an ordinary rendering tag (see
     `_NON_RENDERING_TAGS`, checked by the caller before this) should still be
     walked into the Taffy tree -- false for anything the cascade resolved to
     `display: none` (a real browser's "don't lay this out, don't paint it,
-    don't hit-test it" is exactly `display: none`)."""
+    don't hit-test it" is exactly `display: none`), or to `table-column`/
+    `table-column-group` (see `_NON_RENDERING_DISPLAYS`)."""
     display = style_obj.display
-    return getattr(display, "value", display) != "none"
+    value = getattr(display, "value", display)
+    return value != "none" and value not in _NON_RENDERING_DISPLAYS
 
 
 def _child_elements(element, computed_cache=None, *, reuse_styles=False) -> list:
@@ -2527,6 +2552,34 @@ def _row_cells(row_element, computed_cache) -> list:
     return cells
 
 
+def _max_cell_border_width(table_element, computed_cache) -> float:
+    """The widest border-width any cell in `table_element` declares on any
+    side -- what `build()` reserves as the table root's own outer half-
+    border when `border-collapse:collapse` (CSS 2.1 17.6.2.1's real
+    per-edge collapsing-border resolution picks a winner *per grid line*
+    -- top/right/bottom/left independently -- from width/style/color/
+    source priority; this takes the single widest border anywhere in the
+    table and reserves that same amount on all four sides, correct only
+    when the table's perimeter borders are already uniform, e.g. every
+    cell declaring the same `border` shorthand on every side. A table
+    whose cells border only *one* side each (confirmed directly on
+    border-collapse-applies-to-006.xht: `#left{border-right:10px}`,
+    `#right{border-left:10px}`, neither cell bordered on its own outer/
+    table-facing side at all) over-reserves on the sides that have no
+    real perimeter border -- a known gap in this approximation, not yet
+    worth the real per-edge grid-position bookkeeping a correct fix
+    needs. `0.0` if no cell has a border at all."""
+    widest = 0.0
+    for row in _table_rows(table_element, computed_cache):
+        for cell in _row_cells(row, computed_cache):
+            computed, _style_obj = _describe(cell, computed_cache)
+            for prop in ("borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth"):
+                width = _fontmetrics.parse_length(getattr(computed, prop, None), default=0.0)
+                if width > widest:
+                    widest = width
+    return widest
+
+
 def _compute_table_column_widths(table_element, computed_cache) -> dict:
     """`{id(cell_element): resolved_width}` for every cell, colspan'd or
     not -- a deliberately minimal CSS 2.1 17.5.2.2 "auto" table-layout
@@ -2761,9 +2814,22 @@ def _approximate_inline_flow(
     element.__dict__.pop("_chromonic_float_flow_qualifies", None)
     for child in child_elements:
         child.__dict__.pop("_chromonic_force_full_row_width", None)
+        child.__dict__.pop("_chromonic_float_no_shrink", None)
     if style["display"] != "block":
         return  # already flex/grid/none -- a real, explicit layout mode wins, no guessing over it
-    if len(child_elements) < 2:
+    if len(child_elements) < 2 and not any(_is_floated(cc) for cc in child_computeds):
+        # A *lone* floated child still needs real float positioning (flush
+        # to its containing block's own edge, `float:right` in particular)
+        # -- the usual "needs 2+ children" gate exists to avoid engaging
+        # this whole approximation for an ordinary single-child block (the
+        # overwhelmingly common case, and not a float), but a single
+        # `float:left`/`right` child is exactly as unambiguous a signal
+        # alone as it is alongside siblings (see the float half of
+        # `_wants_horizontal_flow` above). Confirmed directly on floats-
+        # rule3-outside-right-001.xht: a lone `float:right` child, with no
+        # siblings to trigger this function at all, rendered flush-*left*
+        # in its container instead -- `float` wasn't consulted for
+        # positioning at all.
         return
     qualifies = [
         _wants_horizontal_flow(child, child_computed, child_style)
@@ -2788,9 +2854,25 @@ def _approximate_inline_flow(
     # block's full width, `width:auto` or not -- plain flex-wrap would
     # shrink-to-fit it instead, so `build()` forces `flex_basis:100%` for
     # it here; explicit-width blocks are left alone.
-    for child, ok in zip(child_elements, qualifies):
+    for child, ok, child_computed in zip(child_elements, qualifies, child_computeds):
         if not ok:
             child._chromonic_force_full_row_width = True
+        elif _is_floated(child_computed):
+            # A real float with an explicit (non-`auto`) width is never
+            # shrink-to-fit -- CSS 2.1 10.3.5 uses the specified width
+            # outright, and it's free to overflow past its containing
+            # block rather than shrink to stay inside it (the same "no
+            # min-width:auto floor" fact `_chromonic_force_full_row_width`
+            # already relies on, but the opposite problem: here it's
+            # `flex_shrink`, not a min-width floor, doing the unwanted
+            # shrinking -- flex's plain default `flex-shrink:1` lets this
+            # row-packed item give up space to fit the flex line, which an
+            # explicit-width float must never do). Confirmed directly on
+            # floats-rule3-outside-right-001.xht: a lone `float:right`
+            # child with `width:425px` inside a 400px-wide flex-wrap
+            # container was shrunk to fit at 400px instead of staying
+            # 425px and overflowing past the container's own left edge.
+            child._chromonic_float_no_shrink = True
     inline_tag_qualifies = any(
         _is_inline_level(child, child_style) for child, child_style in zip(child_elements, child_styles)
     )
@@ -2835,6 +2917,30 @@ def _establishes_bfc(computed) -> bool:
     overflow_x = (getattr(computed, "overflowX", "visible") or "visible").strip().lower()
     overflow_y = (getattr(computed, "overflowY", "visible") or "visible").strip().lower()
     return overflow_x != "visible" or overflow_y != "visible"
+
+
+def _cleared_y(computed, active_floats, current_y: float) -> float:
+    """The minimum y `computed`'s own `clear` property requires, given
+    `active_floats` (`_fix_float_flow_after_block_sibling`'s own running
+    list of `{side, edge, top, bottom}` for every float already packed in
+    this same container) -- CSS 2.1 9.5.2: a cleared box's top border edge
+    must be at or below the bottom outer edge of every earlier float, on
+    the cleared side(s), still in this block formatting context. Applies
+    to a clearing float exactly as much as a clearing ordinary block (CSS
+    2.1 9.5.2 doesn't exempt one), so both of `_fix_float_flow_after_
+    block_sibling`'s packing branches call this. Returns `current_y`
+    unchanged when there's nothing to clear -- no `clear`, or no float on
+    the relevant side yet."""
+    if computed is None:
+        return current_y
+    clear_value = (getattr(computed, "clear", None) or "none").strip().lower()
+    if clear_value not in ("left", "right", "both"):
+        return current_y
+    required = current_y
+    for active in active_floats:
+        if clear_value == "both" or active["side"] == clear_value:
+            required = max(required, active["bottom"])
+    return required
 
 
 def _establishes_containing_block(style_obj) -> bool:
@@ -2942,8 +3048,41 @@ def build(
         element._chromonic_border_collapse = computed.borderCollapse == "collapse"
         if element._chromonic_border_collapse:
             # Collapsed borders straddle the table grid edge -- reserving
-            # half an outer border per side matches Chrome's inner grid.
-            style.update({"box_sizing": "border-box", "padding": [0.5] * 4})
+            # half the resolved collapsed border-width per side matches
+            # Chrome's inner grid (`_max_cell_border_width` -- an
+            # approximation of CSS 2.1 17.6.2.1's real per-edge collapsing
+            # resolution, see its own docstring). A hardcoded `0.5`px
+            # reservation here previously ignored the cells' actual border
+            # width entirely -- correct only when it happened to *be*
+            # 1px; confirmed directly on border-collapse-001.xht's 5px
+            # cell borders, which need a 2.5px reservation, not 0.5px.
+            #
+            # The table root's *own* declared border competes for the
+            # perimeter's collapsed width exactly like an outermost cell's
+            # would -- `max()` with it here, and halved below the same way
+            # every cell's own border already is (`elif is_table_cell`
+            # below), matching real collapsing-border resolution when a
+            # table declares a border but its cells don't (confirmed
+            # directly on border-collapse-005.html: an empty-`<tbody>`
+            # table with `border:2px solid blue` and borderless cells
+            # needs a 1px inset -- half its own 2px border -- not the 0px
+            # `_max_cell_border_width` alone would give it).
+            own_border = max(_numeric_edge(v) for v in style["border"])
+            resolved_border = max(_max_cell_border_width(element, computed_cache), own_border)
+            half_border = resolved_border / 2.0
+            # The table's own border, like every cell's, only ever draws
+            # its *half* of a collapsed line -- halved here the same way
+            # `elif is_table_cell` below halves each cell's. Extra padding
+            # then only needs to cover the gap between that half and the
+            # resolved perimeter width (zero when the table's own border
+            # already *is* the widest one at the perimeter, as in the
+            # common case of a `border` on `table` and none on its cells).
+            style["border"] = [value / 2.0 if isinstance(value, (int, float)) else value
+                               for value in style["border"]]
+            style.update({
+                "box_sizing": "border-box",
+                "padding": [max(0.0, half_border - own_border / 2.0)] * 4,
+            })
         # Real "auto" table layout (CSS 2.1 17.5.2.2, not `table-layout:
         # fixed`) sizes each column to its widest cell's own content, not
         # an equal row share -- measured once per table so every same-
@@ -2956,10 +3095,71 @@ def build(
             _compute_table_column_widths(element, computed_cache)
             if computed.tableLayout != "fixed" else {}
         )
+        # CSS 2.1 17.6.1: `border-spacing` (the gap between adjacent cells,
+        # and between a cell and the table's own edge) only applies in the
+        # default "separate" border model -- `border-collapse:collapse`
+        # ignores it outright. Was unimplemented entirely (`0px` from every
+        # cell always packed edge-to-edge) regardless of this table's own
+        # spacing, including HTML's own implicit default (a real browser's
+        # UA stylesheet gives `<table>` `border-spacing:2px` -- domonic has
+        # no UA stylesheet of its own, so `ua_style.py` is this project's
+        # substitute for that default, same as every other UA default here).
+        if element._chromonic_border_collapse:
+            element._chromonic_border_spacing = (0.0, 0.0)
+        else:
+            parts = (computed.borderSpacing or "0px").split() or ["0px"]
+            spacing_h = _fontmetrics.parse_length(parts[0], default=0.0)
+            spacing_v = _fontmetrics.parse_length(parts[1], default=spacing_h) if len(parts) > 1 else spacing_h
+            element._chromonic_border_spacing = (spacing_h, spacing_v)
+            if spacing_h or spacing_v:
+                # The same gap also separates the table's own edge from
+                # its outermost row/column (CSS 2.1 17.6.1's spacing
+                # model treats the border as just one more grid line) --
+                # `elif is_table_cell` below's per-row horizontal `gap`
+                # handles *between* cells; this is the perimeter.
+                style["padding"] = [spacing_v, spacing_h, spacing_v, spacing_h]
+                # `is_table_row` below gives every row a `spacing_v` top
+                # margin for the gap *before* it -- correct between two
+                # rows, but for the very first displayed row (CSS 2.1
+                # 17.5.3 header/body/footer order, not necessarily DOM
+                # order) it would double up with the table's own
+                # `padding-top` just set above (padding blocks margin
+                # collapsing, so the two don't merge into one gap the way
+                # two adjoining rows' margins do -- confirmed directly:
+                # left in place, the first row sat `2 * spacing_v` below
+                # the table's own top edge instead of one gap). Marked
+                # here, once, so that row can skip just its own top
+                # margin and leave the table's padding to provide it
+                # alone.
+                rows = _table_rows(element, computed_cache)
+                for row in rows:
+                    row.__dict__.pop("_chromonic_is_first_table_row", None)
+                if rows:
+                    rows[0]._chromonic_is_first_table_row = True
     if is_table_row:
         # Taffy has no table formatting mode -- a plain flex row gives
         # ordinary fixed/equal-column tables the right basic geometry.
         style.update({"display": "flex", "flex_direction": "row", "flex_wrap": "nowrap"})
+        ancestor = getattr(element, "parentElement", None)
+        while ancestor is not None and not getattr(ancestor, "_chromonic_is_table_root", False):
+            ancestor = getattr(ancestor, "parentElement", None)
+        spacing_h, spacing_v = getattr(ancestor, "_chromonic_border_spacing", (0.0, 0.0)) if ancestor is not None else (0.0, 0.0)
+        if spacing_h:
+            style["gap"] = (0.0, spacing_h)
+        if spacing_v and not getattr(element, "_chromonic_is_first_table_row", False):
+            # Between-row spacing: no shared flex container across rows
+            # (row-groups just stack them in ordinary block flow) to hang
+            # a `gap` off, so a real top margin does it instead -- every
+            # row except the first (which would double up with the
+            # table's own `padding-top`, already the first row's own gap
+            # -- see where that's set above). Nothing plays the same role
+            # for a *bottom* margin on the last row: the table's
+            # `padding-bottom` alone already provides that gap, since
+            # nothing after the last row needs to push further. `margin`
+            # never actually applies to a table-row itself (CSS 2.1
+            # 17.4), so repurposing it here costs nothing a real browser
+            # would otherwise show.
+            style["margin"] = [spacing_v, 0.0, 0.0, 0.0]
     elif is_table_cell and style["width"] == "auto":
         ancestor = getattr(element, "parentElement", None)
         while ancestor is not None and not getattr(ancestor, "_chromonic_is_table_root", False):
@@ -2987,6 +3187,40 @@ def build(
         # author width is left alone; only `auto` needs correcting, since
         # real CSS block flow always fills the containing block.
         style["flex_basis"] = ("pct", 1.0)
+        # Flexbox's `min-width:auto` gives every flex item an "automatic
+        # minimum size" (roughly its min-content width) that `flex-shrink`
+        # normally can't shrink it below -- real CSS Flexbox behavior, and
+        # correct for a genuine flex item. But this element isn't one: it's
+        # an ordinary block CSS 2.1 9.2.1 lays out at a fixed width (its
+        # containing block's width minus its own margins) with no such
+        # floor -- its content is free to overflow past that width exactly
+        # like any other block, never forcing the *box itself* wider (or,
+        # worse, shrinking its own margin to compensate -- confirmed
+        # directly: with `min-width:auto` left in place, a 425px-wide
+        # child inside this 500px-wide flex-wrap row forced the parent's
+        # `flex-basis:100%; margin-right:100px` to resolve as width 425/
+        # margin 75 instead of the correct width 400/margin 100 -- Taffy's
+        # shrink algorithm, once content hits that auto-minimum floor,
+        # shrinks the margin to force a fit rather than letting the box
+        # overflow, the one thing real block layout would actually do
+        # here). `min-width:0` removes that floor, matching real CSS block
+        # sizing; only relevant when the author didn't set their own
+        # `min-width` (an explicit one is real author intent, left alone).
+        if style["min_width"] == "auto":
+            style["min_width"] = 0.0
+        # Same content-box-vs-border-box overflow the other two `pct(1.0)`
+        # substitutes for real block `width:auto` need fixing (see their
+        # own comments) -- a content-box `flex-basis:100%` lets this
+        # element's own padding/border stick out past its container
+        # instead of being carved out of it.
+        style["box_sizing"] = "border-box"
+    if getattr(element, "_chromonic_float_no_shrink", False):
+        # Set by `_approximate_inline_flow` for a real float with an
+        # explicit width -- flexbox's plain default `flex-shrink:1` would
+        # otherwise let this row-packed item give up its specified width
+        # to fit the flex line, which CSS 2.1 10.3.5 never does for a
+        # float (it overflows past its containing block instead).
+        style["flex_shrink"] = 0.0
     # `<select>`'s `<option>`s and `<iframe>`'s light-DOM children are never
     # real layout content -- treated as childless regardless of markup.
     children = [] if tag_name in ("select", "svg", "svg:svg", "iframe") else _child_elements(
@@ -3075,7 +3309,14 @@ def build(
             # blocks` call* -- `element` here was body itself -- measuring
             # `800px` (the full viewport) instead of Chrome's `784px`
             # (`800px` minus body's own `8px` left/right UA margins).
+            #
+            # `box-sizing:border-box` alongside it for the same reason the
+            # single-inline-plan branch below needs it: a content-box
+            # `100%` would let this element's own padding/border stick
+            # out past the container instead of being carved out of it,
+            # the way a real auto-width block's actually is.
             style["width"] = ("pct", 1.0)
+            style["box_sizing"] = "border-box"
         owner_cache = element.__dict__.setdefault("_chromonic_split_plan_owners", {})
         piece_ids = []
         plan_index = 0
@@ -3147,6 +3388,22 @@ def build(
         # `css_display_value`, the real pre-mapping computed display, does.
         if css_display_value == "block" and style["width"] == "auto":
             style["width"] = ("pct", 1.0)
+            # `width:auto` on a real CSS block *shrinks* to leave room for
+            # its own padding/border inside the containing block -- a
+            # plain `pct(1.0)` substitute doesn't: Taffy has no `calc(100%
+            # - <padding>)` dimension to ask for that directly, so a
+            # content-box interpretation of `100%` makes this element's
+            # own padding/border stick out past the container instead
+            # (confirmed directly: a lone `<div style="padding-left:2em">
+            # <span>|</span></div>` overflowed its 784px body by exactly
+            # its own padding, landing at 848px). `box-sizing:border-box`
+            # makes `100%` mean the *border box* total instead, which is
+            # exactly what a real auto-width block's border box already
+            # equals regardless of its own padding -- this is a Taffy-
+            # geometry-only override (unrelated to whatever `box-sizing`
+            # the page's own CSS/CSSOM reports, a separate system, see
+            # `_chromonic_native_style`'s own docs), not a display change.
+            style["box_sizing"] = "border-box"
         measure_key = ("inline-context", tuple(element._chromonic_paint_style.items()), tuple(
             ("break", id(run["element"])) if run.get("break") else
             (id(run["source"]), id(run["owner"]), tuple(run["paint_style"].items()),
@@ -3766,14 +4023,22 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
 
     Runs after Taffy's flex-wrap layout, using the qualifying split
     `_approximate_inline_flow` recorded on `element`. Narrow on purpose:
-    only applies when at least one child is an ordinary block and every
-    qualifying child is a real float (not merely inline-level) -- mixed
-    groups are left to Taffy's own result. When it applies, every child's
-    position is recomputed by simple left-to-right block/float packing."""
+    only applies when every *qualifying* child is a real float, not merely
+    inline-level -- a group with even one qualifying-but-not-floated
+    (inline-tag) child leaves Taffy's own flex-wrap result alone entirely
+    (real inline-flow approximation, e.g. a nav bar of plain `<a>`s, relies
+    on that result's own gap/wrap handling, not this simplified packer).
+    Does *not* also require at least one ordinary (non-qualifying) block
+    sibling -- a pure all-float sibling group needs this same real
+    left/right packing just as much (confirmed directly: two floats with
+    no other sibling packed side-by-side, both flush-left, via Taffy's own
+    flex-wrap row layout, `float:right` never actually consulted for
+    positioning at all). When it applies, every child's position is
+    recomputed by simple left-to-right block/float packing."""
     for element in list(node_map.values()):
         children = getattr(element, "_chromonic_float_flow_children", None)
         qualifies = getattr(element, "_chromonic_float_flow_qualifies", None)
-        if not children or qualifies is None or False not in qualifies:
+        if not children or qualifies is None:
             continue
         if any(is_flow and not _is_floated(
                 (getattr(child, "_chromonic_resolved_style", None) or (None,))[0])
@@ -3839,14 +4104,65 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 narrowed_left = content_left
                 narrowed_right = content_right
                 child_computed = (getattr(child, "_chromonic_resolved_style", None) or (None,))[0]
+                new_y = _cleared_y(child_computed, active_floats, new_y)
+                child_native_style = getattr(child, "_chromonic_native_style", None) or {}
+                child_has_explicit_width = child_native_style.get("width") != "auto"
                 if _establishes_bfc(child_computed):
-                    for active in active_floats:
-                        if active["bottom"] <= new_y:
-                            continue
-                        if active["side"] == "left":
-                            narrowed_left = max(narrowed_left, active["edge"])
-                        else:
-                            narrowed_right = min(narrowed_right, active["edge"])
+                    # CSS 2.1 9.5: a box establishing its own BFC must not
+                    # overlap any float still active at its top -- narrowing
+                    # alone (as before) stops there, but an *explicit*-width
+                    # box too wide for what's left between the active
+                    # floats at this `new_y` needs to drop further, past
+                    # whichever of them is blocking it, and be renarrowed
+                    # there -- repeated since dropping past one float can
+                    # still leave another (or the same one, still) in the
+                    # way. Confirmed directly on floats-wrap-top-below-bfc-
+                    # 002l.xht: a 200px-wide new-BFC box between a 150px
+                    # left float and a 300px right float (leaving negative
+                    # room) previously just sat at its unnarrowed `new_y`,
+                    # overlapping both, instead of dropping below the
+                    # lower of the two.
+                    #
+                    # `width:auto` never needs this push-down check at all
+                    # -- narrowing alone already gives it the right answer,
+                    # since (unlike a fixed width) it just *fills* whatever
+                    # narrowed space is left rather than needing to fit an
+                    # already-decided size into it. Using this box's own
+                    # (still full-row, not yet narrowed) `child_box.width`
+                    # as the "does it fit" check here, as the fixed-width
+                    # case does, was wrong for auto-width boxes: confirmed
+                    # directly on floats-wrap-bfc-001-left-overflow.xht, an
+                    # `overflow:hidden` (`width:auto`) div only 150px worth
+                    # of actual content wide but still full-row (300px) at
+                    # this point in the pipeline -- checking that 300
+                    # against the 200px narrowed by an adjacent float
+                    # wrongly looked like an overflow and pushed the whole
+                    # box below the float instead of correctly narrowing
+                    # beside it.
+                    while True:
+                        narrowed_left = content_left
+                        narrowed_right = content_right
+                        # A real interval overlap, not just "hasn't ended
+                        # yet" -- a float whose own top is still below this
+                        # box's `new_y` hasn't started yet either, and
+                        # mustn't narrow a box placed above it (confirmed
+                        # directly: a right float starting well below this
+                        # row's top was otherwise still treated as
+                        # "blocking" a same-row box that starts and ends
+                        # entirely above it).
+                        blocking = [
+                            a for a in active_floats
+                            if a["top"] < new_y + child_box.height and a["bottom"] > new_y
+                        ]
+                        for active in blocking:
+                            if active["side"] == "left":
+                                narrowed_left = max(narrowed_left, active["edge"])
+                            else:
+                                narrowed_right = min(narrowed_right, active["edge"])
+                        if (not child_has_explicit_width or not blocking
+                                or child_box.width <= narrowed_right - narrowed_left):
+                            break
+                        new_y = min(active["bottom"] for active in blocking)
                 ml_auto = margin[3] == "auto"
                 mr_auto = margin[1] == "auto"
                 if ml_auto or mr_auto:
@@ -3882,17 +4198,42 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 cursor_y = row_bottom = block_bottom
                 pending_margins = []
             child_resolved = getattr(child, "_chromonic_resolved_style", None)
+            child_computed = child_resolved[0] if child_resolved is not None else None
             float_side = "left"
-            if child_resolved is not None:
-                float_value = (getattr(child_resolved[0], "float", None) or "").strip().lower()
+            if child_computed is not None:
+                float_value = (getattr(child_computed, "float", None) or "").strip().lower()
                 if float_value == "right":
                     float_side = "right"
+            # CSS 2.1 9.5.2: `clear` applies to a floated box exactly as
+            # much as an ordinary block -- pushes its own top down (and
+            # therefore `cursor_y`/`row_bottom`, both derived from it
+            # below) past whatever it's clearing, before this float's own
+            # placement is computed.
+            cleared_y = _cleared_y(child_computed, active_floats, cursor_y)
+            if cleared_y > cursor_y:
+                cursor_y = row_bottom = cleared_y
+                cursor_x = content_left
+                right_cursor_x = content_right
             if float_side == "right":
                 # `float:right` packs flush to the containing block's right
                 # content edge, not the left-to-right packing below (CSS
                 # 2.1 9.5.1).
                 start_x = right_cursor_x - mr - child_box.width
-                if start_x < cursor_x and right_cursor_x < content_right:
+                # CSS 2.1 9.5.1 rule 7: a float's outer top may not be
+                # higher than any earlier float's it would otherwise
+                # overlap. Triggered by the overlap itself (`start_x <
+                # cursor_x`, i.e. this position collides with whatever's
+                # already packed on the left) -- an earlier version also
+                # required `right_cursor_x < content_right` (an existing
+                # right float having already narrowed this row), which
+                # incorrectly left the *first* right float on a row
+                # unpushed even when it collided with an earlier *left*
+                # float (confirmed directly on floats-wrap-top-below-bfc-
+                # 002l.xht: a 300px right float that can't fit beside a
+                # 150px left float in a 400px container needs to drop
+                # below it, but only ever did when a second right float
+                # was involved).
+                if start_x < cursor_x:
                     cursor_y = row_bottom
                     right_cursor_x = content_right
                     start_x = right_cursor_x - mr - child_box.width
@@ -3903,10 +4244,13 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 right_cursor_x = new_x - ml
                 bottom = new_y + child_box.height + mb
                 row_bottom = max(row_bottom, bottom)
-                active_floats.append({"side": "right", "edge": new_x - ml, "bottom": bottom})
+                active_floats.append({"side": "right", "edge": new_x - ml, "top": new_y, "bottom": bottom})
                 continue
             start_x = cursor_x + ml
-            if start_x + child_box.width + mr > right_cursor_x and cursor_x > content_left:
+            # Symmetric with the right-float branch above -- the overlap
+            # itself is the trigger, not whether this happens to be the
+            # first item packed so far.
+            if start_x + child_box.width + mr > right_cursor_x:
                 cursor_x = content_left
                 cursor_y = row_bottom
                 start_x = cursor_x + ml
@@ -3917,7 +4261,7 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
             cursor_x = new_x + child_box.width + mr
             bottom = new_y + child_box.height + mb
             row_bottom = max(row_bottom, bottom)
-            active_floats.append({"side": "left", "edge": cursor_x, "bottom": bottom})
+            active_floats.append({"side": "left", "edge": cursor_x, "top": new_y, "bottom": bottom})
 
 
 def _shift_later_siblings_for_height_delta(element, delta: float) -> None:

@@ -97,6 +97,7 @@ h6 { font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
 ul, ol { padding: 0 0 0 40px; }
 b, strong { font-weight: bold; }
 th { font-weight: bold; text-align: center; }
+table { border-spacing: 2px; }
 pre, code, kbd, samp { font-family: monospace; }
 pre { white-space: pre; }
 small { font-size: 0.83em; }
