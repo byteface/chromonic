@@ -1314,6 +1314,25 @@ def _tiny_png(color=skia.ColorRED, size=4) -> bytes:
     return bytes(surface.makeImageSnapshot().encodeToData())
 
 
+def _mock_loaded_image(monkeypatch, browser_images, url: str, image, size: int) -> None:
+    """Monkeypatch `load_image(url)` to return `image` *and* populate the
+    real `_cache` entry `natural_size(url)` reads from -- `load_image`'s
+    own return value and `natural_size`'s intrinsic dimensions are two
+    genuinely separate things in the real cache (`_CacheEntry`, populated
+    together by `load_image`'s own real fetch path), so a plain `monkey
+    patch.setattr(browser_images, "load_image", lambda url: image)` alone
+    leaves `natural_size(url)` reporting "not cached yet" (`None, None,
+    None`) -- `_apply_image_intrinsic_size` then has no complete intrinsic
+    pair to size from and falls back to the CSS default replaced-element
+    size (300x150) instead of the mocked image's own square `size`."""
+    monkeypatch.setattr(browser_images, "load_image", lambda requested_url: image)
+    browser_images._cache[url] = browser_images._CacheEntry(
+        image=image, width=size, height=size, decoded_bytes=size * size * 4,
+        loaded_at=0.0, intrinsic_width=float(size), intrinsic_height=float(size),
+        intrinsic_ratio=1.0,
+    )
+
+
 def test_resolve_image_sources_makes_relative_srcs_absolute_only():
     from domonic.dom import DOMParser
 
@@ -1477,7 +1496,7 @@ def test_an_img_with_no_css_size_gets_its_intrinsic_size_from_tree_layout(monkey
     from chromonic import browser_images, tree
 
     png_image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(_tiny_png(size=20)))
-    monkeypatch.setattr(browser_images, "load_image", lambda url: png_image)
+    _mock_loaded_image(monkeypatch, browser_images, "pic.png", png_image, size=20)
 
     root = div(img(_src="pic.png"), _style="width:300px;")
     tree.layout(root, width=300.0)
@@ -2432,7 +2451,7 @@ def test_reuse_styles_still_applies_a_newly_arrived_images_real_size(monkeypatch
     assert img_el.get_layout_box().height == 0.0  # nothing to reserve space for yet
 
     png_image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(_tiny_png(size=20)))
-    monkeypatch.setattr(browser_images, "load_image", lambda url: png_image)  # "arrived" -- generation changed
+    _mock_loaded_image(monkeypatch, browser_images, "pic.png", png_image, size=20)  # "arrived" -- generation changed
     tree.layout(root, width=300.0, reuse_styles=True)
     assert img_el.get_layout_box().height == 20.0  # picked up even though CSS wasn't re-resolved
 

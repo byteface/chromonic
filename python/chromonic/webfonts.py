@@ -255,7 +255,28 @@ def _stylesheet_sources(document, base, external_sources=()):
     for sheet in getattr(document, 'styleSheets', []) or []:
         if external_sources and not getattr(sheet, 'href', None):
             continue
-        if str(sheet) in external_css:
+        # `str(sheet)` is domonic's own CSSOM re-serialization of the
+        # parsed stylesheet -- different whitespace/formatting than the
+        # original source text, so it essentially never equals the *raw*
+        # text `external_sources` captured verbatim, even for the exact
+        # same stylesheet; this alone silently never dedups an external
+        # `<link>` sheet. `browser.py`'s own `_read_resource` override
+        # (what actually fetches an external `<link>`'s CSS, recorded
+        # into `external_sources`) represents the fetched stylesheet to
+        # domonic as a synthesized inline `<style>` element carrying that
+        # exact same raw text unchanged -- `sheet.ownerNode.textContent`
+        # is that text, and *does* match reliably.  Its own `.href` can't
+        # be used for the same purpose: a synthesized `<style>` has no
+        # href of its own, so domonic's `ComputedStyleDeclaration`/CSSOM
+        # falls back to `document.URL`'s own default -- `Window`'s
+        # placeholder `"https://eventual.technology"` when nothing set a
+        # real one, not this page's real location -- for it. Confirmed
+        # directly: an `@font-face`'s own relative `url("face.ttf")`
+        # resolved fine via `external_sources`' correct URL, but was
+        # independently rediscovered a second time here, unresolvable,
+        # via that placeholder as its base.
+        owner_text = getattr(getattr(sheet, 'ownerNode', None), 'textContent', None)
+        if str(sheet) in external_css or (owner_text is not None and owner_text in external_css):
             continue
         href = getattr(sheet, 'href', None) or base
         yield sheet, urllib.parse.urljoin(base, href)

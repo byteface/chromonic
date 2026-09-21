@@ -839,10 +839,26 @@ def _renders(style_obj) -> bool:
     walked into the Taffy tree -- false for anything the cascade resolved to
     `display: none` (a real browser's "don't lay this out, don't paint it,
     don't hit-test it" is exactly `display: none`), or to `table-column`/
-    `table-column-group` (see `_NON_RENDERING_DISPLAYS`)."""
+    `table-column-group` (see `_NON_RENDERING_DISPLAYS`), *unless* this box
+    is absolutely positioned. CSS 2.1 9.7 blockifies `display` for any
+    `position:absolute`/`fixed` box regardless of its specified value (with
+    `none` the only exception, already handled above) -- an author-written
+    `display: table-column-group` on an absolutely positioned element
+    computes to `block`, a perfectly ordinary rendered box, not the
+    17.2.1 "not rendered" rule this function otherwise applies to a literal
+    (in-flow) `table-column`/`table-column-group`. Confirmed directly on
+    `bottom-applies-to-005.xht`: unfixed, such an element was dropped
+    entirely (never even reaching Taffy), instead of rendering as an
+    ordinary absolutely positioned block. The `float`-blockified case CSS
+    2.1 9.7 also covers isn't handled here -- would need `computed` (for
+    `float`), not just `style_obj`, threaded through every call site."""
     display = style_obj.display
     value = getattr(display, "value", display)
-    return value != "none" and value not in _NON_RENDERING_DISPLAYS
+    if value == "none":
+        return False
+    if value in _NON_RENDERING_DISPLAYS:
+        return _is_absolutely_positioned(style_obj)
+    return True
 
 
 def _child_elements(element, computed_cache=None, *, reuse_styles=False) -> list:
@@ -968,6 +984,19 @@ def _inline_mixed_content(element, children, element_is_inline=False):
     items = []
     pending_space = False
     previous_was_element = False
+    # CSS 2.1 16.6.1: whitespace at the very *start* of a block's content
+    # collapses to nothing, same as at a line's start -- only *interior*
+    # whitespace (between two real pieces of content) collapses to a
+    # single space. `pending_space` must therefore never fire until real
+    # content has actually been emitted (`has_content`); otherwise a
+    # purely-formatting leading newline/indentation before this
+    # container's first child (`<div>\n  <span>...`, extremely common in
+    # any hand-formatted or templated HTML) would wrongly manufacture a
+    # visible leading space on that first child. Confirmed directly on
+    # `position-relative-003.xht`: `<div>\n<span>Filler Text</span>\n
+    # </div>` measured the span 4px too wide, a spurious leading space
+    # baked into its own first (and only) run.
+    has_content = False
     for node in element.childNodes or []:
         if getattr(node, "nodeType", None) == TEXT_NODE:
             text = _collapsed_text_node(node)
@@ -976,12 +1005,13 @@ def _inline_mixed_content(element, children, element_is_inline=False):
                 if fragment is None:
                     fragment = _AnonymousTextFragment(node, element)
                     node._chromonic_fragment = fragment
-                fragment._chromonic_leading_collapsed_space = (
+                fragment._chromonic_leading_collapsed_space = has_content and (
                     pending_space or (previous_was_element and text[:1].isalnum())
                 )
                 items.append(("text", fragment, text, None, None))
                 pending_space = False
                 previous_was_element = False
+                has_content = True
             elif (getattr(node, "textContent", "") or ""):
                 pending_space = True
         elif id(node) in by_id:
@@ -990,9 +1020,25 @@ def _inline_mixed_content(element, children, element_is_inline=False):
                 items.append(("break", child, None, computed, style_obj))
                 pending_space = False
                 previous_was_element = False
+                # A forced line break starts a fresh line -- whitespace
+                # right after it collapses to nothing too, not a real
+                # space, the same as at this container's own start.
+                has_content = False
             else:
+                # Mirrors the text-fragment case just above: a whitespace-
+                # only text node collapses to nothing of its own (no run
+                # ever represents it), so the fact a space belongs *before*
+                # this element has to be carried forward the same way, or
+                # it's lost entirely once this element flattens its own
+                # content into runs below. Confirmed directly: `<a>Blue
+                # stein</a> <a>1 hour ago</a>` (a plain space between two
+                # adjacent elements) rendered as "Bluestein1 hour ago",
+                # the space silently dropped.
+                child._chromonic_leading_collapsed_space = has_content and pending_space
                 items.append(("element", child, None, computed, style_obj))
+                pending_space = False
                 previous_was_element = True
+                has_content = True
 
     def pseudo_item(which, info):
         pseudo_computed, text = info
@@ -1110,6 +1156,45 @@ def _empty_decoration_only_run(owner, leading_edge, trailing_edge, top_edge_val,
     }
 
 
+def _make_collapsed_space_run(paint_style, owner, top_edge_val: float, extra_height: float) -> dict:
+    """A standalone run for a whitespace-only text node that collapsed to
+    nothing of its own but still needs to occupy a real (wrappable,
+    collapsible-at-line-end) slot between two elements -- built the same
+    way an ordinary text run is, just for a single space token, and kept
+    as its *own* run rather than merged into a neighboring element's own
+    run. Merging it into the neighbor's first token was tried first and
+    is exactly as wide, but confirmed wrong directly on `inline-
+    formatting-context-013.xht`: when that neighbor's own content didn't
+    fit on the space's line and had to wrap, the merged token pair wrapped
+    as a unit strangely, leaving a stray zero-width space fragment
+    dangling on the *previous* line real Chrome never reports at all. A
+    standalone run collapses at a wrap boundary the same well-tested way
+    any other adjacent whitespace-only run already does elsewhere in this
+    file, instead of taking on a new, untested code path."""
+    font_size = _fontmetrics.parse_length(paint_style["font_size"], default=16.0)
+    family = "" if paint_style["font_family"] == "none" else paint_style["font_family"]
+    weight = _parse_font_weight(paint_style["font_weight"])
+    italic = fonts.is_italic(paint_style["font_style"])
+    ascent, descent, normal_height = fonts.text_metrics(family, font_size, weight >= 600, italic)
+    glyph_height = ascent + descent
+    resolved_lh = _resolved_line_height(paint_style["line_height"])
+    used_lh = resolved_lh if resolved_lh is not None else normal_height
+    above = ascent + math.floor((used_lh - glyph_height) / 2)
+    below = used_lh - above
+    one_w = layout_text("a", family, font_size, font_weight=weight, italic=italic)[0]
+    spaced_w = layout_text("a a", family, font_size, font_weight=weight, italic=italic)[0]
+    space_width = max(0.0, spaced_w - 2.0 * one_w)
+    return {
+        "source": owner, "owner": owner, "paint_style": paint_style,
+        "font_size": font_size, "tokens": [(" ", space_width)],
+        "leading": 0.0, "trailing": 0.0, "box_height": glyph_height + extra_height,
+        "glyph_height": glyph_height, "ascent": ascent,
+        "above": above, "below": below, "top_edge": top_edge_val,
+        "space_width": space_width, "atomic_width": 0.0,
+        "margin_start": 0.0, "margin_end": 0.0, "intrinsic_width": space_width,
+    }
+
+
 def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                                  leading_edge=0.0, trailing_edge=0.0,
                                  top_edge_val=0.0, extra_height=0.0,
@@ -1150,12 +1235,44 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
     if not text_node_indices:
         return []
     runs = []
+    # Whitespace collapses across sibling-node boundaries the same way it
+    # does across run boundaries in `_make_inline_formatting_plan`'s own
+    # top-level text handling (`raw[:1]`/`raw[-1:]`) -- but unlike that
+    # one, every text run built below unconditionally strips *both* ends
+    # of its own text (`t.strip(...)`), with no equivalent restoration.
+    # `pending_space` carries a boundary space forward (from a text node
+    # that collapsed to nothing of its own, or a real node's own trailing
+    # whitespace) to whatever the *next* run turns out to be -- a plain
+    # text token, or a nested element's own first run. Confirmed directly
+    # rendering `news.ycombinator.com`: a subtext line's own `<span class=
+    # "subline">` wrapper (nested one level inside `<td>`, so its content
+    # is flattened here, not via that other, already-correct top-level
+    # path) rendered `Bluestein2 hours ago` -- an `<a>` immediately
+    # followed by a `<span>` with no space token anywhere between them.
+    pending_space = False
+    # Same CSS 2.1 16.6.1 reasoning as `_inline_mixed_content`'s own
+    # `has_content` guard: whitespace collapses to nothing at the very
+    # *start* of this content (never to a real space), so neither a prior
+    # sibling's trailing whitespace nor this node's own leading whitespace
+    # should manufacture a leading-space token until something real has
+    # already been emitted.
+    has_content = False
     for node_index, child_node in enumerate(child_nodes):
         node_tag = (getattr(child_node, "tagName", "") or "").lower()
         if getattr(child_node, "nodeType", None) == TEXT_NODE:
+            node_raw = getattr(child_node, "textContent", None)
+            if node_raw is None:
+                node_raw = getattr(child_node, "data", "") or ""
             raw_text = _collapsed_text_node(child_node)
             if not raw_text:
+                if node_raw:
+                    pending_space = True
                 continue
+            has_leading_space = has_content and (pending_space or bool(
+                node_raw[:1] and node_raw[:1] in _CSS_WHITESPACE_STRIP_CHARS))
+            has_trailing_space = bool(node_raw[-1:] and node_raw[-1:] in _CSS_WHITESPACE_STRIP_CHARS)
+            pending_space = False
+            has_content = True
             is_first_text = node_index == text_node_indices[0]
             is_last_text = node_index == text_node_indices[-1]
             run_leading = leading_edge if is_first_text else 0.0
@@ -1166,7 +1283,9 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
             )
             if not t.strip(_CSS_WHITESPACE_STRIP_CHARS):
                 continue
-            t = t.strip(_CSS_WHITESPACE_STRIP_CHARS)
+            t = ((" " if has_leading_space else "")
+                 + t.strip(_CSS_WHITESPACE_STRIP_CHARS)
+                 + (" " if has_trailing_space else ""))
             font_size_i = _fontmetrics.parse_length(paint_style["font_size"], default=16.0)
             family_i = ("" if paint_style["font_family"] == "none"
                         else paint_style["font_family"])
@@ -1218,10 +1337,19 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                 ),
             })
         elif node_tag == "br":
+            pending_space = False
+            # A forced line break starts a fresh line the same way the
+            # whole container's own start does -- whitespace right after
+            # it collapses to nothing too, not to a real space.
+            has_content = False
             runs.append({"break": True, "element": child_node})
         elif _is_element(child_node) and computed_cache is not None:
             child_computed, child_style = _describe(child_node, computed_cache)
             if _is_absolutely_positioned(child_style):
+                # Out of flow -- doesn't occupy an inline-content slot of
+                # its own, so any space pending before it isn't consumed
+                # here; it still belongs before whatever real content
+                # comes next.
                 runs.append({"escapee": True, "element": child_node,
                              "computed": child_computed, "style": child_style})
                 continue
@@ -1229,8 +1357,22 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                 node for node in (child_node.childNodes or ())
                 if _is_element(node) and (getattr(node, "tagName", "") or "").lower() != "br"
             ]
-            if non_br_element_children:
-                continue  # further nesting -- out of this split path's scope, dropped as before
+            if non_br_element_children and not _is_genuine_inline_wrapper(child_node, child_style):
+                # A nested block, `inline-block`, or replaced descendant
+                # needs its own dedicated treatment (the CSS 2.1 9.2.1.1
+                # split, or an atomic box with real intrinsic sizing) --
+                # this function only ever flattens plain text into runs,
+                # so it has no way to represent one and silently drops it,
+                # same as it already did for a one-level-nested one (a bare
+                # replaced/block element directly here, with no element
+                # children of its own, always recursed into a trivially-
+                # empty call and vanished the same way). Same reasoning as
+                # the escapee case just above: dropped, not consumed, so a
+                # pending space still belongs before whatever comes next.
+                continue
+            needs_leading_space = has_content and pending_space
+            pending_space = False
+            has_content = True
             is_first_text = node_index == text_node_indices[0]
             is_last_text = node_index == text_node_indices[-1]
             nested_native = style_bridge.to_dict(child_style)
@@ -1251,6 +1393,8 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                 margin_end=margin_end if is_last_text else 0.0,
                 computed_cache=computed_cache,
             )
+            if needs_leading_space and nested_runs:
+                runs.append(_make_collapsed_space_run(paint_style, owner, top_edge_val, extra_height))
             # CSS 2.1's bidi box model (box.html#bidi-box-model, confirmed
             # directly against `left-rtl-ref.xht`'s own reference markup:
             # `<span style="border-left-style:none; padding-right:10px;
@@ -1674,7 +1818,7 @@ def _split_inline_flow_around_blocks(element, inline_items, style, css_display, 
 
     def flush_pending():
         if pending:
-            plan = _make_inline_formatting_plan(element, list(pending), style, css_display)
+            plan = _make_inline_formatting_plan(element, list(pending), style, css_display, computed_cache)
             if plan is not None:
                 pieces.append(("plan", plan))
             pending.clear()
@@ -1694,7 +1838,7 @@ def _split_inline_flow_around_blocks(element, inline_items, style, css_display, 
             # wrapper's leading segment rather than sharing its line).
             runs_acc: list = []
             if pending:
-                pending_plan = _make_inline_formatting_plan(element, list(pending), style, css_display)
+                pending_plan = _make_inline_formatting_plan(element, list(pending), style, css_display, computed_cache)
                 if pending_plan is not None:
                     runs_acc.extend(pending_plan.runs)
                 pending.clear()
@@ -1733,7 +1877,7 @@ def _split_inline_flow_around_blocks(element, inline_items, style, css_display, 
     return pieces if found_split else None
 
 
-def _make_inline_formatting_plan(element, inline_items, style, css_display):
+def _make_inline_formatting_plan(element, inline_items, style, css_display, computed_cache=None):
     """Build styled text runs for a shared inline formatting context."""
     if any(kind == "element" and (
             _is_absolutely_positioned(child_style)
@@ -1807,17 +1951,21 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display):
             paint_style = element._chromonic_paint_style
             native = None
         else:
-            # Nested markup is flattened into this plan only when it contains
-            # text and its element children are all <br> forced line-breaks.
-            # Other element descendants (nested spans, etc.) stay on the
-            # established retained projection.
-            non_br_element_children = [
-                node for node in (item.childNodes or [])
-                if _is_element(node)
-                and (getattr(node, "tagName", "") or "").lower() != "br"
-            ]
-            if non_br_element_children:
-                return None
+            # Nested markup is flattened into this plan when it contains
+            # text and `<br>` forced line-breaks -- and, recursively, any
+            # further plain (`_is_genuine_inline_wrapper`) inline nesting
+            # too (`_build_text_runs_from_nodes`, called below, recurses
+            # into each non-`<br>` element child the same way). A nested
+            # block, `inline-block`, or replaced descendant still can't be
+            # represented as a flattened text run, so it's silently
+            # dropped rather than bailing this whole plan to the flex-row
+            # fallback -- confirmed directly that fallback mismeasures
+            # mixed text + nested-inline content (real Chrome vs chromonic
+            # on `news.ycombinator.com`'s subtext line, `<span class="age">
+            # <a>1 hour ago</a></span>` sitting among plain text and other
+            # `<a>`s: the whole line was scrambled -- the nested `<a>`'s
+            # own text wrapped internally into two lines and landed out of
+            # DOM order relative to its siblings).
             # `item` is on the ordinary (non-split) path this layout --
             # clear any stale interruption-block bookkeeping a previous
             # layout's split may have left on it.
@@ -1867,7 +2015,25 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display):
                 top_edge_val=top_edge_val, extra_height=extra_height,
                 margin_start=0.0 if is_rtl_item else margin_start,
                 margin_end=0.0 if is_rtl_item else margin_end,
+                computed_cache=computed_cache,
             )
+            leading_space_run = None
+            if getattr(item, "_chromonic_leading_collapsed_space", False) and child_runs:
+                # A whitespace-only text node right before this element
+                # collapsed to nothing of its own (see where this flag is
+                # set, in `_inline_mixed_content`) -- restore it as its
+                # own standalone run, owned by this shared plan's own
+                # `element` (the same as any other collapsed-whitespace
+                # text node would be), the same collapsed space a plain
+                # text item's own `inferred_leading` (just below) restores
+                # for itself. Kept as a *separate* run rather than merged
+                # into this element's own first token -- confirmed wrong
+                # directly on `inline-formatting-context-013.xht`: merged,
+                # a wrap point landing between the space and this
+                # element's own content left a stray zero-width space
+                # fragment on the previous line real Chrome never reports.
+                leading_space_run = _make_collapsed_space_run(
+                    element._chromonic_paint_style, element, top_edge_val, extra_height)
             if is_rtl_item:
                 non_break_runs = [r for r in child_runs if not r.get("break")]
                 if non_break_runs:
@@ -1907,6 +2073,8 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display):
                 child_runs = [_empty_inline_strut_run(
                     item, left_edge, right_edge, top_edge_val, extra_height, margin_start,
                 )]
+            if leading_space_run is not None:
+                runs.append(leading_space_run)
             runs.extend(child_runs)
             continue
         raw = getattr(source, "textContent", "") or collapsed or ""
@@ -2222,10 +2390,43 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
     150 height/300 width regardless."""
     from . import browser_images
 
+    # Undo the auto-width block stretch this function itself synthesizes
+    # below for a still-loading image, if the *previous* call here (on
+    # this same element) applied one -- otherwise, once applied, it looks
+    # identical to a real, explicit `width`, and everything below keeps
+    # treating it that way even on a later call where the image actually
+    # has arrived. `style` isn't necessarily freshly built each call: a
+    # `reuse_styles=True` layout pass hands back the very same cached
+    # dict this function already mutated last time, not a fresh one from
+    # `style_bridge.to_dict()`. Confirmed directly: an `<img>` that starts
+    # still-loading (this branch fires, `width` becomes `("pct", 1.0)`)
+    # and then arrives on a later `reuse_styles=True` pass kept that
+    # loading-time override -- `width_auto` read `False` below, skipping
+    # the real intrinsic-size branch entirely and using the *stretched*
+    # 300px width with the image's aspect ratio instead of its own real
+    # (much smaller) intrinsic size.
+    if getattr(element, "_chromonic_image_loading_width_stretch", False):
+        style["width"] = "auto"
+        element._chromonic_image_loading_width_stretch = False
+
     src = element.getAttribute("src") or ""
     image = browser_images.load_image(src)
     if image is None:
-        return  # no image to size from -- left as whatever the cascade said (probably auto -> an empty box)
+        # No image to size from yet -- nothing to reserve height for, but
+        # width:auto still needs its ordinary block behavior (stretch to
+        # fill the containing block), same as any other block-level box.
+        # An `<img>` is always built as a bare Taffy *leaf* (`tree.new_leaf`,
+        # just below this function's own call site), never a container with
+        # children Taffy's own block algorithm sizes the normal way -- a
+        # leaf has no measure function to fall back on while `width` is
+        # still `"auto"`, so it silently collapses to `0` instead. Confirmed
+        # directly: an otherwise-identical empty `<div>` (an ordinary
+        # container node, not a leaf) correctly stretches to its 300px
+        # parent; a still-loading `<img>` in the same spot measured `0`.
+        if style["display"] == "block" and style["width"] == "auto":
+            style["width"] = ("pct", 1.0)
+            element._chromonic_image_loading_width_stretch = True
+        return
     intrinsic_width, intrinsic_height, _ratio = browser_images.natural_size(src)
     has_complete_pair = intrinsic_width is not None and intrinsic_height is not None
     intrinsic_ratio = intrinsic_width / intrinsic_height if has_complete_pair and intrinsic_height else None
@@ -2259,6 +2460,21 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
         # percentage width/height at all, so the image simply never
         # painted (zero-height box), despite genuinely finishing loading.
         style["aspect_ratio"] = intrinsic_ratio
+    if isinstance(style["width"], (int, float)):
+        # A resolved replaced-element width (intrinsic, ratio-derived, or
+        # the 300px UA default) is never subject to flex-shrink -- it's
+        # not a genuine flex item, just an atomic run inside whatever
+        # flex-row this project's own inline-formatting approximation
+        # wraps it in alongside surrounding text. Flexbox's plain default
+        # `flex-shrink:1` would otherwise squeeze it down to fit that
+        # row's available width instead of overflowing/wrapping as a
+        # whole unit the way a real inline-replaced element does.
+        # Confirmed directly on replaced-elements-min-width-40.html: six
+        # SVGs with no complete intrinsic size (falling back to the
+        # 300x150 UA default here) were squeezed down to 200px -- the
+        # 200px-wide containing `<div>`'s own width, not theirs -- every
+        # one of them, instead of overflowing it at their real 300px.
+        style["flex_shrink"] = 0.0
 
 
 def _resolve_replaced_percent_height(style: dict, element, height_attr: str) -> "float | None":
@@ -2519,6 +2735,19 @@ def _table_rows(table_element, computed_cache) -> list:
             child_computed, child_style = _describe(child, computed_cache)
             if not _renders(child_style):
                 continue
+            if _is_absolutely_positioned(child_style):
+                # CSS 2.1 9.7: an absolutely/fixed positioned element's
+                # `display` blockifies regardless of its specified value
+                # (`table-row`/`table-row-group`/etc. included) -- pulled
+                # entirely out of the table's own row/row-group structure,
+                # not even transparently walked into for nested rows the
+                # way an ordinary non-table wrapper is below. Confirmed
+                # directly on `top-applies-to-001.xht`: an absolutely
+                # positioned `display:table-row-group` element was still
+                # being placed as a real row-group here, landing it inside
+                # the table's normal flow (y=178) instead of at its own
+                # `top:0` offset (y=0).
+                continue
             if tag == "tr" or _is_table_row_display(child_computed):
                 buckets[kind].append(child)
                 continue
@@ -2547,6 +2776,8 @@ def _row_cells(row_element, computed_cache) -> list:
         child_computed, child_style = _describe(child, computed_cache)
         if not _renders(child_style):
             continue
+        if _is_absolutely_positioned(child_style):
+            continue  # CSS 2.1 9.7: blockified, not a real cell -- see `_table_rows`'s walk()
         if tag in ("td", "th") or _is_table_cell_display(child_computed):
             cells.append(child)
     return cells
@@ -3018,7 +3249,17 @@ def build(
         margin = list(style["margin"])
         margin[0] = margin[2] = 0.0
         style["margin"] = margin
-    table_internal_display = getattr(style_obj.display, "value", "")
+    # CSS 2.1 9.7: an absolutely/fixed positioned element's `display`
+    # blockifies regardless of its specified value -- none of the
+    # table-internal-only rules below (margin/padding suppression,
+    # row/cell classification) apply to it once blockified. Confirmed
+    # directly on `top-applies-to-001.xht`/`bottom-applies-to-005.xht`:
+    # an absolutely positioned `display:table-row-group`/`-column-group`
+    # element must render as an ordinary ("block") absolutely positioned
+    # box, not a real table-internal part.
+    table_internal_display = (
+        "" if _is_absolutely_positioned(style_obj) else getattr(style_obj.display, "value", "")
+    )
     if table_internal_display in _TABLE_INTERNAL_DISPLAYS:
         # CSS 2.1 17.4/CSS Tables 3: margin never applies to an internal
         # table box (row/row-group/cell/column/...) on any side -- only
@@ -3041,8 +3282,10 @@ def build(
         # to Taffy the same way as `overflow`, via `Contain::PAINT`.
         style["establishes_bfc"] = True
     is_table_root = tag_name == "table" or _is_table_root_display(computed)
-    is_table_row = tag_name == "tr" or _is_table_row_display(computed)
-    is_table_cell = tag_name in ("td", "th") or _is_table_cell_display(computed)
+    is_table_row = not _is_absolutely_positioned(style_obj) and (
+        tag_name == "tr" or _is_table_row_display(computed))
+    is_table_cell = not _is_absolutely_positioned(style_obj) and (
+        tag_name in ("td", "th") or _is_table_cell_display(computed))
     if is_table_root:
         element._chromonic_is_table_root = True
         element._chromonic_border_collapse = computed.borderCollapse == "collapse"
@@ -3269,7 +3512,7 @@ def build(
     split_pieces = (_split_inline_flow_around_blocks(
                          element, inline_items, style, css_display_value, computed_cache)
                      if inline_items else None)
-    inline_plan = (_make_inline_formatting_plan(element, inline_items, style, css_display_value)
+    inline_plan = (_make_inline_formatting_plan(element, inline_items, style, css_display_value, computed_cache)
                    if inline_items and split_pieces is None else None)
 
     if split_pieces is not None:
@@ -5196,7 +5439,29 @@ def _is_root_anchored(element) -> bool:
 
 def _find_containing_block_ancestor(element):
     """The nearest ancestor establishing a real containing block for
-    `element`'s absolute/fixed positioning, or `None` if none exists."""
+    `element`'s absolute/fixed positioning, or `None` if none exists.
+
+    CSS 2.1 10.1 rule 4: a `position:fixed` box's containing block is
+    *always* the viewport (`None` here, so the caller falls back to the
+    root/viewport-anchored fix-up) -- unlike `position:absolute`'s rule 3,
+    no ancestor's own `position` can ever substitute for it, not even
+    another positioned one. Confirmed directly on `position-absolute-
+    005.xht`: a `position:fixed` box nested inside a `position:absolute`
+    ancestor was walking up and anchoring to that ancestor instead,
+    landing at its offset (296px, 418px) instead of the viewport's own
+    top-left corner (0, 0) real Chrome puts it at."""
+    # `element._chromonic_native_style["position"]` can't distinguish this
+    # -- `style_bridge._position()` maps CSS `fixed` to the same Taffy-level
+    # `"absolute"` string as CSS `absolute` (Taffy has no native `fixed`
+    # concept). `_chromonic_resolved_style`'s `LayoutStyle.position` is the
+    # pre-Taffy-mapping value straight from domonic's cascade, which still
+    # keeps `fixed` distinct -- the same source `_is_absolutely_positioned`
+    # already reads for exactly this reason.
+    own_resolved = getattr(element, "_chromonic_resolved_style", None)
+    if own_resolved is not None:
+        own_position = own_resolved[1].position
+        if getattr(own_position, "value", own_position) == "fixed":
+            return None
     parent = getattr(element, "parentElement", None)
     while parent is not None:
         resolved = getattr(parent, "_chromonic_resolved_style", None)
@@ -5255,7 +5520,7 @@ def _resolve_viewport_anchored_box(style: dict, box, viewport_height: float):
     return top_v + mt, viewport_height - top_v - mt - bottom_v - mb
 
 
-def _resolve_viewport_anchored_box_x(style: dict, box, viewport_width: float):
+def _resolve_viewport_anchored_box_x(style: dict, box, viewport_width: float, element=None):
     """`(new_x, new_width)` for a root-anchored element -- the horizontal
     counterpart to `_resolve_viewport_anchored_box`, needed because the
     root's own Taffy box (shrunk for its own margin) isn't always the true
@@ -5264,8 +5529,8 @@ def _resolve_viewport_anchored_box_x(style: dict, box, viewport_width: float):
     left_v = _resolve_inset(left, viewport_width)
     right_v = _resolve_inset(right, viewport_width)
     _mt, margin_right, _mb, margin_left = style["margin"]
-    ml = _resolve_inset(margin_left, viewport_width) or 0.0
-    mr = _resolve_inset(margin_right, viewport_width) or 0.0
+    ml = _resolve_inset(margin_left, viewport_width)
+    mr = _resolve_inset(margin_right, viewport_width)
     width = style["width"]
     if isinstance(width, tuple) and width[0] == "pct":
         # Same opposite-inset-independent resolution as the height branch
@@ -5274,21 +5539,52 @@ def _resolve_viewport_anchored_box_x(style: dict, box, viewport_width: float):
         # root-anchored box must resolve against the true viewport width.
         new_width = width[1] * viewport_width
         if left_v is not None:
-            return left_v + ml, new_width
+            return left_v + (ml or 0.0), new_width
         if right_v is not None:
-            return viewport_width - right_v - mr - new_width, new_width
+            return viewport_width - right_v - (mr or 0.0) - new_width, new_width
         return None, new_width
     if right_v is None:
         # `left` alone determines position. Unlike the vertical
         # counterpart, this can't just be left as Taffy computed it --
         # `left_v` may be a percentage Taffy resolved against its own
         # (margin-shrunk) root box instead of the true viewport width.
-        return (None if left_v is None else left_v + ml), None
+        return (None if left_v is None else left_v + (ml or 0.0)), None
     if left_v is None:
-        return viewport_width - right_v - mr - box.width, None
+        return viewport_width - right_v - (mr or 0.0) - box.width, None
     if width != "auto":
         return None, None
-    return left_v + ml, viewport_width - left_v - ml - right_v - mr
+    # CSS 2.1 10.3.7 rule 5 (`left`/`right` definite, `width` auto): any
+    # auto margin is 0 while solving for width. 10.4 then clamps that
+    # solved width to `min-width`/`max-width`; once clamped, width is back
+    # to being definite too, so an auto margin gets to re-absorb the slack
+    # the clamp freed up (equal split, or the same zero-one-side exception
+    # `_fix_absolute_horizontal_auto_margins` applies when that split would
+    # go negative) -- same reasoning as `_fix_absolute_width_against_
+    # containing_block`'s real-containing-block-ancestor case beside it.
+    new_width = viewport_width - left_v - (ml or 0.0) - right_v - (mr or 0.0)
+    max_width_v = _resolve_inset(style.get("max_width"), viewport_width)
+    min_width_v = _resolve_inset(style.get("min_width"), viewport_width)
+    if max_width_v is not None and new_width > max_width_v:
+        new_width = max_width_v
+    elif min_width_v is not None and new_width < min_width_v:
+        new_width = min_width_v
+    else:
+        return left_v + (ml or 0.0), new_width
+    remaining = viewport_width - left_v - new_width - right_v
+    cml, cmr = ml, mr
+    if cml is None and cmr is None:
+        if remaining < 0:
+            if _element_direction(element) == "rtl":
+                cmr, cml = 0.0, remaining
+            else:
+                cml, cmr = 0.0, remaining
+        else:
+            cml = cmr = remaining / 2.0
+    elif cml is None:
+        cml = remaining - cmr
+    elif cmr is None:
+        cmr = remaining - cml
+    return left_v + cml, new_width
 
 
 def _fix_absolute_horizontal_auto_margins(node_map: dict) -> None:
@@ -5306,7 +5602,16 @@ def _fix_absolute_horizontal_auto_margins(node_map: dict) -> None:
     Also handles exactly one of `left`/`right` being `auto` (CSS 2.1
     10.3.7 case 3/5): any auto margin resolves to `0`, and the missing
     inset is solved from the constraint equation -- auto margins only
-    center the box in the fully-constrained case above."""
+    center the box in the fully-constrained case above.
+
+    And handles the fully over-constrained case too (CSS 2.1 10.3.7 rule
+    1 / 10.3.8): `left`/`width`/`right`/both margins *all* definite at
+    once -- includes every replaced element whose intrinsic size makes
+    `width` definite, not just an explicit non-auto `width`. Real Chrome
+    drops the specified `right` (in `ltr`; `left` in `rtl`) and re-solves
+    it, so `x` simply follows `left` + `margin-left` (mirrored for `rtl`)
+    -- Taffy has no such rule and, confirmed directly on `absolute-
+    replaced-width-071.xht`, instead positioned the box from `right`."""
     for element in list(node_map.values()):
         if not _is_element(element):
             continue
@@ -5319,12 +5624,14 @@ def _fix_absolute_horizontal_auto_margins(node_map: dict) -> None:
         if not margin or not inset:
             continue
         margin_left, margin_right = margin[3], margin[1]
-        if margin_left != "auto" and margin_right != "auto":
-            continue  # nothing left for this fix-up to solve
         left, right = inset[3], inset[1]
         left_auto, right_auto = left == "auto", right == "auto"
         if style.get("width") == "auto" or (left_auto and right_auto):
             continue  # under-constrained differently -- not this equation
+        margin_auto = margin_left == "auto" or margin_right == "auto"
+        over_constrained = not left_auto and not right_auto and not margin_auto
+        if not margin_auto and not over_constrained:
+            continue  # nothing left for this fix-up to solve
         containing = _find_containing_block_ancestor(element)
         if containing is None:
             continue  # root-anchored -- handled by the viewport-anchored fix instead
@@ -5333,14 +5640,34 @@ def _fix_absolute_horizontal_auto_margins(node_map: dict) -> None:
             continue
         cb_width = cb_box.client_width
         cb_content_x = cb_box.x + cb_box.border_left
-        if not left_auto and not right_auto:
+        if over_constrained:
+            if _element_direction(containing) == "rtl":
+                right_v = _resolve_inset(right, cb_width) or 0.0
+                mr = _resolve_inset(margin_right, cb_width) or 0.0
+                new_x = cb_content_x + cb_width - right_v - mr - box.width
+            else:
+                left_v = _resolve_inset(left, cb_width) or 0.0
+                ml = _resolve_inset(margin_left, cb_width) or 0.0
+                new_x = cb_content_x + left_v + ml
+        elif not left_auto and not right_auto:
             left_v = _resolve_inset(left, cb_width) or 0.0
             right_v = _resolve_inset(right, cb_width) or 0.0
             remaining = cb_width - left_v - box.width - right_v
             ml = None if margin_left == "auto" else (_resolve_inset(margin_left, cb_width) or 0.0)
             mr = None if margin_right == "auto" else (_resolve_inset(margin_right, cb_width) or 0.0)
             if ml is None and mr is None:
-                ml = mr = remaining / 2.0
+                if remaining < 0:
+                    # CSS 2.1 10.3.7: splitting the negative slack evenly
+                    # would give both margins a negative value -- instead
+                    # the containing block's leading-edge margin (left in
+                    # ltr, right in rtl) is pinned to 0 and the *other*
+                    # margin absorbs all of it.
+                    if _element_direction(containing) == "rtl":
+                        mr, ml = 0.0, remaining
+                    else:
+                        ml, mr = 0.0, remaining
+                else:
+                    ml = mr = remaining / 2.0
             elif ml is None:
                 ml = remaining - mr
             else:
@@ -5355,6 +5682,273 @@ def _fix_absolute_horizontal_auto_margins(node_map: dict) -> None:
         dx = new_x - box.x
         if abs(dx) > 1e-6:
             _shift_subtree(element, dx, 0.0)
+
+
+def _fix_absolute_vertical_auto_margins(node_map: dict) -> None:
+    """CSS 2.1 10.6.4: the vertical counterpart to `_fix_absolute_
+    horizontal_auto_margins` -- for a `position:absolute` box whose
+    `top`/`height`/`bottom` are all definite, any `auto` `margin-top`/
+    `margin-bottom` absorbs the remaining slack of `top + margin-top +
+    height + margin-bottom + bottom == containing block height`, split
+    evenly if both are auto. Unlike the horizontal rule, 10.6.4 has no
+    `direction`-based "pin one side to zero" exception for a negative
+    split -- CSS 2.1 only ever attaches that exception to the *horizontal*
+    margins (10.3.7), so an equal split here is applied unconditionally,
+    even when it comes out negative. Taffy's own absolute positioning
+    doesn't solve this equation, so this corrects the box's `y` (and
+    everything inside it) after the fact.
+
+    Only handled when a real containing-block ancestor exists -- a
+    root-anchored box is corrected separately by `_fix_viewport_anchored_
+    positioning`.
+
+    Also handles exactly one of `top`/`bottom` being `auto` (CSS 2.1
+    10.6.4 case 3/5): any auto margin resolves to `0`, and the missing
+    inset is solved from the constraint equation -- auto margins only
+    center the box in the fully-constrained case above. Confirmed
+    directly on `absolute-non-replaced-height-003.xht` (`top: 0.5in;
+    bottom: 0.5in; height: 1in; margin-top/margin-bottom: auto` inside a
+    3in-tall `position:relative` containing block): unfixed, both auto
+    margins stayed `0` (Taffy's own default) instead of splitting the
+    96px of remaining slack 48px/48px, leaving the box flush against
+    `top` instead of vertically centered."""
+    for element in list(node_map.values()):
+        if not _is_element(element):
+            continue
+        style = getattr(element, "_chromonic_native_style", None)
+        box = element.__dict__.get("_layout_box")
+        if style is None or box is None or style.get("position") != "absolute":
+            continue
+        margin = style.get("margin")
+        inset = style.get("inset")
+        if not margin or not inset:
+            continue
+        margin_top, margin_bottom = margin[0], margin[2]
+        if margin_top != "auto" and margin_bottom != "auto":
+            continue  # nothing left for this fix-up to solve
+        top, bottom = inset[0], inset[2]
+        top_auto, bottom_auto = top == "auto", bottom == "auto"
+        if style.get("height") == "auto" or (top_auto and bottom_auto):
+            continue  # under-constrained differently -- not this equation
+        containing = _find_containing_block_ancestor(element)
+        if containing is None:
+            continue  # root-anchored -- handled by the viewport-anchored fix instead
+        cb_box = containing.__dict__.get("_layout_box")
+        if cb_box is None:
+            continue
+        cb_height = cb_box.client_height
+        cb_content_y = cb_box.y + cb_box.border_top
+        if not top_auto and not bottom_auto:
+            top_v = _resolve_inset(top, cb_height) or 0.0
+            bottom_v = _resolve_inset(bottom, cb_height) or 0.0
+            remaining = cb_height - top_v - box.height - bottom_v
+            mt = None if margin_top == "auto" else (_resolve_inset(margin_top, cb_height) or 0.0)
+            mb = None if margin_bottom == "auto" else (_resolve_inset(margin_bottom, cb_height) or 0.0)
+            if mt is None and mb is None:
+                mt = mb = remaining / 2.0
+            elif mt is None:
+                mt = remaining - mb
+            else:
+                mb = remaining - mt
+            new_y = cb_content_y + top_v + mt
+        elif top_auto:
+            bottom_v = _resolve_inset(bottom, cb_height) or 0.0
+            new_y = cb_content_y + cb_height - bottom_v - box.height
+        else:
+            top_v = _resolve_inset(top, cb_height) or 0.0
+            new_y = cb_content_y + top_v
+        dy = new_y - box.y
+        if abs(dy) > 1e-6:
+            _shift_subtree(element, 0.0, dy)
+
+
+def _fix_absolute_width_against_containing_block(node_map: dict) -> None:
+    """CSS 2.1 10.3.7: a `position:absolute` box with `width:auto` and both
+    `left`/`right` definite has its width *solved* from the constraint
+    equation (`left + margin-left + width + margin-right + right ==
+    containing block width`) -- the same equation `_resolve_viewport_
+    anchored_box_x` already solves for a *root*-anchored box (no real
+    containing-block ancestor, so it resolves against the viewport
+    instead), generalized here for the ordinary case of a real containing-
+    block ancestor, which that function doesn't cover at all. Taffy's own
+    absolute positioning doesn't solve this equation either way, leaving
+    `width:auto` at whatever the element's own content happened to
+    measure (typically far too small, or `0` for an otherwise-empty box)
+    instead. Confirmed directly on position-absolute-percentage-inherit-
+    001.xht: a nested absolutely-positioned box with all four insets given
+    and no explicit `width` measured `0` instead of the ~169px CSS 2.1
+    10.3.7 actually solves for.
+
+    Also applies CSS 2.1 10.4's min/max-width clamp to that solved width:
+    unclamped, an auto margin is treated as `0` while solving the width
+    equation (rule 5 above) -- but once clamping replaces the solved width
+    with a fixed `min-width`/`max-width`, the box is back to the ordinary
+    "all three of left/width/right are definite" case, so any auto margin
+    gets to re-absorb the slack the clamp just freed up via the same
+    equal-split (or, if that split would go negative, `_fix_absolute_
+    horizontal_auto_margins`'s zero-one-side exception) rule -- otherwise
+    a `max-width`-clamped, centered (`margin: auto`) absolutely positioned
+    box would keep sitting flush against `left` instead of centering.
+    Confirmed directly on `position-absolute-width-025.xht`
+    (`left/right: 8px; width: auto; max-width: 100px; margin: 0 auto`):
+    unclamped this solved `width: 784px` (the full containing block minus
+    the two 8px insets) instead of the expected `100px`, centered box.
+
+    Deliberately as narrow as `_fix_absolute_horizontal_auto_margins`
+    beside it: only overwrites this box's own width/x (and its content-box
+    accordingly) -- its children are shifted, like that function's box is,
+    but not relaid-out to the new width, the same simplification
+    `_fix_viewport_anchored_positioning` already accepts for the root-
+    anchored case."""
+    for element in list(node_map.values()):
+        if not _is_element(element):
+            continue
+        style = getattr(element, "_chromonic_native_style", None)
+        box = element.__dict__.get("_layout_box")
+        if style is None or box is None or style.get("position") != "absolute":
+            continue
+        if style.get("width") != "auto":
+            continue
+        inset = style.get("inset")
+        if not inset:
+            continue
+        left, right = inset[3], inset[1]
+        if left == "auto" or right == "auto":
+            continue  # under-constrained differently -- not this equation
+        containing = _find_containing_block_ancestor(element)
+        if containing is None:
+            continue  # root-anchored -- handled by the viewport-anchored fix instead
+        cb_box = containing.__dict__.get("_layout_box")
+        if cb_box is None:
+            continue
+        cb_width = cb_box.client_width
+        cb_content_x = cb_box.x + cb_box.border_left
+        margin = style.get("margin") or (0.0, 0.0, 0.0, 0.0)
+        margin_left_raw, margin_right_raw = margin[3], margin[1]
+        ml = _resolve_inset(margin_left_raw, cb_width)
+        mr = _resolve_inset(margin_right_raw, cb_width)
+        left_v = _resolve_inset(left, cb_width) or 0.0
+        right_v = _resolve_inset(right, cb_width) or 0.0
+        new_width = max(0.0, cb_width - left_v - (ml or 0.0) - right_v - (mr or 0.0))
+        max_width_v = _resolve_inset(style.get("max_width"), cb_width)
+        min_width_v = _resolve_inset(style.get("min_width"), cb_width)
+        clamped = False
+        if max_width_v is not None and new_width > max_width_v:
+            new_width, clamped = max_width_v, True
+        elif min_width_v is not None and new_width < min_width_v:
+            new_width, clamped = min_width_v, True
+        new_x = box.x
+        if clamped:
+            remaining = cb_width - left_v - new_width - right_v
+            cml, cmr = ml, mr
+            if cml is None and cmr is None:
+                if remaining < 0:
+                    if _element_direction(containing) == "rtl":
+                        cmr, cml = 0.0, remaining
+                    else:
+                        cml, cmr = 0.0, remaining
+                else:
+                    cml = cmr = remaining / 2.0
+            elif cml is None:
+                cml = remaining - cmr
+            elif cmr is None:
+                cmr = remaining - cml
+            new_x = cb_content_x + left_v + cml
+        if abs(new_width - box.width) <= 1e-6 and abs(new_x - box.x) <= 1e-6:
+            continue
+        border_and_padding = box.width - box.client_width
+        # Resize first, at the box's *current* x -- `_shift_subtree` below
+        # (not a second, redundant x assignment here) is what carries this
+        # box and its descendants over to `new_x`, reading whatever x this
+        # box has at the moment it runs.
+        element.__dict__["_layout_box"] = LayoutBox(
+            x=box.x, y=box.y, width=new_width, height=box.height,
+            client_width=max(0.0, new_width - border_and_padding), client_height=box.client_height,
+            border_top=box.border_top, border_left=box.border_left,
+        )
+        dx = new_x - box.x
+        if abs(dx) > 1e-6:
+            _shift_subtree(element, dx, 0.0)
+
+
+def _fix_absolute_height_against_containing_block(node_map: dict) -> None:
+    """CSS 2.1 10.6.4: the vertical counterpart to `_fix_absolute_width_
+    against_containing_block` -- a `position:absolute` box with
+    `height:auto` and both `top`/`bottom` definite has its height *solved*
+    from the constraint equation (`top + margin-top + height + margin-
+    bottom + bottom == containing block height`), then clamped by CSS
+    2.1 10.7's `min-height`/`max-height`, with any auto margin re-
+    absorbing the slack that clamp frees up. Unlike the width version,
+    the vertical margin split has no `direction`-based zero-one-side
+    exception for a negative remainder (CSS 2.1 10.6.4, unlike 10.3.7,
+    doesn't carve one out) -- always an equal split, matching `_fix_
+    absolute_vertical_auto_margins` beside it. Taffy's own absolute
+    positioning doesn't solve this equation, leaving `height:auto` at
+    whatever the box's own content happened to measure instead.
+
+    Deliberately as narrow as `_fix_absolute_width_against_containing_
+    block`: only overwrites this box's own height/y (and its content-box
+    accordingly) -- children are shifted, not relaid-out to the new
+    height."""
+    for element in list(node_map.values()):
+        if not _is_element(element):
+            continue
+        style = getattr(element, "_chromonic_native_style", None)
+        box = element.__dict__.get("_layout_box")
+        if style is None or box is None or style.get("position") != "absolute":
+            continue
+        if style.get("height") != "auto":
+            continue
+        inset = style.get("inset")
+        if not inset:
+            continue
+        top, bottom = inset[0], inset[2]
+        if top == "auto" or bottom == "auto":
+            continue  # under-constrained differently -- not this equation
+        containing = _find_containing_block_ancestor(element)
+        if containing is None:
+            continue  # root-anchored -- not handled here
+        cb_box = containing.__dict__.get("_layout_box")
+        if cb_box is None:
+            continue
+        cb_height = cb_box.client_height
+        cb_content_y = cb_box.y + cb_box.border_top
+        margin = style.get("margin") or (0.0, 0.0, 0.0, 0.0)
+        margin_top_raw, margin_bottom_raw = margin[0], margin[2]
+        mt = _resolve_inset(margin_top_raw, cb_height)
+        mb = _resolve_inset(margin_bottom_raw, cb_height)
+        top_v = _resolve_inset(top, cb_height) or 0.0
+        bottom_v = _resolve_inset(bottom, cb_height) or 0.0
+        new_height = max(0.0, cb_height - top_v - (mt or 0.0) - bottom_v - (mb or 0.0))
+        max_height_v = _resolve_inset(style.get("max_height"), cb_height)
+        min_height_v = _resolve_inset(style.get("min_height"), cb_height)
+        clamped = False
+        if max_height_v is not None and new_height > max_height_v:
+            new_height, clamped = max_height_v, True
+        elif min_height_v is not None and new_height < min_height_v:
+            new_height, clamped = min_height_v, True
+        new_y = box.y
+        if clamped:
+            remaining = cb_height - top_v - new_height - bottom_v
+            cmt, cmb = mt, mb
+            if cmt is None and cmb is None:
+                cmt = cmb = remaining / 2.0
+            elif cmt is None:
+                cmt = remaining - cmb
+            elif cmb is None:
+                cmb = remaining - cmt
+            new_y = cb_content_y + top_v + cmt
+        if abs(new_height - box.height) <= 1e-6 and abs(new_y - box.y) <= 1e-6:
+            continue
+        border_and_padding = box.height - box.client_height
+        element.__dict__["_layout_box"] = LayoutBox(
+            x=box.x, y=box.y, width=box.width, height=new_height,
+            client_width=box.client_width, client_height=max(0.0, new_height - border_and_padding),
+            border_top=box.border_top, border_left=box.border_left,
+        )
+        dy = new_y - box.y
+        if abs(dy) > 1e-6:
+            _shift_subtree(element, 0.0, dy)
 
 
 def _publish_used_horizontal_margins(node_map: dict) -> None:
@@ -5589,7 +6183,7 @@ def _fix_viewport_anchored_positioning(node_map: dict, viewport_height: float,
             continue
         new_y, new_height = _resolve_viewport_anchored_box(style, box, viewport_height)
         new_x, new_width = ((None, None) if viewport_width is None
-                             else _resolve_viewport_anchored_box_x(style, box, viewport_width))
+                             else _resolve_viewport_anchored_box_x(style, box, viewport_width, element))
         if new_y is None and new_height is None and new_x is None and new_width is None:
             continue
         dy = (new_y - box.y) if new_y is not None else 0.0
@@ -5638,6 +6232,28 @@ def _fix_rtl_block_positioning(node_map: dict) -> None:
                 continue
             if native_self.get("display") != "block":
                 continue
+            # `native_self["position"]` can't tell a genuine CSS
+            # `position:relative` apart from plain `static` here --
+            # `style_bridge._position()` maps both to the same Taffy-level
+            # `"relative"` string (Taffy has no `static` of its own; an
+            # un-positioned box is just "relative" with `inset` forced to
+            # auto, see `to_dict()`). A *real* `position:relative` box
+            # already gets its own correct horizontal offset from Taffy's
+            # native relative-position handling (its `right`/`left` inset
+            # included) -- this function's margin-based recalculation is
+            # CSS 2.1 10.3.3's rule for an ordinary, non-positioned block's
+            # margin box, a wholly different mechanism, and applying it on
+            # top would silently discard Taffy's already-correct offset.
+            # Confirmed directly on `right-offset-002.xht`/`right-007.xht`:
+            # a `position:relative` block with `right` (not `left`) set,
+            # inside a `direction:rtl` container, had its correct Taffy-
+            # computed offset overwritten by this function's margin-only
+            # recalculation, which has no notion of `right` at all.
+            own_resolved = element.__dict__.get("_chromonic_resolved_style")
+            if own_resolved is not None:
+                own_position = own_resolved[1].position
+                if getattr(own_position, "value", own_position) == "relative":
+                    continue
             container = getattr(element, "parentElement", None)
             if container is None:
                 continue
@@ -5946,6 +6562,24 @@ def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_hei
     _apply_empty_inline_block_min_height(node_map)
     _fix_float_shrink_to_fit_width(tree_obj, node_map)
     _fix_table_shrink_to_fit_width(tree_obj, node_map)
+    # Both shrink-to-fit fixes above reposition their whole subtree via
+    # `_write_boxes` (a fresh, isolated `tree.compute()`) + `_shift_subtree`
+    # -- but `_write_boxes` only ever touches elements with a *real* Taffy
+    # node (the block-level container itself and its Taffy children), never
+    # a plain inline element whose own box instead comes from `_publish_
+    # inline_formatting`'s fragment-based tracking (`_finalize_inline_owner_
+    # boxes`). `_shift_subtree` still walks and shifts those elements too
+    # (it recurses through every DOM child, not just real Taffy nodes),
+    # double-applying the correction on top of a box that was never reset in
+    # the first place. Re-publishing here recomputes every such element's
+    # box fresh from its (now finally correct) container box instead of
+    # shifting a stale one. Confirmed directly on a one-cell auto-width
+    # `<table><tr><td><span>1.</span></td></tr></table>`: the `<span>`
+    # landed one full shrink-to-fit correction below and right of where its
+    # `<td>` actually ended up -- on a real page (an HTML `<table>`-based
+    # site with narrow, auto-width columns), enough to push every cell's
+    # inline content off past its own row entirely.
+    _publish_inline_formatting(node_map)
     _fix_float_flow_after_block_sibling(node_map)
     _fix_float_flow_container_auto_height(node_map)
     _fix_nested_bfc_float_auto_height(node_map)
@@ -5963,6 +6597,9 @@ def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_hei
     # from the now-final positions instead of the stale ones above.
     _adjust_body_collapsed_margins(root_element)
     _fix_absolute_horizontal_auto_margins(node_map)
+    _fix_absolute_vertical_auto_margins(node_map)
+    _fix_absolute_width_against_containing_block(node_map)
+    _fix_absolute_height_against_containing_block(node_map)
     _fix_absolute_static_position_fallback(node_map)
     if viewport_height is not None:
         _fix_viewport_anchored_positioning(node_map, viewport_height, width)

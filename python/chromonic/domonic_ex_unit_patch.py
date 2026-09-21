@@ -34,11 +34,24 @@ exactly the "do not special-case one property" the underlying CSS
 behaviour already implies (`ex` is a length unit like any other, not a
 padding-specific concept).
 
-Only this one function is patched: `LayoutStyle.from_computed` (the
-cascade -> layout path chromonic's own `style_bridge.to_dict()` actually
-consumes) is what needs `ex` for real layout geometry; `getComputedStyle()`
-(`ComputedStyleDeclaration._to_used_length`) is a separate path chromonic
-doesn't rely on for layout, left unpatched (deliberately, not an oversight)."""
+`LayoutStyle.from_computed` (the cascade -> layout path chromonic's own
+`style_bridge.to_dict()` consumes for width/height/margin/padding/etc.) is
+the main function patched here. `getComputedStyle()`
+(`ComputedStyleDeclaration._to_used_length`) is mostly a separate path
+chromonic doesn't rely on for layout -- except for `line-height`, whose
+used value chromonic *does* read straight from `computed.lineHeight`
+(`chromonic.tree._resolved_line_height`, the line box strut height), never
+through `LayoutStyle` at all. Confirmed directly with `tests/wpt/css/CSS2/
+linebox/line-height-080.xht`'s Ahem `line-height: 1ex` (Ahem's glyphs fill
+the whole em box, so its real x-height equals its font-size): unpatched,
+`_to_used_length` fell through to `_length_string_to_px`'s generic `ex`
+handling, the CSS-spec fallback of a flat `0.5em` for a UA with no real
+glyph metrics -- half the correct, Ahem-specific value. `_to_used_length`
+is therefore also lightly wrapped below, narrowly, only to substitute the
+same real `x_height()`-backed resolution above when the value being used-
+value-resolved is `line-height` and reduces to a plain `ex` token; every
+other property/value still goes through the original, unpatched
+`_to_used_length`."""
 from __future__ import annotations
 
 import re
@@ -54,9 +67,12 @@ from . import webfonts as _webfonts
 # reaches the real submodule here, not attribute access on the `domonic`
 # package itself.
 _layout = sys.modules["domonic.layout"]
+_style = sys.modules.setdefault("domonic.style", __import__("domonic.style", fromlist=["_"]))
+_ComputedStyleDeclaration = _style.ComputedStyleDeclaration
 
 _INSTALLED = False
 _ORIGINAL_PARSE_LENGTH_OR_PERCENT = _layout._parse_length_or_percent
+_ORIGINAL_TO_USED_LENGTH = _ComputedStyleDeclaration._to_used_length
 
 # Matches the same shape `_LENGTH_TOKEN_RE` already accepts generally
 # (optional leading sign, digits, optional fraction), restricted to the
@@ -115,12 +131,21 @@ def _parse_length_or_percent_with_ex(raw, computed, **kwargs):
     return _ORIGINAL_PARSE_LENGTH_OR_PERCENT(raw, computed, **kwargs)
 
 
+def _to_used_length_with_ex_line_height(self, target, value):
+    if target == "line-height":
+        resolved = _resolve_ex_px(value, self)
+        if resolved is not None:
+            return _style._px_str(resolved)
+    return _ORIGINAL_TO_USED_LENGTH(self, target, value)
+
+
 def install() -> bool:
     """Install once and return whether this call changed domonic."""
     global _INSTALLED
     if _INSTALLED:
         return False
     _layout._parse_length_or_percent = _parse_length_or_percent_with_ex
+    _ComputedStyleDeclaration._to_used_length = _to_used_length_with_ex_line_height
     _INSTALLED = True
     return True
 
@@ -130,6 +155,7 @@ def uninstall() -> bool:
     if not _INSTALLED:
         return False
     _layout._parse_length_or_percent = _ORIGINAL_PARSE_LENGTH_OR_PERCENT
+    _ComputedStyleDeclaration._to_used_length = _ORIGINAL_TO_USED_LENGTH
     _INSTALLED = False
     return True
 

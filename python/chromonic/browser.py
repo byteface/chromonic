@@ -21,8 +21,11 @@ import urllib.request
 from . import (
     domonic_ch_unit_patch,
     domonic_currentcolor_replace_patch,
+    domonic_dir_pseudo_patch,
     domonic_ex_unit_patch,
     domonic_flex_flow_patch,
+    domonic_link_pseudo_patch,
+    domonic_negative_line_height_patch,
     domonic_presentational_hint_patch,
     domonic_print_media_patch,
     domonic_selector_fallback_patch,

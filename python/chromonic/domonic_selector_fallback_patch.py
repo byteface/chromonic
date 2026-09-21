@@ -48,20 +48,37 @@ def _match_element_with_bs4_fallback(self, element, query):
     if _ORIGINAL_MATCH_ELEMENT(self, element, query):
         return True
     selector = str(query or "").strip()
-    if not selector or any(c in selector for c in " >+~"):
-        # A combinator chain: `_matches_selector_chain` (called separately,
-        # alongside this method, by every caller that needs it) already
-        # handles that case -- stay narrowly scoped to the single-compound
-        # gap this patch exists for.
+    if not selector:
         return False
     try:
         from domonic.bs4 import (
             _match_parsed_selector,
             _match_simple_pseudo,
             _parse_stripped_selector,
+            _split_simple_selector_chain,
             _strip_simple_pseudo,
         )
     except Exception:
+        return False
+    # A genuine combinator chain (`div > span`) has more than one part --
+    # `_matches_selector_chain` (called separately, alongside this method,
+    # by every caller that needs it) already handles that case, so this
+    # stays narrowly scoped to the single-compound gap this patch exists
+    # for. A plain character scan for `" >+~"` anywhere in the string was
+    # tried first and is wrong: a functional pseudo-class's own argument
+    # can legitimately contain those characters without this selector
+    # being a chain at all (`:has(> span)`'s relative-selector argument),
+    # and `_split_simple_selector_chain` already correctly tells the two
+    # apart (it respects parens), so reusing it here instead of a second,
+    # cruder check is both more correct and no extra work. Confirmed
+    # directly on `wpt/css/selectors/has-style-sharing-001.html`: the
+    # char-scan rejected `:has(> span)` outright (a single compound, not a
+    # chain), so `:has(> span) { background: green }` never applied
+    # during cascade resolution even though `.matches()` -- which has its
+    # own further `querySelectorAll()` fallback this cascade path doesn't
+    # use -- correctly reported the element matching it.
+    parts = _split_simple_selector_chain(selector)
+    if not parts or len(parts) != 1:
         return False
     stripped = _strip_simple_pseudo(selector)
     if stripped is None:
