@@ -9,10 +9,29 @@ description = "Experimental POC: domonic DOM/CSSOM backed browser"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "domonic>=1.8.2",
+    # Pinned exactly, not a floor (`>=`) -- domonic is the whole CSS/DOM
+    # engine this project builds on, so an unverified newer release must
+    # never get pulled in silently by a plain `pip install`/fresh resolve;
+    # see PLAN.md's "domonic version" note for the bump procedure (check
+    # the diff, update this pin, audit `domonic_*_patch.py` for now-
+    # redundant/broken patches, verify, only then bump).
+    "domonic==1.8.3",
     "fonttools[woff]>=4.0",
     "glfw>=2.7",
-    "myjs",
+    # Also pinned exactly -- myjs pulls in `domonic-libs`, which only
+    # floors domonic at `>=1.7.0` with no upper bound of its own; without
+    # myjs pinned too, that loose transitive floor is the other way an
+    # untested domonic release could get resolved in even with the exact
+    # pin above satisfied (pip is free to pick any domonic satisfying
+    # *every* constraint in play, not just this project's own).
+    "myjs==0.0.5",
+    # The actual source of that loose `domonic>=1.7.0` floor -- pinned
+    # here explicitly (even though only myjs depends on it directly) so
+    # its own version is just as deliberate a bump as domonic's/myjs's.
+    # domonic-libs 0.0.5 is the release that actually bumped its own floor
+    # to `domonic>=1.8.2` (0.0.4 only required `>=1.7.0`) -- the matching
+    # pair for the domonic pin above; myjs 0.0.5 requires it directly.
+    "domonic-libs==0.0.5",
     "PyOpenGL>=3.1",
     "pytest>=8.0",
     "skia-python>=87.0",

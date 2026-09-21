@@ -11,7 +11,7 @@ import urllib.parse
 
 import skia
 
-from . import browser, browser_images, domonic_canvas_patch, fonts, hittest, paint, tree
+from . import browser, browser_images, domonic_canvas_patch, fonts, hittest, paint, tree, window
 from .tree import warm_text_layout
 
 TOOLBAR = 44
@@ -96,7 +96,17 @@ class View:
         self.page = None
         self.page_title = ""
         self.url = self.address = ''
+        # Real, cross-page navigation history -- the index-based model
+        # `domonic.webapi.history.History` already implements (a list of
+        # entries plus a current index, forward entries truncated on a
+        # fresh navigation, `back`/`forward` just move the index), kept
+        # alive here across full reloads since each page's own `window.
+        # history` is a brand-new object every load (`commit_page` reseeds
+        # it from this list). A list `self.history` used to stand in for
+        # this and destructively `.pop()`ped on `back()`, permanently
+        # losing the "forward" entry -- no `forward()` existed at all.
         self.history = []
+        self.history_index = -1
         self.scroll_y = 0.0
         self.content_height = 0.0
         self.editing = False
@@ -109,6 +119,20 @@ class View:
         self.focused_element = None
         self.input_caret = 0
         self.navigation_handler = None
+        # Set by `run()` once the real GLFW window exists. `commit_page`
+        # re-attaches it to each newly-loaded page's own `domonic.window.
+        # Window` so `document.defaultView` always represents the real
+        # native browser window, not a headless stand-in -- see
+        # `GLFWWindowHost.attach`, which already handles detaching from
+        # the previous page's window (clearing its stale RAF callbacks)
+        # before attaching to the new one.
+        self._host = None
+        # Populated by `run()`'s GLFW drop callback via `on_file_drop`.
+        # Not wired into the DOM yet (no DragEvent/DataTransfer, no
+        # populating an `<input type=file>`) -- just exposed here so
+        # something can observe it (devtools console, a future DOM
+        # wiring) instead of the dropped paths going nowhere.
+        self.dropped_files = []
         self.status = ''
         self.loading = False
         self.dirty = True
@@ -157,21 +181,21 @@ class View:
     def viewport_height(self):
         return max(1, self.height - TOOLBAR)
 
-    def navigate(self, address, *, back=False, method='GET', data=None):
+    def navigate(self, address, *, mode='push', jump_index=None, method='GET', data=None):
         url = urllib.parse.urljoin(self.url, browser._normalize_address(address))
         try:
             browser._validate_navigable(url)
             if self.navigation_handler is not None:
-                return self.navigation_handler(url, back=back, method=method, data=data)
+                return self.navigation_handler(url, mode=mode, jump_index=jump_index, method=method, data=data)
             page = (self.loader(url) if method == 'GET' and data is None
                     else browser.load(url, method=method, data=data))
         except Exception as error:
             self.status = str(error)
             self.dirty = True
             return False
-        return self.commit_page(page, url, back=back)
+        return self.commit_page(page, url, mode=mode, jump_index=jump_index)
 
-    def commit_page(self, page, url, *, back=False):
+    def commit_page(self, page, url, *, mode='push', jump_index=None):
         # `page.url` is the real, final URL `browser.load` fetched (after
         # any HTTP redirect -- a POST form submission commonly gets one on
         # success) -- `url` is only what was originally *requested*, which
@@ -191,13 +215,24 @@ class View:
         if page_url and page_url != 'about:blank':
             url = page_url
         self.page, self.url, self.address = page, url, url
+        dom_window = getattr(page.document, "defaultView", None)
+        if self._host is not None and dom_window is not None:
+            # `Window.attach_host` (not `host.attach` directly) -- it
+            # sets `dom_window._host` as well as calling `host.attach`
+            # reciprocally, which `host.attach` alone does not do. Only
+            # `attach_host` makes `window.resizeTo()`/`.moveTo()`/
+            # `.focus()`/`.close()` find this host at all.
+            dom_window.attach_host(self._host)
         titles = page.document.getElementsByTagName("title")
         self.page_title = (titles[0].textContent or "").strip() if titles else ""
         self.caret = len(url)
-        if back:
-            self.history.pop()
-        else:
+        if mode == 'push':
+            del self.history[self.history_index + 1:]
             self.history.append(url)
+            self.history_index = len(self.history) - 1
+        elif mode == 'jump' and jump_index is not None:
+            self.history_index = max(0, min(len(self.history) - 1, jump_index))
+        self._sync_window_history(dom_window)
         self.scroll_y = 0
         self.editing = False
         self.select_anchor = None
@@ -211,10 +246,71 @@ class View:
         self.relayout()
         return True
 
-    def back(self):
-        if len(self.history) > 1:
-            return self.navigate(self.history[-2], back=True)
-        return False
+    def _sync_window_history(self, dom_window) -> None:
+        """Seed the just-loaded page's own `window.history` (a brand-new
+        `domonic.webapi.history.History`, empty but for its own current
+        href, every fresh `Window`) from `self.history`/`.history_index` --
+        the real, persistent record of every page this view has actually
+        navigated across, which a fresh per-page `History` object has no
+        way to know about on its own. Otherwise `window.history.length`/
+        `.state`/`.entries` always reported a lone one-entry history
+        immediately after every single navigation, real back/forward depth
+        included, however many pages deep the view's own toolbar back
+        button could actually reach.
+
+        Also rebinds this history's own `back`/`forward`/`go` (instance
+        methods, not the class -- every other page's `History` keeps
+        `domonic`'s own) to drive a real chromonic navigation instead: by
+        default they only update `History`'s internal index and set
+        `window.location` directly, which -- unlike a real browser's actual
+        back/forward -- never re-runs `browser.load()`'s full pipeline
+        (fonts, presentational hints, image resolution, this view's own
+        GLFW host reattachment); some other code calling `window.history.
+        back()` (the devtools console, today; a real script engine, if one
+        is ever wired in) should still get a real page instead of a
+        half-loaded one."""
+        if dom_window is None:
+            return
+        history_obj = getattr(dom_window, "history", None)
+        if history_obj is None:
+            return
+        from domonic.webapi.history import HistoryEntry
+        history_obj._entries = [HistoryEntry(u) for u in self.history]
+        history_obj.index = self.history_index
+        history_obj.back = self.back
+        history_obj.forward = self.forward
+        history_obj.go = self.history_go
+
+    def back(self) -> bool:
+        return self.history_go(-1)
+
+    def forward(self) -> bool:
+        return self.history_go(1)
+
+    def history_go(self, delta=0) -> bool:
+        """`window.history.go(delta)`'s real-navigation equivalent -- see
+        `_sync_window_history`. `delta`'s sign follows the DOM API: negative
+        goes back, positive goes forward, `0`/anything out of range is a
+        no-op (matching `History.go`'s own real-browser semantics, not an
+        error)."""
+        try:
+            delta = int(delta or 0)
+        except (TypeError, ValueError):
+            return False
+        target = self.history_index + delta
+        if delta == 0 or target < 0 or target >= len(self.history):
+            return False
+        return self.navigate(self.history[target], mode='jump', jump_index=target)
+
+    def on_file_drop(self, paths):
+        """GLFW's drop callback hands us real OS file paths -- store them
+        and surface a status message. No DragEvent/DataTransfer yet, and
+        nothing populates an `<input type=file>` from this; a real DOM
+        wiring is future work, this just keeps the paths from going
+        nowhere in the meantime."""
+        self.dropped_files = list(paths)
+        self.status = f"Dropped {len(self.dropped_files)} file(s): {', '.join(self.dropped_files)}"
+        self.dirty = True
 
     @staticmethod
     def _ema(previous, value, alpha=0.2):
@@ -1039,7 +1135,9 @@ class GLRenderer:
         view.draw(canvas)
         canvas.restore()
         self.context.flushAndSubmit()
-        view.record_frame_time((time.perf_counter() - frame_started) * 1000.0)
+        record_frame_time = getattr(view, "record_frame_time", None)
+        if record_frame_time is not None:
+            record_frame_time((time.perf_counter() - frame_started) * 1000.0)
 
     def close(self):
         self.surface = self.target = None
@@ -1059,12 +1157,12 @@ class Navigation:
         self.pending = None
         view.navigation_handler = self.request
 
-    def request(self, url, *, back=False, method='GET', data=None):
+    def request(self, url, *, mode='push', jump_index=None, method='GET', data=None):
         if self.pending is not None:
             self.pending[0].cancel()
         loader = ((lambda: self.view.loader(url)) if method == 'GET' and data is None
                   else (lambda: browser.load(url, method=method, data=data)))
-        self.pending = (self.executor.submit(loader), url, back, time.perf_counter())
+        self.pending = (self.executor.submit(loader), url, mode, jump_index, time.perf_counter())
         self.view.address = url
         self.view.caret = len(url)
         self.view.status = 'Loading ' + url
@@ -1075,7 +1173,7 @@ class Navigation:
     def poll(self):
         if self.pending is None or not self.pending[0].done():
             return
-        future, url, back, started = self.pending
+        future, url, mode, jump_index, started = self.pending
         self.pending = None
         self.view.last_navigation_ms = (time.perf_counter() - started) * 1000.0
         try:
@@ -1087,7 +1185,7 @@ class Navigation:
         else:
             # Do not discard text typed while a request was in flight.
             edit = (self.view.address, self.view.caret, self.view.select_anchor) if self.view.editing else None
-            self.view.commit_page(page, url, back=back)
+            self.view.commit_page(page, url, mode=mode, jump_index=jump_index)
             if edit is not None:
                 self.view.address, self.view.caret, self.view.select_anchor = edit
                 self.view.editing = True
@@ -1111,10 +1209,22 @@ class WindowInput:
         self.view = view
         self._cursors = {}
         self._last_cursor_kind = None
+        # `getattr(..., self.glfw.ARROW_CURSOR)` for the GLFW-3.4-only
+        # shapes (resize/not-allowed) -- older bindings (this project only
+        # floors on `glfw>=2.7`) simply don't define them, and falling back
+        # to the arrow cursor is a harmless degradation rather than an
+        # AttributeError at startup.
         self._cursor_shapes = {
             'pointer': self.glfw.HAND_CURSOR,
             'text': self.glfw.IBEAM_CURSOR,
             'arrow': self.glfw.ARROW_CURSOR,
+            'crosshair': getattr(self.glfw, 'CROSSHAIR_CURSOR', self.glfw.ARROW_CURSOR),
+            'move': getattr(self.glfw, 'RESIZE_ALL_CURSOR', self.glfw.ARROW_CURSOR),
+            'not-allowed': getattr(self.glfw, 'NOT_ALLOWED_CURSOR', self.glfw.ARROW_CURSOR),
+            'ew-resize': getattr(self.glfw, 'HRESIZE_CURSOR', self.glfw.ARROW_CURSOR),
+            'ns-resize': getattr(self.glfw, 'VRESIZE_CURSOR', self.glfw.ARROW_CURSOR),
+            'nwse-resize': getattr(self.glfw, 'RESIZE_NWSE_CURSOR', self.glfw.ARROW_CURSOR),
+            'nesw-resize': getattr(self.glfw, 'RESIZE_NESW_CURSOR', self.glfw.ARROW_CURSOR),
         }
 
     def install(self):
@@ -1171,6 +1281,12 @@ class WindowInput:
             ((mods & g.MOD_ALT) and key == g.KEY_LEFT)
             or ((mods & g.MOD_SUPER) and key == g.KEY_LEFT_BRACKET)
         )
+        # Symmetric with `back_key` -- Option+Right is also "move by word"
+        # while editing, so forward only means forward the rest of the time.
+        forward_key = not self.view.editing and (
+            ((mods & g.MOD_ALT) and key == g.KEY_RIGHT)
+            or ((mods & g.MOD_SUPER) and key == g.KEY_RIGHT_BRACKET)
+        )
 
         if key == g.KEY_F10:
             self.view.toggle_perf()
@@ -1185,6 +1301,8 @@ class WindowInput:
                 self.view.navigate(self.view.url)
         elif back_key:
             self.view.back()
+        elif forward_key:
+            self.view.forward()
         elif self.view.editing:
             self._address_key(key, command, mods)
         elif self.view.focused_element is not None:
@@ -1290,7 +1408,7 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
     if not glfw.init():
         raise RuntimeError('GLFW could not initialize a display')
 
-    win = renderer = navigation = input_controller = None
+    win = renderer = navigation = input_controller = host = None
     try:
         glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
         glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 2)
@@ -1311,6 +1429,38 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
         navigation = Navigation(view)
         input_controller = WindowInput(glfw, win, view)
         input_controller.install()
+
+        # `GLFWWindowHost` gives each loaded page's `document.defaultView`
+        # a real native backend (`window.resizeTo()`, `.moveTo()`, `.close()`,
+        # `.native`, ...). Deliberately not `host.install_callbacks()`: that
+        # would steal the window/framebuffer/refresh callback slots
+        # `WindowInput.install()` above already owns (GLFW allows only one
+        # callback per slot), which drive this view's own resize/repaint
+        # handling. `sync_state()` polled once per loop tick below covers
+        # size/position/scale state without the conflict -- `commit_page`
+        # re-`attach`es this host to each new page's window.
+        host = window.GLFWWindowHost(glfw, win, viewport_insets=(0, TOOLBAR, 0, 0))
+        view._host = host
+        host.on_drop = view.on_file_drop
+        glfw.set_drop_callback(win, host._on_drop)
+
+        # Focus/blur don't share a callback slot with WindowInput, and
+        # polling can't dispatch a real `focus`/`blur` DOM event the way a
+        # browser does (`sync_state()`'s own focus check deliberately
+        # passes `dispatch=False`, just to keep state in sync) -- wire the
+        # real GLFW callback so `window.addEventListener("focus"/"blur", ...)`
+        # fires like it would in a real browser.
+        glfw.set_window_focus_callback(win, host._on_window_focus)
+        # Also no conflict with WindowInput's slots. Without this, an OS
+        # close-button click only reaches `_host_closed()` (dispatching
+        # `close`) in the `finally` block below, by which point the loop
+        # has already exited and the window is about to be torn down --
+        # too late for a listener to do anything meaningful. The real
+        # callback fires while GLFW processes the close request, in the
+        # same iteration that sets `glfw.window_should_close`, so the page
+        # still has a live window to react in.
+        glfw.set_window_close_callback(win, host._on_window_close)
+
         view.navigate(url)
 
         drawn = 0
@@ -1318,6 +1468,22 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
 
         while not glfw.window_should_close(win):
             sync_window_size(view, win, glfw)
+            host.sync_state()
+
+            # `Window.requestAnimationFrame` already routes to
+            # `host.request_animation_frame` instead of domonic's headless
+            # `threading.Timer` fallback whenever a host is attached (see
+            # `Window.requestAnimationFrame`/`.cancelAnimationFrame`) -- so
+            # callbacks just sit queued on the host until flushed here, tied
+            # to this render loop's own cadence rather than a background
+            # timer thread racing chromonic's layout/paint. Flushed before
+            # `poll_deferred_work()` so a callback's DOM/style mutations are
+            # picked up by the same frame's layout pass, not the next one;
+            # `request_relayout()`'s default zero delay means that deferred
+            # pass fires immediately, in this same iteration.
+            if host.window is not None and host.flush_animation_frames(host.window.performance.now() * 1000.0):
+                view.request_relayout()
+
             navigation.poll()
             view.poll_images()
             view.poll_deferred_work()
@@ -1362,9 +1528,13 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
             input_controller.close()
         if navigation is not None:
             navigation.close()
+        if host is not None:
+            dom_window = host.window
+            if dom_window is not None and not dom_window.closed:
+                dom_window._host_closed()
+            host.destroy()
         if renderer is not None:
             renderer.close()
         if win is not None:
             glfw.destroy_window(win)
         glfw.terminate()
-

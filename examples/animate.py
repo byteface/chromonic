@@ -1,9 +1,9 @@
-"""chromonic phase 3: a continuous animation, not just click-driven repaints.
+"""chromonic phase 3: requestAnimationFrame-driven animation.
 
 Seven bars in a flex row, each height following its own phase-shifted sine
 wave -- a real-time equalizer, entirely from Python mutating
-`element.style.height` ~30 times a second and chromonic relaying it through
-Taffy (relayout) and Skia (repaint) every time.
+`element.style.height` from `window.requestAnimationFrame` callbacks and
+chromonic relaying it through Taffy (relayout) and Skia (repaint) every frame.
 
 Needs a real display -- run it by hand:
 
@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import math
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
@@ -48,16 +47,28 @@ def build_page():
 
 def main() -> int:
     stage, bars = build_page()
-    start = time.perf_counter()
+    state = {"window": None}
 
-    def on_tick():
-        t = time.perf_counter() - start
+    def animate(timestamp_ms: float):
+        t = timestamp_ms / 1000.0
         for i, bar in enumerate(bars):
             phase = i * 0.7
             wave = 0.5 + 0.5 * math.sin(t * 2.4 + phase)  # 0..1
             bar.style.height = f"{10 + wave * (HEIGHT - 60):.1f}px"
+        state["window"].requestAnimationFrame(animate)
 
-    chromonic.window.run(stage, width=WIDTH, height=HEIGHT, title="chromonic -- live equalizer", on_tick=on_tick, fps=30)
+    def start_animation(dom_window):
+        state["window"] = dom_window
+        dom_window.requestAnimationFrame(animate)
+
+    chromonic.window.run(
+        stage,
+        width=WIDTH,
+        height=HEIGHT,
+        title="chromonic -- requestAnimationFrame equalizer",
+        on_window_ready=start_animation,
+        fps=60,
+    )
     return 0
 
 

@@ -19,8 +19,9 @@ import urllib.request
 from . import (
     domonic_ch_unit_patch,
     domonic_ex_unit_patch,
-    domonic_media_query_patch,
     domonic_presentational_hint_patch,
+    domonic_print_media_patch,
+    domonic_selector_fallback_patch,
     hittest,
     tree,
     window,
@@ -176,6 +177,7 @@ def _apply_presentational_attributes(document) -> None:
 
 def _load_local(url: str):
     from myjs import Page
+    from myjs._engine import JSError
 
     from . import webfonts
 
@@ -198,6 +200,43 @@ def _load_local(url: str):
             )
 
             return css
+
+        def _apply_stylesheets(self):
+            """myjs >=0.0.5 rewrote `Page._apply_stylesheets` to fetch every
+            `<link rel=stylesheet>` through its own inlined, concurrent
+            fetch helper (`_batch_fetch_text`/`Path.read_text`) instead of
+            `self._read_resource` -- a real behaviour change for this
+            subclass specifically: `_read_resource`'s own side effect
+            (appending every stylesheet's text to `_font_stylesheet_sources`,
+            which `browser.load()` later hands to `webfonts.prepare()` to
+            discover `@font-face` rules) silently stopped firing for any
+            *external* stylesheet the moment myjs was bumped past 0.0.4,
+            even though 0.0.4's identical-looking method still worked fine.
+            Overridden back to the simpler, sequential 0.0.4 behaviour
+            (call `self._read_resource(href)` per link) so font discovery
+            keeps working regardless of which myjs version is installed --
+            trades away 0.0.5's concurrent-fetch speedup for stylesheets,
+            not a correctness concern for this project's own fixture-sized
+            pages."""
+            for link in list(self.document.getElementsByTagName("link")):
+                rel = (link.getAttribute("rel") or "").strip().lower()
+                href = link.getAttribute("href")
+                if "stylesheet" not in rel.split() or not href:
+                    continue
+                try:
+                    css = self._read_resource(href)
+                except Exception as exc:  # noqa: BLE001 -- a bad sheet must not abort the page
+                    self.errors.append(JSError(f"failed to load stylesheet {href!r}: {exc}",
+                                               name="NetworkError"))
+                    continue
+                try:
+                    style_el = self.document.createElement("style")
+                    style_el.textContent = css
+                    head = (self.document.getElementsByTagName("head") or [None])[0]
+                    (head or self.document.documentElement or self.document).appendChild(style_el)
+                except Exception as exc:  # noqa: BLE001
+                    self.errors.append(JSError(f"failed to apply stylesheet {href!r}: {exc}",
+                                               name="Error"))
 
     source = _local_path(url)
 
@@ -274,8 +313,23 @@ def _load_remote(url: str, *, method: str = "GET", data=None, http_session=None)
     return page
 
 
+def _ensure_window(page) -> None:
+    """Every loaded page gets a real `domonic.window.Window` as its
+    `document.defaultView` -- a remote page already gets one from
+    `domonic._scrape._parse(..., attach=True)` (see `_load_remote`), but a
+    local (myjs) page never does, so a plain `<script>` reading `window.*`,
+    the devtools console (`native_browser.View.console_submit`), or a
+    native browser host (`native_browser.run`'s `GLFWWindowHost.attach`)
+    would otherwise have nothing real to attach to. `Window(doc=...)` sets
+    `document.defaultView` itself as a side effect of construction."""
+    from domonic.window import Window
+
+    if getattr(page.document, "defaultView", None) is None:
+        Window(doc=page.document)
+
+
 def load(url: str, *, method: str = "GET", data=None, http_session=None):
-    """Fetch + parse `url` with domonic 1.8.1 for HTTP(S), myjs for local files.
+    """Fetch + parse `url` with domonic 1.8.3 for HTTP(S), myjs for local files.
 
     `method`/`data` (ignored for local files -- forms don't target them in
     practice) let a caller submit a real HTML form: `method="POST"` with
@@ -288,6 +342,7 @@ def load(url: str, *, method: str = "GET", data=None, http_session=None):
     page = (_load_remote(url, method=method, data=data, http_session=http_session)
             if _is_url(url) else _load_local(url))
     page.document._chromonic_base_url = page.url
+    _ensure_window(page)
 
     _apply_presentational_attributes(page.document)
 
@@ -324,8 +379,21 @@ def set_viewport(page, width, height) -> None:
         if isinstance(state, dict):
             state["innerWidth"] = width
             state["innerHeight"] = height
-        elif hasattr(window_obj, "resizeTo"):
-            window_obj.resizeTo(width, height)
+        elif hasattr(window_obj, "_set_viewport"):
+            # Not `resizeTo()`: that's the *outer* browser-window-resizing
+            # API (CSS 2.1's `window.resizeTo` == moving the real OS
+            # window), and once a `domonic.window.Window` has a real host
+            # attached (see `native_browser.run`), calling it here actually
+            # commands the native window to shrink to this *inner* content
+            # height -- which then changes the real window size, which
+            # `native_browser.sync_window_size` notices next frame and
+            # resizes the view to match, triggering another relayout that
+            # calls this again with an even smaller height: a runaway
+            # feedback loop that shrinks the window to nothing. This call
+            # only means "the page's own viewport is now this size" (for
+            # `window.innerWidth`/`matchMedia()`), so it must only update
+            # that state, never touch the host/native window.
+            window_obj._set_viewport(width, height, dispatch=True)
         else:
             window_obj.innerWidth = width
             window_obj.innerHeight = height

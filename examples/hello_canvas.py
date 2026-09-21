@@ -49,6 +49,7 @@ class CanvasView:
         self.paused = False
         self.dirty = True
         self.fps = 0.0
+        self.last_frame_ms = 0.0
 
         self.start = time.perf_counter()
 
@@ -297,6 +298,15 @@ class CanvasView:
         )
 
         self.dirty = True
+
+    def record_frame_time(self, elapsed_ms):
+        # `GLRenderer.draw()` (shared with native_browser.py's real `View`)
+        # calls this on whatever view it's given -- added there after this
+        # demo was written, so this standalone `CanvasView` never picked it
+        # up and crashed on the very first frame.
+        self.last_frame_ms = elapsed_ms
+        if elapsed_ms > 0:
+            self.fps = 1000.0 / elapsed_ms
 
     def draw(self, gpu_canvas):
         # No application-level Skia drawing here.

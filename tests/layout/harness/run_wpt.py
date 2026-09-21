@@ -26,6 +26,16 @@ SUFFIXES = {".html", ".htm", ".xht", ".xhtml"}
 SKIP_TAGS = {
     "html", "head", "title", "base", "link",
     "meta", "style", "script", "noscript",
+    # `body` itself is never a fair comparison: testharness.js (loaded by
+    # the vast majority of real WPT fixtures) appends its own visible
+    # results-log UI to `<body>` after the test runs in the real Chrome
+    # capture -- inflating its height by however tall that log ends up,
+    # nothing to do with chromonic's own layout of the fixture's actual
+    # content. Confirmed directly on auto-margins-used-values-with-floats.
+    # tentative.html: every real content element (.box/.float/.container)
+    # matched Chrome exactly; only `<body>`'s own height differed (100px
+    # vs Chrome's testharness-log-inflated 1469.625px).
+    "body",
 }
 
 
@@ -184,6 +194,19 @@ def should_skip(path):
 _DOM_FLAGS_META_RE = re.compile(
     r'<meta\s[^>]*name=["\']flags["\'][^>]*content=["\']([^"\']*)["\']', re.I
 )
+# A fixture can need real page script to reach the DOM/layout shape it
+# tests without ever declaring WPT's own `flags="dom"` meta tag -- e.g. an
+# embedded `<script>` that mutates an element's `style.*` property directly,
+# or calls the WPT `checkLayout()` helper (which itself only makes sense
+# once earlier script in the same page has already run). Neither chromonic
+# nor domonic can execute that script, so these need the same skip
+# `_requires_dom_scripting` already gives `flags="dom"` fixtures.
+_SCRIPTED_LAYOUT_MUTATION_RE = re.compile(
+    r"<script\b[\s\S]*?(?:\.style\.\w+\s*=|checkLayout\s*\("
+    r"|\.removeChild\s*\(|\.appendChild\s*\(|\.insertBefore\s*\("
+    r"|\.replaceChild\s*\(|\.remove\s*\(\s*\))[\s\S]*?</script>",
+    re.I,
+)
 
 
 def _requires_dom_scripting(source: str) -> bool:
@@ -191,14 +214,22 @@ def _requires_dom_scripting(source: str) -> bool:
     among the space-separated flag words marks a fixture as needing real
     page script to reach the DOM shape it tests (an `onload` handler that
     mutates the DOM, typically). See `run_folder`'s own use of this for
-    why: neither chromonic nor domonic can ever execute that script."""
+    why: neither chromonic nor domonic can ever execute that script.
+
+    Also true, meta tag or not, whenever `_SCRIPTED_LAYOUT_MUTATION_RE`
+    matches -- a `flags="dom"`-less fixture can still rely on inline script
+    to mutate style/run `checkLayout()`, and comparing chromonic's own
+    (never-mutated) layout against Chrome's (post-script) one would just be
+    an unfair, unfixable "failure" rather than a real chromonic bug."""
     match = _DOM_FLAGS_META_RE.search(source)
     if not match:
-        return False
-    return "dom" in match.group(1).strip().lower().split()
+        return bool(_SCRIPTED_LAYOUT_MUTATION_RE.search(source))
+    return "dom" in match.group(1).strip().lower().split() or bool(
+        _SCRIPTED_LAYOUT_MUTATION_RE.search(source)
+    )
 
 
-def run_folder(folder, output, base_url, tolerance, chrome=None, limit=None):
+def run_folder(folder, output, base_url, tolerance, chrome=None, limit=None, start=0):
     folder = folder.resolve()
     wpt_root = find_wpt_root(folder)
 
@@ -209,6 +240,9 @@ def run_folder(folder, output, base_url, tolerance, chrome=None, limit=None):
         and path.suffix.lower() in SUFFIXES
         and not should_skip(path)
     )
+
+    if start:
+        files = files[start:]
 
     if limit:
         files = files[:limit]
@@ -446,6 +480,15 @@ def main(argv=None):
         help="Only run the first N tests",
     )
 
+    parser.add_argument(
+        "--start",
+        type=int,
+        default=0,
+        help="Skip the first N tests (0-based) before applying --limit -- "
+             "e.g. --start 30 --limit 1 runs only the 31st fixture, without "
+             "re-running everything before it.",
+    )
+
     args = parser.parse_args(argv)
 
     folder = args.folder
@@ -471,6 +514,7 @@ def main(argv=None):
         args.tolerance,
         chrome=args.chrome,
         limit=args.limit,
+        start=args.start,
     )
 
     print()

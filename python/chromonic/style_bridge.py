@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import re
 
-from domonic.layout import AUTO, Edges, Fr, GridLine, Keyword, Length, LayoutStyle, Percent
+from domonic.layout import AUTO, Edges, Fr, GridLine, GridSpan, Keyword, Length, LayoutStyle, Percent
 
 
 _VIEWPORT = ContextVar("chromonic_style_viewport", default=(None, None))
@@ -173,8 +173,16 @@ def _keyword(kw: Keyword) -> str:
     return kw.value.replace(" ", "-")
 
 
-def _grid_line(value) -> "int | None":
-    return value.line if isinstance(value, GridLine) else None  # AUTO / GridSpan / named -- not modelled
+def _grid_line(value):
+    """A `grid-column`/`grid-row` longhand value, in whatever shape
+    `src/lib.rs`'s `parse_grid_placement` accepts: an explicit line number
+    (`int`), `("span", N)` for `span N` (auto-placed, N tracks), or `None`
+    for `auto`/an unmodelled named line."""
+    if isinstance(value, GridLine):
+        return value.line
+    if isinstance(value, GridSpan):
+        return ("span", value.count)
+    return None
 
 
 _AUTO_EDGES = ["auto", "auto", "auto", "auto"]

@@ -41,12 +41,31 @@ def _fragments(element, rect):
             line_height = float(getattr(fragment, "_chromonic_line_height", 0.0) or 0.0)
             raw = getattr(getattr(fragment, "source", None), "textContent", "") or ""
             margins = getattr(fragment, "_chromonic_native_style", {}).get("margin") or (0.0,) * 4
+            # A text fragment's own reported rect is its *glyph* box
+            # (ascent+descent), never the full line-height -- matching the
+            # other, non-shared-plan branch below (already correct there)
+            # and real `getClientRects()`, which never reports a line's
+            # own leading as part of a text range's box. Confirmed on
+            # `wpt/css/CSS2/visudet/inline-block-baseline-010.xht`
+            # (`line-height:5`, i.e. 75px, on 15px text): this branch was
+            # reporting `text[].height` as the full `75`, not the real
+            # `17`, and `text[].y` at the *line's* own top instead of the
+            # glyph's (offset by the line's own half-leading below it).
+            fragment_paint_style = getattr(fragment, "_chromonic_paint_style", None) or {}
+            glyph_font_size = _fontmetrics.parse_length(fragment_paint_style.get("font_size"), default=16.0)
+            glyph_family = fragment_paint_style.get("font_family", "") or ""
+            glyph_weight = tree._parse_font_weight(fragment_paint_style.get("font_weight"))
+            glyph_italic = fonts.is_italic(fragment_paint_style.get("font_style"))
+            glyph_ascent, glyph_descent, _normal = fonts.text_metrics(
+                glyph_family, glyph_font_size, glyph_weight >= 600, glyph_italic)
+            glyph_height = glyph_ascent + glyph_descent
+            half_leading = math.floor((line_height - glyph_height) / 2) if line_height else 0.0
             for index, text in enumerate(lines):
                 leading = float(margins[3]) if index == 0 else 0.0
                 trailing = float(margins[1]) if index == len(lines) - 1 else 0.0
-                text_rects.append(_rect_dict(box.x - leading, box.y + index * line_height,
+                text_rects.append(_rect_dict(box.x - leading, box.y + index * line_height + half_leading,
                                              (widths[index] if index < len(widths) else box.width) + leading + trailing,
-                                             line_height) | {"text": text})
+                                             glyph_height) | {"text": text})
         return {"element": element_rects, "text": text_rects}
     lines = getattr(element, "_chromonic_text_lines", None) or []
     line_height = float(getattr(element, "_chromonic_line_height", 0.0) or 0.0)

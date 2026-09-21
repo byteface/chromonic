@@ -202,6 +202,13 @@ fn get_f32(dict: &Bound<PyDict>, key: &str, default: f32) -> PyResult<f32> {
     }
 }
 
+fn get_opt_f32(dict: &Bound<PyDict>, key: &str) -> PyResult<Option<f32>> {
+    match get(dict, key) {
+        Some(v) if !v.is_none() => Ok(Some(v.extract::<f32>()?)),
+        _ => Ok(None),
+    }
+}
+
 fn parse_align_items(text: &str) -> PyResult<Option<AlignItems>> {
     Ok(match text {
         "" | "normal" | "auto" => None,
@@ -240,6 +247,18 @@ fn parse_grid_placement(value: Option<Bound<PyAny>>) -> PyResult<Line<GridPlacem
             let one = |item: Bound<PyAny>| -> PyResult<GridPlacement> {
                 if item.is_none() {
                     return Ok(GridPlacement::Auto);
+                }
+                // `grid-column`/`grid-row`'s `span N` form -- style_bridge.py
+                // passes it as the 2-tuple `("span", N)` since it has no line
+                // number of its own (auto-placed, N tracks wide/tall).
+                if let Ok(span_tuple) = item.cast::<PyTuple>() {
+                    if span_tuple.len() == 2 {
+                        let tag: String = span_tuple.get_item(0)?.extract()?;
+                        if tag == "span" {
+                            let n: u16 = span_tuple.get_item(1)?.extract()?;
+                            return Ok(GridPlacement::Span(n));
+                        }
+                    }
                 }
                 let n: i16 = item.extract()?;
                 Ok(line(n))
@@ -325,6 +344,7 @@ fn parse_style(dict: &Bound<PyDict>) -> PyResult<Style> {
         grid_template_rows,
         grid_column: parse_grid_placement(get(dict, "grid_column"))?,
         grid_row: parse_grid_placement(get(dict, "grid_row"))?,
+        aspect_ratio: get_opt_f32(dict, "aspect_ratio")?,
         ..Default::default()
     })
 }

@@ -160,6 +160,17 @@ class _InlineFormattingPlan:
         # first formatted line -- every later line (after a wrap or a
         # `<br>`) resets `x` to `0.0` already, unaffected.
         x = self.text_indent
+        # A `<br>`'s own reported position sits right after the preceding
+        # text's advance, never including that run's own trailing border/
+        # padding/margin-end -- confirmed directly against `left-rtl-
+        # ref.xht`'s real geometry: a `direction:rtl` first fragment's own
+        # *end*-side package (`padding-right`/`margin-right`) genuinely
+        # inflates that fragment's own box width, but a `<br>` immediately
+        # following the text is positioned before that decoration, not
+        # after it (the decoration renders past the wrap point instead).
+        # Tracked separately from `x` since `x` itself must still carry the
+        # trailing/margin-end forward for whatever follows on the same line.
+        x_pre_trailing = x
         y = 0.0
         line_margin_start = 0.0  # how much of the current line's `x` is `margin_start`, not content
         line_leading_total = 0.0  # and how much is a leading border/padding edge
@@ -170,6 +181,12 @@ class _InlineFormattingPlan:
         line_has_content = False
         # run index -> (x, y, line height, line's own margin_start, line's own leading edge)
         self._break_positions = {}
+        # For a `direction:rtl` plan, a `<br>` mirrors to the *start* (post-
+        # mirror box `x`, not the un-mirrored text-end point) of whichever
+        # real run immediately preceded it -- tracked here so it can be
+        # resolved once `placed` itself has been mirrored, below.
+        break_precedes_run: dict = {}
+        last_real_run = None
         # id(escapee element) -> (x, y): an out-of-flow `top/left:auto`
         # absolutely-positioned element mixed into inline content still has
         # a real CSS 2.1 10.3.7/10.6.4 "static position" wherever it falls
@@ -187,9 +204,12 @@ class _InlineFormattingPlan:
                 self._line_baselines[y] = above
                 self._line_belows[y] = below
                 self._line_has_content[y] = line_has_content
-                self._break_positions[run_index] = (x, y, above + below, line_margin_start, line_leading_total)
+                self._break_positions[run_index] = (x_pre_trailing, y, above + below, line_margin_start, line_leading_total)
+                break_precedes_run[run_index] = last_real_run
                 y += above + below
                 x = 0.0
+                x_pre_trailing = 0.0
+                last_real_run = None
                 line_margin_start = 0.0
                 line_leading_total = 0.0
                 above, below = base_above, base_below
@@ -230,6 +250,7 @@ class _InlineFormattingPlan:
                     self._line_has_content[y] = line_has_content
                     y += above + below
                     x = 0.0
+                    x_pre_trailing = 0.0
                     line_margin_start = 0.0
                     line_leading_total = 0.0
                     above, below = base_above, base_below
@@ -248,6 +269,8 @@ class _InlineFormattingPlan:
                     line_has_content = True
                 placed.append((run, text, x + leading, y, token_width, token_height,
                                leading, trailing, advance_width))
+                x_pre_trailing = x + leading + advance_width
+                last_real_run = run
                 x += total
                 if index == len(tokens) - 1:
                     # A non-replaced inline's horizontal margins are real,
@@ -283,27 +306,69 @@ class _InlineFormattingPlan:
         rtl_mirror_suppressed = self.text_align == "left"
         if self.rtl and not rtl_mirror_suppressed and placed:
             # `direction:rtl` mirrors each line, as a rigid group, against
-            # the same `width` it was placed within. Margin isn't part of a
-            # fragment's own box, so `margin_start`/margin-right are
-            # subtracted back out around the mirror rather than dragged
-            # along with it. A split segment that isn't the wrapper's true
-            # trailing one never owns margin-right, even though it's alone
-            # in its own `placed` list and would otherwise look "last".
+            # the same `width` it was placed within. Each fragment's own
+            # `margin_end` (physical-right margin, already attached to
+            # whichever fragment actually owns it -- see the direct-child
+            # bidi-box-model edge-swap in `_make_inline_formatting_plan`)
+            # shifts its mirrored box left by that amount, same as it would
+            # shift a plain LTR box's cursor rightward before mirroring --
+            # confirmed directly against `right-rtl-ref.xht`'s real
+            # geometry: only subtracting on the whole line's last placed
+            # entry (the pre-mixed-direction-support original here) is
+            # wrong whenever that entry isn't the one actually carrying the
+            # margin (e.g. a bidi-box-model split's first, not last,
+            # fragment owns the trailing package for `direction:rtl`).
+            # A CSS 2.1 9.2.1.1 block-in-inline split (`_split_wrapping_
+            # inline_element`) never threads its own trailing margin through
+            # a run's `margin_end` field at all (only `margin_start`, on its
+            # first segment) -- so for that case, the wrapper's own overall
+            # last placed fragment still needs its raw CSS margin-right
+            # applied directly here, same as before mixed-direction support
+            # existed. Skipped whenever `margin_end` is already nonzero
+            # (this plan's own bidi-box-model build already threaded it
+            # correctly there -- see `_make_inline_formatting_plan`), to
+            # avoid double-counting it.
             is_final_segment = getattr(self, "_chromonic_final_split_fragment", True)
-            last_index = len(placed) - 1
+            last_index_for_owner: dict = {}
+            for i, entry in enumerate(placed):
+                last_index_for_owner[id(entry[0].get("owner"))] = i
             mirrored = []
             for index, (run, text, px, y, token_width, token_height, leading, trailing, advance) in enumerate(placed):
                 margin_start = run.get("margin_start", 0.0)
-                outer_left = px - leading - margin_start
-                outer_width = leading + advance + trailing
-                new_px = (width - outer_left - outer_width) + leading
-                if index == last_index and is_final_segment:
+                margin_end = run.get("margin_end", 0.0)
+                if (not margin_end and not run.get("_bidi_margin_resolved") and is_final_segment
+                        and index == last_index_for_owner.get(id(run.get("owner")))):
                     owner_style = getattr(run.get("owner"), "_chromonic_native_style", None) or {}
                     owner_margin = owner_style.get("margin") or (0.0, 0.0, 0.0, 0.0)
-                    new_px -= _numeric_edge(owner_margin[1])
+                    margin_end = _numeric_edge(owner_margin[1])
+                outer_left = px - leading - margin_start
+                outer_width = leading + advance + trailing
+                new_px = (width - outer_left - outer_width - margin_end) + leading
                 mirrored.append((run, text, new_px, y, token_width, token_height, leading, trailing, advance))
             placed = mirrored
-        elif not self.rtl:
+            # A `<br>`'s own position mirrors to the *text* start (the
+            # mirrored `px`, not the box's own outer `x`) of whichever real
+            # run immediately preceded it -- confirmed against both `left-
+            # rtl-ref.xht` (a zero-leading fragment, where box `x` and text
+            # `x` coincide) and `right-ltr-ref.xht` (a nonzero-leading
+            # nested `ltr` fragment inside a `rtl` base, where only the text
+            # position -- not the box's outer edge including its own
+            # leading decoration -- matches real Chrome).
+            run_text_x = {id(run): new_px for run, _t, new_px, _y, _tw, _th, _l, _tr, _a in placed}
+            for run_index, preceding_run in break_precedes_run.items():
+                if preceding_run is not None and id(preceding_run) in run_text_x:
+                    old = self._break_positions[run_index]
+                    self._break_positions[run_index] = (run_text_x[id(preceding_run)],) + old[1:]
+        elif not self.rtl and placed:
+            # This plan's own base direction is `ltr` (no plan-wide mirror
+            # applies). A *nested* `direction:rtl` element's own start/end
+            # edge assignment was already resolved at build time (see
+            # `_build_text_runs_from_nodes`'s nested-element branch, which
+            # attaches the nested element's border/padding/margin package to
+            # the physically-correct side per its own direction) -- each
+            # fragment's build position is therefore already correct, and no
+            # position-mirroring step is needed here at all for a nested
+            # override; only ordinary physical `text-align` applies.
             placed = self._apply_text_align(placed, width)
         self._placed = placed
         return (content_width, self.height)
@@ -505,15 +570,11 @@ class _InlineFormattingPlan:
         # so the harness reports the correct height (Chrome: 18px, not 0).
         for run_index, run in enumerate(self.runs):
             if run.get("break"):
-                br_x, br_y, line_h, line_margin_start, line_leading_total = self._break_positions.get(
+                br_x, br_y, line_h, _line_margin_start, _line_leading_total = self._break_positions.get(
                     run_index, (0.0, 0.0, 0.0, 0.0, 0.0))
-                if self.rtl:
-                    # `_break_positions` is captured before the RTL mirror
-                    # pass below runs on `placed` -- mirror it here too, or
-                    # a `<br>`'s marker stays at its un-mirrored position
-                    # while the real text around it moves.
-                    br_x = (getattr(self, "_measured_width", 0.0)
-                            - (br_x - line_margin_start) + line_leading_total)
+                # For `self.rtl`, `measure()` itself already resolved `br_x`
+                # to its mirrored position (the preceding real run's own
+                # post-mirror box start) -- no further adjustment needed here.
                 run["element"].__dict__["_layout_box"] = LayoutBox(
                     x=origin_x + br_x, y=origin_y + br_y,
                     width=0.0, height=line_h,
@@ -1153,16 +1214,80 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
             nested_top = _numeric_edge(nested_native["padding"][0]) + _numeric_edge(nested_native["border"][0])
             nested_extra = (nested_top + _numeric_edge(nested_native["padding"][2])
                              + _numeric_edge(nested_native["border"][2]))
-            nested_margin_start = _numeric_edge(nested_native["margin"][3])
-            runs.extend(_build_text_runs_from_nodes(
+            nested_margin_left = _numeric_edge(nested_native["margin"][3])
+            nested_margin_right = _numeric_edge(nested_native["margin"][1])
+            nested_runs = _build_text_runs_from_nodes(
                 list(child_node.childNodes or ()), child_node._chromonic_paint_style, child_node,
-                leading_edge=(leading_edge if is_first_text else 0.0) + nested_left,
-                trailing_edge=(trailing_edge if is_last_text else 0.0) + nested_right,
+                leading_edge=leading_edge if is_first_text else 0.0,
+                trailing_edge=trailing_edge if is_last_text else 0.0,
                 top_edge_val=top_edge_val + nested_top,
                 extra_height=extra_height + nested_extra,
-                margin_start=(margin_start if is_first_text else 0.0) + nested_margin_start,
+                margin_start=margin_start if is_first_text else 0.0,
+                margin_end=margin_end if is_last_text else 0.0,
                 computed_cache=computed_cache,
-            ))
+            )
+            # CSS 2.1's bidi box model (box.html#bidi-box-model, confirmed
+            # directly against `left-rtl-ref.xht`'s own reference markup:
+            # `<span style="border-left-style:none; padding-right:10px;
+            # margin-right:60px">One</span>` for the DOM-first fragment of a
+            # `direction:rtl` box split by a line break) attaches this
+            # element's own *start*-side package (border+padding+margin
+            # together, on one physical side, nothing on the other) to the
+            # DOM-first non-break run and the *end*-side package to the
+            # DOM-last one -- start=left/end=right for `ltr`, start=right/
+            # end=left for `rtl`. `leading_edge`/`trailing_edge`/
+            # `margin_start`/`margin_end` above carry only outer-ancestor
+            # contributions (always physical, unswapped -- an ancestor's own
+            # side was already resolved at its own level); this element's
+            # own package is added directly onto the correct physical field
+            # of the correct run here, after the recursive call returns,
+            # since the recursive call's own `leading_edge`/`trailing_edge`
+            # params are structurally physical-left/physical-right and can't
+            # express "this element's start edge is physically on the right".
+            non_break_runs = [r for r in nested_runs if not r.get("break")]
+            if non_break_runs:
+                first_run, last_run = non_break_runs[0], non_break_runs[-1]
+                is_rtl_nested = _element_direction(child_node, child_computed) == "rtl"
+                # Tells `_InlineFormattingPlan.measure()`'s whole-line RTL
+                # mirror not to fall back to the owner's raw CSS margin-right
+                # on this fragment even when its own `margin_end` is zero --
+                # zero is a real, direction-aware answer here (an `rtl`
+                # box's end fragment legitimately owns margin-*left*
+                # instead), not a sign the field was never threaded (which
+                # is what that fallback exists for, elsewhere).
+                first_run["_bidi_margin_resolved"] = True
+                last_run["_bidi_margin_resolved"] = True
+                if first_run is last_run:
+                    # Unsplit -- the sole run owns both edges, physically,
+                    # regardless of direction (a box's own border/padding
+                    # doesn't change because its content is `rtl`; only a
+                    # line-break split invokes the start/end swap at all).
+                    first_run["leading"] = first_run.get("leading", 0.0) + nested_left
+                    first_run["trailing"] = first_run.get("trailing", 0.0) + nested_right
+                    first_run["margin_start"] = first_run.get("margin_start", 0.0) + nested_margin_left
+                    first_run["margin_end"] = first_run.get("margin_end", 0.0) + nested_margin_right
+                    first_run["intrinsic_width"] = (first_run.get("intrinsic_width", 0.0)
+                                                      + nested_left + nested_right
+                                                      + nested_margin_left + nested_margin_right)
+                elif is_rtl_nested:
+                    first_run["trailing"] = first_run.get("trailing", 0.0) + nested_right
+                    first_run["margin_end"] = first_run.get("margin_end", 0.0) + nested_margin_right
+                    first_run["intrinsic_width"] = (first_run.get("intrinsic_width", 0.0)
+                                                      + nested_right + nested_margin_right)
+                    last_run["leading"] = last_run.get("leading", 0.0) + nested_left
+                    last_run["margin_start"] = last_run.get("margin_start", 0.0) + nested_margin_left
+                    last_run["intrinsic_width"] = (last_run.get("intrinsic_width", 0.0)
+                                                     + nested_left + nested_margin_left)
+                else:
+                    first_run["leading"] = first_run.get("leading", 0.0) + nested_left
+                    first_run["margin_start"] = first_run.get("margin_start", 0.0) + nested_margin_left
+                    first_run["intrinsic_width"] = (first_run.get("intrinsic_width", 0.0)
+                                                      + nested_left + nested_margin_left)
+                    last_run["trailing"] = last_run.get("trailing", 0.0) + nested_right
+                    last_run["margin_end"] = last_run.get("margin_end", 0.0) + nested_margin_right
+                    last_run["intrinsic_width"] = (last_run.get("intrinsic_width", 0.0)
+                                                     + nested_right + nested_margin_right)
+            runs.extend(nested_runs)
     return runs
 
 
@@ -1286,14 +1411,20 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
     # The split's leading/trailing fragments carry the wrapper's *logical*
     # start/end edge, not always its physical left/right -- in
     # `direction:rtl`, the first-generated fragment owns the right
-    # border/padding and the last owns the left, swapped from `ltr`.
+    # border/padding/margin and the last owns the left, swapped from `ltr`.
+    # `left_edge`/`right_edge`/`margin_left`/`margin_right` themselves stay
+    # physical below (unswapped); which segment (first vs last) each gets
+    # routed to is decided per-segment further down instead, since a plain
+    # value-swap here would just move the *magnitude* without moving it to
+    # the physically-correct side (`_build_text_runs_from_nodes`'s own
+    # `leading_edge`/`trailing_edge` params are always physical-left/
+    # physical-right, tied structurally to first/last segment respectively).
     is_rtl = _element_direction(wrapper, wrapper_computed) == "rtl"
-    if is_rtl:
-        left_edge, right_edge = right_edge, left_edge
     top_edge_val = _numeric_edge(native["padding"][0]) + _numeric_edge(native["border"][0])
     extra_height = (top_edge_val + _numeric_edge(native["padding"][2])
                     + _numeric_edge(native["border"][2]))
-    margin_start = _numeric_edge(native["margin"][3])
+    margin_left = _numeric_edge(native["margin"][3])
+    margin_right = _numeric_edge(native["margin"][1])
     if wrapper is container:
         # The direct-child shape: `wrapper` is a real Taffy node, so Taffy
         # already physically shifted its text-leaf children by this same
@@ -1301,8 +1432,9 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
         # horizontal position; `top_edge_val` stays (one-way addition, safe),
         # its own vertical position corrected via `_chromonic_split_self_edges`
         # in `_finalize_inline_owner_boxes` instead.
-        wrapper._chromonic_split_self_edges = (left_edge, right_edge, top_edge_val)
-        left_edge = right_edge = margin_start = 0.0
+        wrapper._chromonic_split_self_edges = (
+            (right_edge if is_rtl else left_edge), (left_edge if is_rtl else right_edge), top_edge_val)
+        left_edge = right_edge = margin_left = margin_right = 0.0
     else:
         wrapper.__dict__.pop("_chromonic_split_self_edges", None)
     paint_style = wrapper._chromonic_paint_style
@@ -1382,15 +1514,20 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
 
     for index, seg_nodes in enumerate(segments):
         is_first, is_last = index == 0, index == len(segments) - 1
-        seg_leading = left_edge if is_first else 0.0
-        seg_trailing = right_edge if is_last else 0.0
-        seg_margin_start = margin_start if is_first else 0.0
+        # `direction:rtl`: the first segment owns the *start* (physical-
+        # right) package, the last owns the *end* (physical-left) one --
+        # swapped from `ltr`'s first=left/last=right (CSS 2.1's own bidi box
+        # model, confirmed against `left-rtl-ref.xht`'s real geometry).
+        seg_leading = (left_edge if is_last else 0.0) if is_rtl else (left_edge if is_first else 0.0)
+        seg_trailing = (right_edge if is_first else 0.0) if is_rtl else (right_edge if is_last else 0.0)
+        seg_margin_start = (margin_left if is_last else 0.0) if is_rtl else (margin_left if is_first else 0.0)
+        seg_margin_end = (margin_right if is_first else 0.0) if is_rtl else 0.0
         runs = _build_text_runs_from_nodes(
             seg_nodes, paint_style, wrapper,
             leading_edge=seg_leading,
             trailing_edge=seg_trailing,
             top_edge_val=top_edge_val, extra_height=extra_height,
-            margin_start=seg_margin_start,
+            margin_start=seg_margin_start, margin_end=seg_margin_end,
             computed_cache=computed_cache,
         )
         if not runs and (seg_leading or seg_trailing):
@@ -1444,6 +1581,15 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
             for run in runs:
                 if not run.get("break"):
                     run["split_group"] = index
+                    if is_rtl and (is_first or is_last):
+                        # A zero `margin_end`/`margin_start` on this segment
+                        # is a real, direction-aware answer here (see the
+                        # identical tag elsewhere) -- suppress `measure()`'s
+                        # owner-raw-margin fallback, which exists only for
+                        # the untagged, non-`rtl` case above where that
+                        # fallback is genuinely needed (margin-right is
+                        # never threaded there at all).
+                        run["_bidi_margin_resolved"] = True
             yield ("run", runs)
         if index < len(blocks):
             if index in nested_wrapper_at:
@@ -1577,7 +1723,41 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display):
             # real recursive `build()` call on it runs instead, exactly
             # like an absolutely-positioned or pseudo item already does.
             or getattr(item, "_chromonic_before_pseudo", None) is not None
-            or getattr(item, "_chromonic_after_pseudo", None) is not None)
+            or getattr(item, "_chromonic_after_pseudo", None) is not None
+            # `inline-block` (CSS 2.1 10.3.10) is always an atomic box with
+            # its own formatting context, own explicit/auto width+height,
+            # never flattened text runs sharing this plan's line metrics --
+            # the "element" branch below only ever tries to flatten a
+            # nested element's own *text* into runs, which for a genuinely
+            # empty `inline-block` (no text, no children at all) produces
+            # zero runs and *no fallback strut either* (that fallback is
+            # deliberately `display:inline`-only, since only a plain empty
+            # inline collapses to nothing -- an empty inline-block still
+            # keeps its own explicit box, CSS 2.1 9.2.1.1/10.8) -- silently
+            # dropping the element from the plan's own `runs` entirely, and
+            # therefore from `node_map`, painted or not. Confirmed on `wpt/
+            # css/CSS2/visudet/inline-block-baseline-011.xht`: an empty
+            # `<span style="display:inline-block">` between two text runs
+            # never got a Taffy node at all. Bailing here routes it through
+            # the flex-row fallback instead, which already builds every
+            # element item as its own real recursive `build()` subtree.
+            or getattr(child_style.display, "value", "") == "inline-block"
+            # A replaced element (`<img>`, `<canvas>`, `<svg>`, `<iframe>`,
+            # a form control) is exactly as atomic as `inline-block` above
+            # -- its own box is a real Taffy leaf sized from its own
+            # intrinsic/authored width+height, never flattened text runs --
+            # and one is typically a void element with no `childNodes` of
+            # its own at all, so it hits the exact same silent-drop gap:
+            # zero runs, no empty-strut fallback (also deliberately
+            # excluded for these tags, since they don't collapse to
+            # nothing like a plain empty inline can). Confirmed directly on
+            # `wpt/css/CSS2/visudet/replaced-elements-width-40.html`: every
+            # `<img>` meant to flow inline with the comma-separated text
+            # between them vanished from layout entirely once that text
+            # started actually being recognised as inline-mixed content
+            # (see `_USUALLY_INLINE_TAGS` picking up `img`/`canvas`/`svg`/
+            # `iframe`).
+            or (getattr(item, "tagName", "") or "").lower() in _REPLACED_OR_CONTROL_TAGS)
            for kind, item, _text, _computed, child_style in inline_items):
         # A generated-content pseudo-element needs its own real box (own
         # font, own position, possibly absolute) -- this shared-plan path
@@ -1643,12 +1823,54 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display):
             # `margin_end` handling adds both sides independently).
             margin_start = _numeric_edge(native["margin"][3])
             margin_end = _numeric_edge(native["margin"][1])
+            # CSS 2.1's bidi box model (box.html#bidi-box-model, confirmed
+            # against `left-rtl-ref.xht`'s own reference markup) attaches
+            # the *start*-side package (border+padding+margin together) to
+            # the DOM-first fragment and the *end*-side package to the
+            # DOM-last one -- start=left/end=right for `ltr`, start=right/
+            # end=left for `rtl`. `_build_text_runs_from_nodes`'s own
+            # `leading_edge`/`trailing_edge` params are always physical-left/
+            # physical-right, so for a `direction:rtl` item the two edge
+            # packages are built unswapped here and then swapped onto the
+            # correct fragment below, once the actual (possibly `<br>`-
+            # split) fragments are known.
+            is_rtl_item = _element_direction(item, child_computed) == "rtl"
             child_runs = _build_text_runs_from_nodes(
                 list(item.childNodes or []), item._chromonic_paint_style, item,
-                leading_edge=left_edge, trailing_edge=right_edge,
+                leading_edge=0.0 if is_rtl_item else left_edge,
+                trailing_edge=0.0 if is_rtl_item else right_edge,
                 top_edge_val=top_edge_val, extra_height=extra_height,
-                margin_start=margin_start, margin_end=margin_end,
+                margin_start=0.0 if is_rtl_item else margin_start,
+                margin_end=0.0 if is_rtl_item else margin_end,
             )
+            if is_rtl_item:
+                non_break_runs = [r for r in child_runs if not r.get("break")]
+                if non_break_runs:
+                    first_run, last_run = non_break_runs[0], non_break_runs[-1]
+                    # See the identical tag in `_build_text_runs_from_nodes`'s
+                    # nested-element branch: a zero `margin_end` here is a
+                    # real, direction-aware answer, not an unthreaded field.
+                    first_run["_bidi_margin_resolved"] = True
+                    last_run["_bidi_margin_resolved"] = True
+                    if first_run is last_run:
+                        # Unsplit -- the sole run owns both edges, physically,
+                        # regardless of direction.
+                        first_run["leading"] = first_run.get("leading", 0.0) + left_edge
+                        first_run["trailing"] = first_run.get("trailing", 0.0) + right_edge
+                        first_run["margin_start"] = first_run.get("margin_start", 0.0) + margin_start
+                        first_run["margin_end"] = first_run.get("margin_end", 0.0) + margin_end
+                        first_run["intrinsic_width"] = (first_run.get("intrinsic_width", 0.0)
+                                                          + left_edge + right_edge
+                                                          + margin_start + margin_end)
+                    else:
+                        first_run["trailing"] = first_run.get("trailing", 0.0) + right_edge
+                        first_run["margin_end"] = first_run.get("margin_end", 0.0) + margin_end
+                        first_run["intrinsic_width"] = (first_run.get("intrinsic_width", 0.0)
+                                                          + right_edge + margin_end)
+                        last_run["leading"] = last_run.get("leading", 0.0) + left_edge
+                        last_run["margin_start"] = last_run.get("margin_start", 0.0) + margin_start
+                        last_run["intrinsic_width"] = (last_run.get("intrinsic_width", 0.0)
+                                                         + left_edge + margin_start)
             item_display = (getattr(child_computed, "display", "") or "").strip().lower()
             item_tag = (getattr(item, "tagName", "") or "").lower()
             if (not child_runs and not (item.childNodes or [])
@@ -1750,6 +1972,28 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display):
     return _InlineFormattingPlan(element, runs, element._chromonic_paint_style, css_display) if runs else None
 
 
+def _needs_inline_flow_grouping(child, child_style) -> bool:
+    """Whether `child` still needs `_group_inline_element_runs`'s flex-row
+    simulation of real inline flow. An inline-level *tag* (`_is_inline_
+    level`) that CSS 2.1 9.2.1.1 has already split around an in-flow block
+    child (`_split_wrapping_inline_element` marks this on the element
+    itself via `_chromonic_split_container`, set every time it runs) no
+    longer needs it: `build()` already represents that element as an
+    ordinary block-flow Taffy node (ordinary sibling block pieces, not
+    real horizontal inline content), so wrapping it in a flex row here
+    would be both redundant and actively wrong -- CSS margins never
+    collapse across a flex formatting context, so a plain block sibling
+    after it could never collapse through the wrapper with the split's
+    own trailing margin, even though nothing here is really "inline"
+    content anymore. Confirmed directly: `<div class="container"><span>
+    <div class="first"></div></span><div class="second"></div></div>`
+    only collapsed margin-bottom/margin-top additively (70px) instead of
+    the correct `max()` (40px) until this exemption was added -- the
+    anonymous flex wrapper `_group_inline_element_runs` built around the
+    already-dissolved `<span>` was the collapse barrier."""
+    return _is_inline_level(child, child_style) and getattr(child, "_chromonic_split_container", None) is None
+
+
 def _group_inline_element_runs(tree, parent, entries, parent_style, node_map, projection):
     """Wrap consecutive inline siblings in retained anonymous flex rows."""
     if parent_style["display"] != "block":
@@ -1758,13 +2002,15 @@ def _group_inline_element_runs(tree, parent, entries, parent_style, node_map, pr
     cache = parent.__dict__.setdefault("_chromonic_inline_runs", {})
     while index < len(entries):
         child, child_style, node_id = entries[index]
-        if not _is_inline_level(child, child_style):
+        if not _needs_inline_flow_grouping(child, child_style):
             output.append(node_id)
             index += 1
             continue
         run = []
-        while index < len(entries) and _is_inline_level(entries[index][0], entries[index][1]):
+        run_elements = []
+        while index < len(entries) and _needs_inline_flow_grouping(entries[index][0], entries[index][1]):
             run.append(entries[index][2])
+            run_elements.append(entries[index][0])
             index += 1
         wrapper = cache.get(run_index)
         if wrapper is None:
@@ -1776,6 +2022,17 @@ def _group_inline_element_runs(tree, parent, entries, parent_style, node_map, pr
         wrapper_style.update({"display": "flex", "flex_direction": "row", "flex_wrap": "nowrap",
                               "align_items": "baseline"})
         wrapper._chromonic_native_style = wrapper_style
+        # `_fix_flex_row_baseline_alignment` only corrects Taffy's own
+        # (sometimes wrong -- see that function's docstring) baseline
+        # cross-axis placement for a row it can find via this attribute;
+        # never set here before, so a run of consecutive real inline-level
+        # element siblings (not the separate mixed-text-and-elements `elif
+        # inline_items:` approximation, which already sets it) got no such
+        # correction at all. Confirmed on `wpt/css/CSS2/visudet/content-
+        # height-001.html`: three sibling `display:inline-block` divs with
+        # different `line-height`s (so genuinely different heights) landed
+        # at the wrong `y` relative to each other, silently unfixed.
+        wrapper._chromonic_flex_row_members = run_elements
         wrapper_id = (projection.upsert(wrapper, wrapper_style, run, None, None)
                       if projection else tree.new_with_children(wrapper_style, run))
         node_map[wrapper_id] = wrapper
@@ -1867,6 +2124,17 @@ def _make_measure(paint_style: dict, text: str, element):
             ]
         element._chromonic_text_line_widths = line_widths
         element._chromonic_line_height = lines[0][2] if lines else font_size * 1.2
+        # `_fix_flex_row_baseline_alignment` needs this to re-assert the
+        # real measured content height onto a member of an `align-items:
+        # baseline` row -- Taffy's own cross-axis sizing for a custom
+        # `MeasureFunc` leaf doesn't reliably keep this method's own
+        # returned `height` once that alignment mode is in play (the same
+        # quirk `_InlineFormattingPlan.measure()`'s own leaves have,
+        # confirmed on `wpt/css/CSS2/visudet/inline-block-baseline-001.xht`:
+        # a `display:inline-block` `<span>`'s `line-height:5`-driven `75px`
+        # height came back `17px` -- this method itself, called directly
+        # with the same arguments, correctly returns `75`).
+        element._chromonic_measured_height = height
         return (width, height)
 
     return measure
@@ -1903,32 +2171,69 @@ def _select_display_text(element) -> str:
 
 
 def _apply_image_intrinsic_size(style: dict, element) -> None:
-    """`<img>` is a replaced element: an `auto` width/height uses its
-    intrinsic pixel size -- baked directly into the style before Taffy
-    ever sees it, since a block child's width isn't `measure`'s to give.
-    An explicit CSS size is left alone, as always.
+    """`<img>` is a replaced element: an `auto` width/height is sized from
+    its own intrinsic width/height -- built here since Taffy has no concept
+    of an image's intrinsic properties (only the plain rectangle `width`/
+    `height`/`aspect_ratio` this function bakes into `style` before Taffy
+    ever sees the tree, as a block child's own width isn't `measure`'s to
+    give). An explicit CSS size on either axis is always left alone.
 
-    CSS 2.1 10.6.2: when only *one* of `width`/`height` is `auto` and the
-    other is a definite length, an intrinsic ratio scales the auto one
-    from that definite one -- not the image's own unscaled natural size
-    on that axis. `1in` (96px) on a 15x15 image, `height:auto`, must come
-    out `96px`, not `15px`."""
+    A raster image (PNG/JPEG/GIF/...) always has a complete intrinsic size.
+    An SVG only has whichever of `width`/`height`/`viewBox` its root
+    element actually declares (`browser_images.natural_size`), each
+    independently possibly absent -- CSS 2.1 10.3.2 leaves a replaced
+    element's sizing genuinely undefined for every case *except* a
+    complete intrinsic width+height pair (this fixture's own `<meta
+    name="flags" content="should">` notes exactly that), and real browsers
+    resolve the undefined cases by falling back to the CSS default object
+    size (300x150, the same UA default `<canvas>`/`<iframe>` already use)
+    outright -- confirmed directly against Chrome on `wpt/css/CSS2/
+    visudet/replaced-elements-width-40.html`'s own seven SVGs: an
+    intrinsic ratio alone (from `viewBox`, with or without one matching
+    dimension) is *not* used to scale an explicit CSS dimension the way
+    CSS Images 3 5.2's idealised algorithm would suggest -- only a
+    complete width+height pair ever drives sizing; every partial case
+    (ratio-only, one dimension only, or nothing at all) gets the default
+    150 height/300 width regardless."""
     from . import browser_images
 
-    image = browser_images.load_image(element.getAttribute("src") or "")
+    src = element.getAttribute("src") or ""
+    image = browser_images.load_image(src)
     if image is None:
         return  # no image to size from -- left as whatever the cascade said (probably auto -> an empty box)
-    natural_width = float(image.width())
-    natural_height = float(image.height())
+    intrinsic_width, intrinsic_height, _ratio = browser_images.natural_size(src)
+    has_complete_pair = intrinsic_width is not None and intrinsic_height is not None
+    intrinsic_ratio = intrinsic_width / intrinsic_height if has_complete_pair and intrinsic_height else None
+    # CSS Images 3 5.2's own fallback when nothing intrinsic is known at
+    # all on the needed axis -- 300x150, the same UA default `<canvas>`/
+    # `<iframe>` already use elsewhere in this file.
+    default_width, default_height = 300.0, 150.0
     width_auto = style["width"] == "auto"
     height_auto = style["height"] == "auto"
     if width_auto and height_auto:
-        style["width"] = natural_width
-        style["height"] = natural_height
-    elif height_auto and isinstance(style["width"], (int, float)) and natural_width:
-        style["height"] = style["width"] * (natural_height / natural_width)
-    elif width_auto and isinstance(style["height"], (int, float)) and natural_height:
-        style["width"] = style["height"] * (natural_width / natural_height)
+        if has_complete_pair:
+            style["width"], style["height"] = intrinsic_width, intrinsic_height
+        else:
+            style["width"], style["height"] = default_width, default_height
+    elif height_auto and isinstance(style["width"], (int, float)):
+        style["height"] = style["width"] * (1.0 / intrinsic_ratio) if intrinsic_ratio else default_height
+    elif width_auto and isinstance(style["height"], (int, float)):
+        style["width"] = style["height"] * intrinsic_ratio if intrinsic_ratio else default_width
+    elif (height_auto or width_auto) and intrinsic_ratio:
+        # `width`/`height` isn't a plain pixel length on either side (most
+        # commonly a percentage, e.g. `width:100%` on a responsive `<img>`)
+        # -- its resolved pixel value isn't known until Taffy itself lays
+        # out the box, so this function (which only ever runs once, before
+        # Taffy sees the tree at all) can't precompute the scaled auto side
+        # the way the plain-pixel branches above do. Taffy's own native
+        # `aspect_ratio` support (added to its `Style` for exactly this)
+        # picks it up after resolving whichever side has a real value, on
+        # its own. Confirmed directly on bbc.com: every `<img
+        # style="width:100%">` measured a real width and `height:auto` but
+        # a literal `0` height -- nothing here had ever handled a
+        # percentage width/height at all, so the image simply never
+        # painted (zero-height box), despite genuinely finishing loading.
+        style["aspect_ratio"] = intrinsic_ratio
 
 
 def _resolve_replaced_percent_height(style: dict, element, height_attr: str) -> "float | None":
@@ -2129,10 +2434,104 @@ def _measure_min_content_width(element, computed_cache) -> "float | None":
     return widest
 
 
+def _is_table_row_display(computed) -> bool:
+    return (getattr(computed, "display", "") or "").strip().lower() == "table-row"
+
+
+def _is_table_cell_display(computed) -> bool:
+    return (getattr(computed, "display", "") or "").strip().lower() == "table-cell"
+
+
+def _is_table_root_display(computed) -> bool:
+    return (getattr(computed, "display", "") or "").strip().lower() in ("table", "inline-table")
+
+
+_ROW_GROUP_TAG_KIND = {"thead": "header", "tfoot": "footer", "tbody": "body"}
+
+
+def _row_group_kind(tag: str, computed) -> "str | None":
+    """`None` if `tag`/`computed` isn't a table row-group at all (a plain
+    wrapper `walk` should recurse through transparently); otherwise which
+    of the three CSS 2.1 17.5.3 row-group buckets it is."""
+    if tag in _ROW_GROUP_TAG_KIND:
+        return _ROW_GROUP_TAG_KIND[tag]
+    display = (getattr(computed, "display", "") or "").strip().lower()
+    if display == "table-header-group":
+        return "header"
+    if display == "table-footer-group":
+        return "footer"
+    if display == "table-row-group":
+        return "body"
+    return None
+
+
+def _table_rows(table_element, computed_cache) -> list:
+    """Every table-row belonging to `table_element`'s own table -- a
+    literal `<tr>`, or any element computing `display:table-row` --
+    reached transparently through any depth of row-group wrapper
+    (`table-row-group`/`-header-group`/`-footer-group`, or a literal
+    `<tbody>`/`<thead>`/`<tfoot>`). Stops at a nested table's own
+    boundary -- its rows belong to it, not this one.
+
+    CSS 2.1 17.5.3: however many header/body/footer row-groups appear,
+    and in whatever source order, they're always *displayed* in a fixed
+    header-groups, then body-groups, then footer-groups order -- a
+    `<tfoot>` authored first (a common pattern, so its totals row can
+    reach the network before the body finishes loading) still renders
+    last. A row with no row-group ancestor at all counts as an (implicit)
+    body row, same as a `table-row-group`. Row order *within* each bucket,
+    and row-group order within `header`/`footer` (multiple of either is
+    non-conforming markup, but not fatal here), stays DOM order."""
+    buckets: dict[str, list] = {"header": [], "body": [], "footer": []}
+
+    def walk(node, kind: str):
+        for child in node.childNodes or ():
+            if not _is_element(child):
+                continue
+            tag = (getattr(child, "tagName", "") or "").lower()
+            if tag in _NON_RENDERING_TAGS:
+                continue
+            child_computed, child_style = _describe(child, computed_cache)
+            if not _renders(child_style):
+                continue
+            if tag == "tr" or _is_table_row_display(child_computed):
+                buckets[kind].append(child)
+                continue
+            if tag == "table" or _is_table_root_display(child_computed):
+                continue  # a nested table's own rows aren't this table's
+            group_kind = _row_group_kind(tag, child_computed)
+            walk(child, group_kind if group_kind is not None else kind)
+
+    walk(table_element, "body")
+    return buckets["header"] + buckets["body"] + buckets["footer"]
+
+
+def _row_cells(row_element, computed_cache) -> list:
+    """Every table-cell directly inside `row_element` -- a literal `<td>`/
+    `<th>`, or any element computing `display:table-cell`. CSS 2.1
+    17.2.1 only ever generates a cell as a row's *direct* child (an
+    anonymous cell wraps other content instead), so this deliberately
+    doesn't recurse."""
+    cells: list = []
+    for child in row_element.childNodes or ():
+        if not _is_element(child):
+            continue
+        tag = (getattr(child, "tagName", "") or "").lower()
+        if tag in _NON_RENDERING_TAGS:
+            continue
+        child_computed, child_style = _describe(child, computed_cache)
+        if not _renders(child_style):
+            continue
+        if tag in ("td", "th") or _is_table_cell_display(child_computed):
+            cells.append(child)
+    return cells
+
+
 def _compute_table_column_widths(table_element, computed_cache) -> dict:
     """`{id(cell_element): resolved_width}` for every cell, colspan'd or
     not -- a deliberately minimal CSS 2.1 17.5.2.2 "auto" table-layout
-    pass, enough for ordinary HTML tables.
+    pass, enough for ordinary HTML tables (and `display:table`-styled
+    arbitrary elements, see `_table_rows`/`_row_cells`).
 
     1. Each colspan-1 cell's max-content width; a column's width is the
        widest same-column cell across every row.
@@ -2145,25 +2544,10 @@ def _compute_table_column_widths(table_element, computed_cache) -> dict:
     per_column: dict[int, float] = {}
     single_cells: dict[int, int] = {}  # id(cell) -> col_index, colspan == 1
     span_cells: list = []  # (cell, start_col, colspan)
-    try:
-        rows = table_element.querySelectorAll("tr")
-    except Exception:
-        return {}
+    rows = _table_rows(table_element, computed_cache)
     for row in rows:
-        # Skip a row belonging to a nested table -- `querySelectorAll`
-        # matches at any depth.
-        ancestor = row.parentElement
-        while ancestor is not None and (getattr(ancestor, "tagName", "") or "").lower() != "table":
-            ancestor = ancestor.parentElement
-        if ancestor is not table_element:
-            continue
         col_index = 0
-        for cell in row.childNodes or ():
-            if not _is_element(cell):
-                continue
-            tag = (getattr(cell, "tagName", "") or "").lower()
-            if tag not in ("td", "th"):
-                continue
+        for cell in _row_cells(row, computed_cache):
             colspan_raw = cell.getAttribute("colspan") if hasattr(cell, "getAttribute") else None
             try:
                 colspan = max(1, int(colspan_raw)) if colspan_raw else 1
@@ -2228,6 +2612,21 @@ _USUALLY_INLINE_TAGS = frozenset({
     "a", "span", "b", "i", "em", "strong", "small", "code", "label", "abbr",
     "cite", "mark", "sub", "sup", "time", "kbd", "samp", "var", "q", "u", "s",
     "button", "input", "select", "textarea",
+    # Every real HTML UA stylesheet gives these `display:inline` by default
+    # too, same as the form controls just above -- missing here left `img`/
+    # `canvas`/`svg`/`iframe` untrusted by `_trusts_computed_inline`, so
+    # `_is_inline_level` always said `False` for them regardless of their
+    # own genuinely-inline computed style, which made `_inline_mixed_
+    # content`'s `_child_qualifies` reject any container mixing one with
+    # real text -- the whole container fell out of inline flow entirely
+    # (`_make_inline_formatting_plan` *and* the flex-row fallback both
+    # bail together, since neither ever got a chance to run at all),
+    # putting each image on its own block-level line instead of flowing
+    # with its surrounding text. Confirmed directly on `wpt/css/CSS2/
+    # visudet/replaced-elements-width-40.html`: seven `<img>`s meant to
+    # flow with comma-separated text between them each landed alone on
+    # its own row.
+    "img", "canvas", "svg", "svg:svg", "iframe",
 })
 
 # Replaced elements and form controls size themselves from authored
@@ -2284,7 +2683,7 @@ def _is_inline_level(element, style_obj) -> bool:
         match = style_bridge._SIMPLE_VAR_FALLBACK.match(value.strip())
         if match:
             value = match.group(1).strip()
-    if value not in ("inline", "inline-block"):
+    if value not in ("inline", "inline-block", "inline-table"):
         return False
     tag_name = (getattr(element, "tagName", "") or "").lower()
     return _trusts_computed_inline(element, tag_name)
@@ -2513,18 +2912,33 @@ def build(
         margin = list(style["margin"])
         margin[0] = margin[2] = 0.0
         style["margin"] = margin
-    if getattr(style_obj.display, "value", "") in _TABLE_INTERNAL_DISPLAYS:
+    table_internal_display = getattr(style_obj.display, "value", "")
+    if table_internal_display in _TABLE_INTERNAL_DISPLAYS:
         # CSS 2.1 17.4/CSS Tables 3: margin never applies to an internal
         # table box (row/row-group/cell/column/...) on any side -- only
         # the outer `display:table` box itself keeps it.
         style["margin"] = [0.0, 0.0, 0.0, 0.0]
+        if table_internal_display != "table-cell":
+            # Unlike margin, padding *does* still apply to `table-cell`
+            # (CSS 2.1 17.6.1 -- a cell's own padding is what visibly
+            # separates its content from its border) -- every other
+            # internal table box (row/row-group/column/column-group) gets
+            # neither, same as margin. Confirmed directly on `wpt/css/
+            # CSS2/margin-padding-clear/padding-applies-to-001.xht`
+            # (`display:table-row-group; padding:50px` was still adding
+            # 50px of space Chrome never does).
+            style["padding"] = [0.0, 0.0, 0.0, 0.0]
     if (getattr(style_obj.display, "value", "") == "inline-block"
             and _trusts_computed_inline(element, tag_name)):
         # `inline-block` establishes its own BFC (CSS 2.1 9.2.1), so an
         # in-flow child's margin must not collapse through it -- signalled
         # to Taffy the same way as `overflow`, via `Contain::PAINT`.
         style["establishes_bfc"] = True
-    if tag_name == "table":
+    is_table_root = tag_name == "table" or _is_table_root_display(computed)
+    is_table_row = tag_name == "tr" or _is_table_row_display(computed)
+    is_table_cell = tag_name in ("td", "th") or _is_table_cell_display(computed)
+    if is_table_root:
+        element._chromonic_is_table_root = True
         element._chromonic_border_collapse = computed.borderCollapse == "collapse"
         if element._chromonic_border_collapse:
             # Collapsed borders straddle the table grid edge -- reserving
@@ -2533,18 +2947,22 @@ def build(
         # Real "auto" table layout (CSS 2.1 17.5.2.2, not `table-layout:
         # fixed`) sizes each column to its widest cell's own content, not
         # an equal row share -- measured once per table so every same-
-        # column cell agrees. See `_compute_table_column_widths`.
+        # column cell agrees. See `_compute_table_column_widths`. Applies
+        # equally to a literal `<table>` and any `display:table`/`inline-
+        # table` arbitrary element -- `_table_rows`/`_row_cells` (which
+        # this calls) recognise a table-row/-cell by computed `display`
+        # too, not just tag name.
         element._chromonic_table_column_widths = (
             _compute_table_column_widths(element, computed_cache)
             if computed.tableLayout != "fixed" else {}
         )
-    if tag_name == "tr":
+    if is_table_row:
         # Taffy has no table formatting mode -- a plain flex row gives
         # ordinary fixed/equal-column tables the right basic geometry.
         style.update({"display": "flex", "flex_direction": "row", "flex_wrap": "nowrap"})
-    elif tag_name in ("td", "th") and style["width"] == "auto":
+    elif is_table_cell and style["width"] == "auto":
         ancestor = getattr(element, "parentElement", None)
-        while ancestor is not None and getattr(ancestor, "_chromonic_tag_name", None) != "table":
+        while ancestor is not None and not getattr(ancestor, "_chromonic_is_table_root", False):
             ancestor = getattr(ancestor, "parentElement", None)
         column_width = None
         if ancestor is not None:
@@ -2574,6 +2992,23 @@ def build(
     children = [] if tag_name in ("select", "svg", "svg:svg", "iframe") else _child_elements(
         element, computed_cache, reuse_styles=reuse_styles
     )
+    if is_table_root and children:
+        # CSS 2.1 17.5.3: row-groups always *display* in header/body/
+        # footer order regardless of source order (a `<tfoot>` authored
+        # first, so its totals reach the network before the body
+        # finishes loading, is common markup) -- `_table_rows` already
+        # reorders for column-width *measurement*; this reorders the
+        # table's own direct Taffy children the same way so the visual
+        # stacking (built from ordinary DOM-order block-child handling,
+        # same as any other element) matches. A non-row-group direct
+        # child (a bare `<tr>`, or anything else) counts as an implicit
+        # body row/group, same as `_table_rows`'s own default.
+        header, body, footer = [], [], []
+        for entry in children:
+            child_tag = (getattr(entry[0], "tagName", "") or "").lower()
+            kind = _row_group_kind(child_tag, entry[1]) or "body"
+            (header if kind == "header" else footer if kind == "footer" else body).append(entry)
+        children = header + body + footer
     element._chromonic_has_layout_children = bool(children)
     if tag_name == "button":
         _apply_button_intrinsic_width(style, element)
@@ -2590,8 +3025,12 @@ def build(
     # `display` is uninformatively "inline" -- forced to "block" here so
     # `_InlineFormattingPlan`'s `owner_display` leaves Taffy's own
     # (already-correct, full column-width) box alone instead of narrowing
-    # it to just the cell's own text fragment.
-    css_display_value = ("block" if tag_name in ("td", "th")
+    # it to just the cell's own text fragment. A `display:table-cell`
+    # element on an arbitrary tag has a real, already-correct computed
+    # value (`is_table_cell`, from earlier in this function) -- included
+    # here for the same "leave Taffy's box alone" reason, not because its
+    # own computed value is uninformative too.
+    css_display_value = ("block" if (tag_name in ("td", "th") or is_table_cell)
                           else getattr(style_obj.display, "value", "").strip() or "block")
     split_pieces = (_split_inline_flow_around_blocks(
                          element, inline_items, style, css_display_value, computed_cache)
@@ -2737,6 +3176,29 @@ def build(
         style["flex_direction"] = "row"
         style["flex_wrap"] = "wrap"
         style["align_items"] = "baseline"
+        # CSS 2.1 16.2 `text-align`: this flex-row approximation's own
+        # `elif inline_items:` mixed-text-and-elements content otherwise
+        # always packs to the row's physical start (Taffy's own default,
+        # unset `justify_content`), silently ignoring `right`/`center` --
+        # `justify-content` is a real, direct equivalent for a *single*
+        # unjustified line, which is genuinely what this approximation
+        # already models one of (`flex-wrap:wrap` repeats it per wrapped
+        # row too, matching real `text-align` applying per line, not once
+        # for the whole block). `justify`/`start`/`end` deliberately not
+        # remapped here -- no simple `justify-content` distributes text
+        # the way real justification does, and `start`/`end` need real
+        # `direction` awareness this approximation doesn't have elsewhere
+        # either (`_InlineFormattingPlan._apply_text_align` next door
+        # makes the same simplification, physical `left`/`right`/`center`
+        # only). Confirmed on `wpt/css/CSS2/visudet/line-height-203.html`:
+        # a `position:absolute; width:300px; text-align:right` box's own
+        # inline-block `<span>` landed flush left instead of at the box's
+        # own right edge.
+        text_align_value = (getattr(computed, "textAlign", "") or "").strip().lower()
+        if text_align_value in ("right", "end"):
+            style["justify_content"] = "flex-end"
+        elif text_align_value == "center":
+            style["justify_content"] = "center"
         font_size = _fontmetrics.parse_length(computed.fontSize, default=16.0)
         paint_style = element._chromonic_paint_style
         family = "" if paint_style["font_family"] == "none" else paint_style["font_family"]
@@ -3255,6 +3717,45 @@ def _fix_float_shrink_to_fit_width(tree_obj, node_map: dict) -> None:
             _shift_subtree(element, dx, dy)
 
 
+def _fix_table_shrink_to_fit_width(tree_obj, node_map: dict) -> None:
+    """CSS 2.1 17.5.2: an outer `display:table`/`inline-table` box with
+    `width:auto` is sized by shrink-to-fit (summed column widths), the
+    same as a float or `inline-block` -- not stretched to fill its
+    containing block the way an ordinary block is. Chromonic's table
+    root has no dedicated Taffy display mode of its own (plain "block",
+    same as any other box; only its `<tr>`-equivalent children switch to
+    a flex-row simulation -- see `build()`'s `is_table_row` handling), so
+    it reaches this point laid out full-width first, same starting point
+    `_fix_float_shrink_to_fit_width` corrects for floats -- reuses the
+    identical technique (a fresh, max-content `tree.compute()` for just
+    this subtree)."""
+    by_id = {id(element): node_id for node_id, element in node_map.items()}
+    for element in list(node_map.values()):
+        if not _is_element(element):
+            continue
+        if not getattr(element, "_chromonic_is_table_root", False):
+            continue
+        style = getattr(element, "_chromonic_native_style", None)
+        box = element.__dict__.get("_layout_box")
+        if style is None or box is None or style.get("width") != "auto":
+            continue
+        node_id = by_id.get(id(element))
+        if node_id is None:
+            continue
+        boxes = tree_obj.compute(node_id, None, None)
+        own = boxes.get(node_id)
+        if own is None:
+            continue
+        new_width = own[2]
+        if new_width >= box.width:
+            continue  # shrink-to-fit never grows a box past its available width
+        _write_boxes(boxes, node_map)
+        dx = box.x - own[0]
+        dy = box.y - own[1]
+        if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+            _shift_subtree(element, dx, dy)
+
+
 def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
     """CSS 2.1 9.5: a float starts at or below the current block-flow
     position, at the containing block's edge, never wherever a previous
@@ -3515,6 +4016,23 @@ def _fix_nested_bfc_float_auto_height(node_map: dict) -> None:
             # summing child contributions -- its `height:auto` is already
             # a real, correctly-measured text/line-box result, not
             # something to recompute from `childNodes` here.
+            continue
+        if getattr(element, "_chromonic_inline_plan", None) is not None:
+            # `_chromonic_has_layout_children` is set `True` for one of
+            # these too (a different purpose -- see `build()`'s own
+            # comment there, stopping `paint.py` from drawing raw
+            # `textContent` a second time), but it's still a genuine,
+            # single Taffy leaf measured whole by `plan.measure()` -- its
+            # own inline children (a `<span>`, say) were flattened into the
+            # plan's runs, never built as real Taffy nodes of their own, so
+            # they have no real `_layout_box` this function's "sum child
+            # bottoms" logic could read. Recomputing its height from
+            # `childNodes` here silently discarded the plan's own already-
+            # correct measured height instead (confirmed on `wpt/css/CSS2/
+            # visudet/content-height-001.html`: a `line-height:200px`
+            # `display:inline-block` div, which also establishes a BFC,
+            # measured `200px` correctly and then got overwritten to `129px`
+            # by this exact function, right here).
             continue
         box = element.__dict__.get("_layout_box")
         if box is None:
@@ -4232,16 +4750,27 @@ def _adjust_body_collapsed_margins(root_element):
         resolved = getattr(child, "_chromonic_resolved_style", None)
         if resolved is not None and _is_floated(resolved[0]):
             continue
-        box = child.__dict__.get("_layout_box")
+        # A child that dissolved into a CSS 2.1 9.2.1.1 split reports its
+        # `_chromonic_flow_extent_box` (the decoration-free flow extent,
+        # authoritative and available earlier in the correction pipeline)
+        # rather than its own `_layout_box` -- which, for such a child, is
+        # not written until `_publish_inline_formatting` runs, several
+        # passes after this function. Checking `_layout_box` for `None`
+        # first (the previous order) meant this function saw no box at
+        # all for a still-mid-split child on its first (pre-publish) call
+        # this pass, silently skipped it, and returned without ever
+        # setting `_chromonic_margin_collapsed` -- letting `_apply_root_
+        # margin_offset` (which runs immediately after) wrongly add the
+        # root's own margin a second time on top of Taffy's already-
+        # correct collapsed position. Taffy's raw output was never wrong;
+        # only this substitution order was. `_chromonic_flow_extent_box`
+        # is checked first and preferred for exactly this reason -- only
+        # a child with neither is skipped.
+        box = getattr(child, "_chromonic_flow_extent_box", None)
+        if box is None:
+            box = child.__dict__.get("_layout_box")
         if box is None:
             continue
-        # A `child` that dissolved into a CSS 2.1 9.2.1.1 split reports its
-        # `_layout_box` as the visual union of every generated fragment,
-        # which can be taller than the real block-flow space they occupy
-        # -- substitute the decoration-free flow extent when one exists.
-        flow_box = getattr(child, "_chromonic_flow_extent_box", None)
-        if flow_box is not None:
-            box = flow_box
         boxes.append(box)
         # A CSS-empty box (no border/padding/height, no in-flow content --
         # an absolutely-positioned-only wrapper still counts as empty)
@@ -4590,7 +5119,10 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
             # ordinary `position:static` box -- pushed down by its own
             # margin-top (collapsing with a preceding sibling handled
             # separately below).
-            own_margin_top = _numeric_edge((style.get("margin") or (0.0,) * 4)[0])
+            own_margin = style.get("margin") or (0.0,) * 4
+            own_margin_top = _numeric_edge(own_margin[0])
+            own_margin_right = _numeric_edge(own_margin[1])
+            own_margin_left = _numeric_edge(own_margin[3])
             # The static position is the parent's content-box origin, not
             # its border box.
             parent_pad_top, parent_pad_right, _parent_pad_bottom, parent_pad_left = (
@@ -4601,13 +5133,21 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
             # an ordinary in-flow block, follows the same `direction:rtl`
             # flush-right rule `_fix_rtl_block_positioning` already
             # applies to a real (non-absolute) sibling: flush against the
-            # containing block's *right* content edge, not its left.
+            # containing block's *right* content edge, not its left. Either
+            # way this is still an ordinary block box's own margin box, so
+            # its own margin-left/-right (mirroring `static_y`'s own
+            # margin-top below) has to push it in from that edge same as
+            # any other block -- previously omitted here, unlike the
+            # vertical axis, so a `position:absolute` element with `left/
+            # right:auto` (falling back to its static position) landed
+            # flush against the containing block's padding edge with its
+            # own declared margin silently dropped.
             if _element_direction(parent) == "rtl":
                 static_x = (parent_box.x + parent_box.border_left
                             + parent_box.client_width - parent_pad_left - parent_pad_right
-                            - box.width)
+                            - box.width - own_margin_right)
             else:
-                static_x = parent_box.x + parent_box.border_left + parent_pad_left
+                static_x = parent_box.x + parent_box.border_left + parent_pad_left + own_margin_left
             static_y = parent_box.y + parent_box.border_top + parent_pad_top + own_margin_top
             for sibling in parent.childNodes or ():
                 if sibling is element:
@@ -4862,7 +5402,13 @@ def _fix_flex_row_baseline_alignment(node_map: dict) -> None:
     flexbox, whose own explicit `align-items:baseline` must keep Taffy's
     own (here, correct-by-definition) behavior untouched."""
     for element in node_map.values():
-        members = element.__dict__.get("_chromonic_flex_row_members") if _is_element(element) else None
+        # Not gated on `_is_element`: `_group_inline_element_runs`' own
+        # anonymous-block wrapper (`_AnonymousInlineRun`, a pseudo-node
+        # with `nodeType` 3, not a real `Element`) sets this attribute too,
+        # for a run of consecutive real inline-level element siblings --
+        # excluding it here silently skipped that whole case (confirmed on
+        # `wpt/css/CSS2/visudet/content-height-001.html`).
+        members = element.__dict__.get("_chromonic_flex_row_members") if hasattr(element, "__dict__") else None
         if not members or len(members) < 2:
             continue
         box = element.__dict__.get("_layout_box")
@@ -4884,6 +5430,32 @@ def _fix_flex_row_baseline_alignment(node_map: dict) -> None:
         if len(current) > 1:
             rows.append(current)
         for row in rows:
+            # Taffy's own cross-axis sizing for a custom `MeasureFunc` leaf
+            # inside an `align-items:baseline` row doesn't reliably keep
+            # that leaf's own correctly-measured `height:auto` result (see
+            # `_make_measure`'s own `_chromonic_measured_height` stash, and
+            # `_InlineFormattingPlan.height` for a leaf with its own inline
+            # plan) -- re-assert it here, before any baseline math below
+            # reads a (possibly still-wrong) `member_box.height`.
+            for member in row:
+                member_native = member.__dict__.get("_chromonic_native_style")
+                if member_native is None or member_native.get("height") != "auto":
+                    continue
+                plan = member.__dict__.get("_chromonic_inline_plan")
+                wanted = (plan.height if plan is not None
+                          else member.__dict__.get("_chromonic_measured_height"))
+                if wanted is None:
+                    continue
+                member_box = member.__dict__.get("_layout_box")
+                if member_box is None:
+                    continue
+                delta = wanted - member_box.height
+                if abs(delta) < 0.01:
+                    continue
+                member.__dict__["_layout_box"] = dataclasses.replace(
+                    member_box, height=member_box.height + delta,
+                    client_height=member_box.client_height + delta,
+                )
             # Taffy already applied its *own* (here, sometimes wrong)
             # cross-axis baseline offset to every member's current `y` --
             # using that directly as a baseline reference would double-
@@ -5029,6 +5601,7 @@ def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_hei
     _apply_linebox_strut_height(node_map)
     _apply_empty_inline_block_min_height(node_map)
     _fix_float_shrink_to_fit_width(tree_obj, node_map)
+    _fix_table_shrink_to_fit_width(tree_obj, node_map)
     _fix_float_flow_after_block_sibling(node_map)
     _fix_float_flow_container_auto_height(node_map)
     _fix_nested_bfc_float_auto_height(node_map)

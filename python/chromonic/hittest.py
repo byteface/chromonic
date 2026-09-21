@@ -69,23 +69,31 @@ def _accepts_pointer(element) -> bool:
     return True
 
 
+#: CSS `cursor` keywords this browser can show a distinct native shape for
+#: (GLFW's own standard-cursor set) -- returned verbatim so callers (see
+#: `native_browser.WindowInput._cursor_shapes`) can map straight to a GLFW
+#: constant with no separate CSS-keyword-to-internal-name translation step.
+_NATIVE_CURSOR_KEYWORDS = frozenset({
+    "pointer", "text", "crosshair", "move", "not-allowed",
+    "ew-resize", "ns-resize", "nwse-resize", "nesw-resize",
+})
+
+
 def cursor_for_element(element) -> str:
-    """Return the cursor shape ('pointer', 'text', or 'arrow') for a hovered
-    element -- walking up through ancestors the same way `click()` already
-    does to find an enclosing `<a href>`, so hovering text nested inside a
-    link still shows the hand cursor. Computed `cursor: pointer`/`text`
-    wins over tag-based defaults when the author set one explicitly."""
+    """Return the cursor shape (a `_NATIVE_CURSOR_KEYWORDS` member, or
+    'arrow') for a hovered element -- walking up through ancestors the same
+    way `click()` already does to find an enclosing `<a href>`, so hovering
+    text nested inside a link still shows the hand cursor. Any computed
+    `cursor` the browser can actually show wins over tag-based defaults
+    when the author set one explicitly."""
 
     node = element
 
     while node is not None and _is_element(node):
         cursor = _style_keyword(node, "cursor")
 
-        if cursor == "pointer":
-            return "pointer"
-
-        if cursor == "text":
-            return "text"
+        if cursor in _NATIVE_CURSOR_KEYWORDS:
+            return cursor
 
         tag = (getattr(node, "tagName", "") or "").lower()
 
@@ -106,7 +114,12 @@ def cursor_for_element(element) -> str:
         if tag == "textarea":
             return "text"
 
-        if (node.getAttribute("contenteditable") or "").lower() in ("", "true"):
+        # `getAttribute` returning `None` (attribute absent) must not match
+        # here -- `(None or "").lower()` is `""`, the same string a bare
+        # `contenteditable` (valid shorthand for `contenteditable="true"`)
+        # produces, so checking the *value* alone made every element with
+        # no `contenteditable` attribute at all report a text cursor too.
+        if node.hasAttribute("contenteditable") and (node.getAttribute("contenteditable") or "").lower() in ("", "true"):
             return "text"
 
         node = getattr(node, "parentElement", None)

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -97,6 +98,15 @@ class _CacheEntry:
     height: int
     decoded_bytes: int
     loaded_at: float
+    # CSS Images 3 5.2's three *intrinsic* properties, distinct from `width`/
+    # `height` above (always a real positive rasterised size, even for an SVG
+    # with no `width`/`height`/`viewBox` at all, which decodes as some
+    # fallback bitmap size -- `natural_size()` is what layout actually needs).
+    # `None` means "this image genuinely has no intrinsic value here", not
+    # "not computed yet" -- always set together, never left stale.
+    intrinsic_width: "float | None" = None
+    intrinsic_height: "float | None" = None
+    intrinsic_ratio: "float | None" = None
 
 
 @dataclass(slots=True)
@@ -232,6 +242,67 @@ def _fetch_bytes(url: str) -> bytes:
         return b"".join(chunks)
 
 
+_SVG_ROOT_TAG_RE = re.compile(rb"<svg\b[^>]*>", re.IGNORECASE | re.DOTALL)
+_SVG_ATTR_RE = re.compile(rb'([a-zA-Z:-]+)\s*=\s*"([^"]*)"|([a-zA-Z:-]+)\s*=\s*\'([^\']*)\'')
+# CSS Images 3 5.2's own fallback when a replaced element has neither an
+# intrinsic size nor ratio at all -- 300x150, the same UA default already
+# used for `<canvas>`/`<iframe>` elsewhere in this project.
+_DEFAULT_OBJECT_SIZE = (300.0, 150.0)
+
+
+def _svg_attr_length(raw: bytes) -> "float | None":
+    """A plain SVG `width`/`height` attribute value as a real intrinsic
+    length -- `None` for a percentage (no intrinsic value at all, CSS
+    Images 3 5.2) or anything else this can't confidently parse as a bare
+    number (with or without a `px` unit; SVG's own default unit)."""
+    text = raw.decode("ascii", errors="replace").strip()
+    if not text or text.endswith("%"):
+        return None
+    if text.endswith("px"):
+        text = text[:-2].strip()
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _svg_intrinsic_metadata(data: bytes) -> "tuple[float | None, float | None, float | None]":
+    """`(intrinsic_width, intrinsic_height, intrinsic_ratio)` straight from
+    the SVG root element's own `width`/`height`/`viewBox` attributes (CSS
+    Images 3 5.2/SVG 2 5.1.2) -- deliberately *not* derived from `skia.
+    SVGDOM.containerSize()`, which only ever reports a real size when
+    *both* `width` and `height` are present and returns `(0, 0)` for every
+    other case (a `viewBox`-only ratio, a single explicit dimension, or a
+    genuinely dimensionless SVG) -- indistinguishable from each other, and
+    from an explicit `width="0"`, without reading the markup directly."""
+    match = _SVG_ROOT_TAG_RE.search(data)
+    if match is None:
+        return None, None, None
+    attrs: dict[str, bytes] = {}
+    for attr_match in _SVG_ATTR_RE.finditer(match.group(0)):
+        name = (attr_match.group(1) or attr_match.group(3) or b"").decode("ascii", errors="replace").lower()
+        value = attr_match.group(2) if attr_match.group(1) else attr_match.group(4)
+        attrs[name] = value or b""
+    width = _svg_attr_length(attrs["width"]) if "width" in attrs else None
+    height = _svg_attr_length(attrs["height"]) if "height" in attrs else None
+    ratio = None
+    view_box = attrs.get("viewbox")
+    if view_box is not None:
+        parts = view_box.decode("ascii", errors="replace").replace(",", " ").split()
+        if len(parts) == 4:
+            try:
+                vb_width, vb_height = float(parts[2]), float(parts[3])
+                if vb_width > 0 and vb_height > 0:
+                    ratio = vb_width / vb_height
+            except ValueError:
+                pass
+    if ratio is None and width is not None and height is not None and width > 0 and height > 0:
+        # No `viewBox` at all, but both dimensions given directly -- their
+        # own ratio is still the SVG's real intrinsic ratio.
+        ratio = width / height
+    return width, height, ratio
+
+
 def _decode_image(data: bytes) -> "skia.Image | None":
     image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(data))
     if image is not None:
@@ -246,8 +317,24 @@ def _decode_image(data: bytes) -> "skia.Image | None":
         if svg is None:
             return None
         size = svg.containerSize()
-        width = max(1, int(round(size.width())))
-        height = max(1, int(round(size.height())))
+        # `containerSize()` is `(0, 0)` whenever `width`/`height` aren't
+        # *both* set on the root -- rasterised at the CSS default object
+        # size (or a ratio-derived size, ratio known) instead of `max(1,
+        # ...)`'s degenerate 1x1 bitmap, purely so a dimensionless/ratio-
+        # only SVG still paints recognisably; layout's own used size (this
+        # project's `natural_size()`/`_apply_image_intrinsic_size`) is
+        # computed from the real intrinsic metadata below, never from this
+        # raster bitmap's own pixel dimensions.
+        if size.width() > 0 and size.height() > 0:
+            width, height = size.width(), size.height()
+        else:
+            _iw, _ih, ratio = _svg_intrinsic_metadata(data)
+            if ratio is not None:
+                width, height = _DEFAULT_OBJECT_SIZE[1] * ratio, _DEFAULT_OBJECT_SIZE[1]
+            else:
+                width, height = _DEFAULT_OBJECT_SIZE
+        width = max(1, int(round(width)))
+        height = max(1, int(round(height)))
         # Avoid accidentally allocating a pathological SVG surface.  This is a
         # decoded-memory guard, independent of the encoded network size limit.
         if width * height * 4 > _CACHE_BUDGET_BYTES:
@@ -267,6 +354,29 @@ def _decode_resource(data: bytes):
     if animation is not None:
         return animation.frames[0], animation
     return _decode_image(data), None
+
+
+def _natural_metadata(data: bytes, image: skia.Image) -> "tuple[float | None, float | None, float | None]":
+    """`(intrinsic_width, intrinsic_height, intrinsic_ratio)` for a decoded
+    image resource, CSS Images 3 5.2 -- an ordinary raster format (PNG/JPEG/
+    GIF/...) always has both dimensions and their own ratio, correctly read
+    straight off `image`'s own decoded pixel size below. An SVG is
+    different: it only has whichever of `width`/`height`/`viewBox` its root
+    element actually declared (`_svg_intrinsic_metadata`), each
+    independently possibly absent -- `image`'s own rasterised bitmap size
+    is *not* a fallback for a missing one here, unlike a raster format,
+    since `_decode_image`'s own SVG branch already rasterises a
+    dimensionless/ratio-only SVG at a real, deliberately non-trivial
+    fallback size purely so it still paints recognisably (CSS's default
+    object size, or a ratio-derived one) -- treating that bitmap size as
+    if it were genuine intrinsic data would silently invent intrinsic
+    dimensions and a ratio for an SVG that has neither."""
+    if _SVG_ROOT_TAG_RE.search(data) is not None:
+        return _svg_intrinsic_metadata(data)
+    raster_width, raster_height = _image_size(image)
+    if raster_width > 0 and raster_height > 0:
+        return float(raster_width), float(raster_height), raster_width / raster_height
+    return None, None, None
 
 
 def _image_size(image: skia.Image) -> tuple[int, int]:
@@ -317,6 +427,7 @@ def _finish(
     fetch_ms: float,
     decode_ms: float,
     error: str | None = None,
+    natural: "tuple[float | None, float | None, float | None]" = (None, None, None),
 ) -> None:
     """Publish a worker result atomically, or discard it if it became stale."""
     global _generation, _cache_bytes
@@ -343,12 +454,16 @@ def _finish(
             old = _cache.pop(url, None)
             if old is not None:
                 _cache_bytes = max(0, _cache_bytes - old.decoded_bytes)
+            intrinsic_width, intrinsic_height, intrinsic_ratio = natural
             _cache[url] = _CacheEntry(
                 image=image,
                 width=width,
                 height=height,
                 decoded_bytes=decoded_bytes,
                 loaded_at=time.monotonic(),
+                intrinsic_width=intrinsic_width,
+                intrinsic_height=intrinsic_height,
+                intrinsic_ratio=intrinsic_ratio,
             )
             _cache_bytes += decoded_bytes
             if animation is not None:
@@ -390,9 +505,11 @@ def _decode_stage(url: str, epoch: int, data: bytes, fetch_ms: float) -> None:
     try:
         image, animation = _decode_resource(data)
         error = None if image is not None else "unsupported or corrupt image"
+        natural = _natural_metadata(data, image) if image is not None else (None, None, None)
     except Exception as exc:
         image = animation = None
         error = f"{type(exc).__name__}: {exc}"
+        natural = (None, None, None)
     decode_ms = (time.perf_counter() - started) * 1000.0
     _finish(
         url,
@@ -401,6 +518,7 @@ def _decode_stage(url: str, epoch: int, data: bytes, fetch_ms: float) -> None:
         animation,
         encoded_bytes=len(data),
         fetch_ms=fetch_ms,
+        natural=natural,
         decode_ms=decode_ms,
         error=error,
     )
@@ -570,6 +688,7 @@ def load_image(url: str) -> "skia.Image | None":
                 if image is not None:
                     width, height = _image_size(image)
                     decoded_bytes = _decoded_size(image, animation)
+                    intrinsic_width, intrinsic_height, intrinsic_ratio = _natural_metadata(data, image)
                     with _lock:
                         existing = _cache.pop(url, None)
                         if existing is not None:
@@ -580,6 +699,9 @@ def load_image(url: str) -> "skia.Image | None":
                             height=height,
                             decoded_bytes=decoded_bytes,
                             loaded_at=time.monotonic(),
+                            intrinsic_width=intrinsic_width,
+                            intrinsic_height=intrinsic_height,
+                            intrinsic_ratio=intrinsic_ratio,
                         )
                         _cache_bytes += decoded_bytes
                         if animation is not None:
@@ -595,6 +717,24 @@ def load_image(url: str) -> "skia.Image | None":
 
     request_image(url)
     return None
+
+
+def natural_size(url: str) -> "tuple[float | None, float | None, float | None]":
+    """`(intrinsic_width, intrinsic_height, intrinsic_ratio)`, CSS Images 3
+    5.2, for an already-decoded/cached image -- `(None, None, None)` if
+    `url` isn't cached yet (matches `load_image`'s own "not ready, caller
+    already queued it" contract; layout re-checks once the image arrives).
+    Each of the three is independently `None` when this resource genuinely
+    doesn't have that property (an SVG with no `width` attribute has no
+    intrinsic width, even though it decoded to a real bitmap some other
+    way) -- `_apply_image_intrinsic_size` is what turns this into a real
+    used size, following CSS's own default-sizing algorithm for a replaced
+    element with a partial or absent intrinsic size."""
+    with _lock:
+        entry = _cache.get(url)
+        if entry is None:
+            return None, None, None
+        return entry.intrinsic_width, entry.intrinsic_height, entry.intrinsic_ratio
 
 
 def generation() -> int:
