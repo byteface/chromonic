@@ -185,7 +185,14 @@ def _submit(kind: str, fn, *args) -> Future:
 
 
 def _is_url(value) -> bool:
-    return isinstance(value, str) and value.split(":", 1)[0].lower() in ("http", "https")
+    # `file:` alongside `http`/`https` -- a locally loaded page's own
+    # `<img src="local.png">` already resolves to an absolute `file://` URI
+    # here (`resolve_image_sources`'s `urljoin` against the page's own
+    # `file://` base), but until now nothing downstream actually recognized
+    # that scheme as fetchable: `_fetch_bytes`'s `urllib.request.urlopen`
+    # already handles `file://` transparently (confirmed directly), so nothing
+    # else needs to change for local images to load, only this gate.
+    return isinstance(value, str) and value.split(":", 1)[0].lower() in ("http", "https", "file")
 
 
 def _supported_source(url: str) -> bool:

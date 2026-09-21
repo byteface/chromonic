@@ -6,13 +6,17 @@ without a display. All DOM/layout/GPU work remains on the main thread.
 """
 from __future__ import annotations
 
+import logging
 import time
 import urllib.parse
+from pathlib import Path
 
 import skia
 
 from . import browser, browser_images, domonic_canvas_patch, fonts, hittest, paint, tree, window
 from .tree import warm_text_layout
+
+_log = logging.getLogger(__name__)
 
 TOOLBAR = 44
 
@@ -23,6 +27,16 @@ TOOLBAR = 44
 # periodic geometry updates rather than postponing layout forever.
 _IMAGE_RELAYOUT_INTERVAL = 0.2
 _MAX_DEFERRED_LAYOUT_LATENCY = 0.5
+
+# A live window drag calls `resize()` on every intermediate size GLFW
+# reports. A page whose relayout comfortably fits this budget can just run
+# it live, on every one of those ticks, and track the window fluidly instead
+# of stretching the last completed frame to fit and snapping to real layout
+# once the drag pauses. 12ms leaves headroom within a 60fps (~16.7ms) frame
+# for paint/swap on top of layout itself; a page too expensive for that
+# still falls back to the old coalesced-until-idle behavior so a live
+# resize doesn't start dropping frames or lagging input.
+_LIVE_RESIZE_BUDGET_MS = 12.0
 
 
 def _clipboard_text(glfw_module, window):
@@ -77,6 +91,128 @@ def _ancestor(element, predicate):
     return None
 
 
+#: How far the pointer must move from its mouse-down position, in either
+#: axis, before a press-drag-release is treated as a text selection instead
+#: of a plain click -- keeps an ordinary link/button click (a press and
+#: release at effectively the same pixel) from being swallowed by selection
+#: handling.
+_SELECTION_DRAG_THRESHOLD = 3.0
+
+
+def _collect_selectable_runs(display_list):
+    """Every line of rendered text on the page, in document/paint order, as
+    `paint.TextRun`s -- the substrate text-selection hit-testing/highlighting
+    works against. `display_list` (`paint.build_display_list`'s flat, already
+    paint-ordered element list) covers every real DOM element with a layout
+    box, but not the anonymous inline-text/generated-content fragments mixed
+    inline content retains (`_chromonic_inline_fragments` -- see `paint.
+    paint_element`'s own handling of them); those are walked recursively here
+    the same way `paint_element` recurses into them for drawing, so a
+    selectable run always corresponds to something actually painted."""
+    runs = []
+
+    def add(element):
+        tag_name = getattr(element, "_chromonic_tag_name", None) or (getattr(element, "tagName", "") or "").lower()
+        has_layout_children = getattr(element, "_chromonic_has_layout_children", None)
+        if has_layout_children is None:
+            has_layout_children = tag_name != "select" and any(
+                paint._is_element(child) for child in (element.childNodes or [])
+            )
+        if not has_layout_children:
+            box = element.__dict__.get("_layout_box")
+            if box is not None:
+                runs.extend(paint.text_line_runs(element, box, paint._paint_style(element)))
+        for fragment in getattr(element, "_chromonic_inline_fragments", ()) or ():
+            add(fragment)
+
+    for element in display_list:
+        add(element)
+    return runs
+
+
+def _char_offset(run, x):
+    """The character offset within `run.text` nearest to document-space `x`,
+    via the same `font.measureText` prefix-width technique `draw_input_caret`
+    already uses for a single input field's caret -- extended here to a
+    binary search since a run can be an arbitrarily long line."""
+    text = run.text
+    if x <= run.x:
+        return 0
+    font = run.font
+    if x >= run.x + run.width:
+        return len(text)
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if run.x + font.measureText(text[:mid]) <= x:
+            low = mid
+        else:
+            high = mid - 1
+    # Round to whichever boundary `x` is actually closer to, rather than
+    # always flooring -- feels more natural under the pointer.
+    if low < len(text):
+        floor_x = run.x + font.measureText(text[:low])
+        ceil_x = run.x + font.measureText(text[:low + 1])
+        if x - floor_x > ceil_x - x:
+            low += 1
+    return low
+
+
+def _hit_run(runs, x, y):
+    """`(run_index, char_offset)` nearest to document-space `(x, y)`. Falls
+    back to whichever run's vertical band is closest when `y` doesn't land
+    inside any of them (dragging above the first line or below the last)."""
+    if not runs:
+        return None
+    best_i, best_d = 0, None
+    for i, run in enumerate(runs):
+        top = run.baseline_y - run.height * 0.8
+        bottom = top + run.height
+        d = 0.0 if top <= y <= bottom else (top - y if y < top else y - bottom)
+        if best_d is None or d < best_d:
+            best_d, best_i = d, i
+        if d == 0.0:
+            break
+    return best_i, _char_offset(runs[best_i], x)
+
+
+#: Sniffed only when a saved image's own URL gives no usable extension
+#: (`refEncodedData()`'s bytes are the real original file, but nothing
+#: about them names the format) -- magic-number prefixes for the formats
+#: `browser_images.py`'s own decoder already supports.
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
+
+
+def _sniff_image_suffix(data: bytes) -> str:
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    for magic, suffix in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return suffix
+    return ".png"  # `encodeToData()`'s own fallback format, see save_hovered_image
+
+
+def _unique_desktop_path(name: str) -> Path:
+    """`~/Desktop/{name}`, or `~/Desktop/{name} 2`/`3`/... if that's taken --
+    the same "don't clobber, number it instead" convention Finder itself
+    uses for a duplicate filename."""
+    desktop = Path.home() / "Desktop"
+    desktop.mkdir(parents=True, exist_ok=True)
+    stem = Path(name).stem or "image"
+    suffix = Path(name).suffix
+    candidate = desktop / f"{stem}{suffix}"
+    counter = 2
+    while candidate.exists():
+        candidate = desktop / f"{stem} {counter}{suffix}"
+        counter += 1
+    return candidate
+
+
 def sync_window_size(view, window, glfw_module):
     """Reflow to GLFW's settled logical size after processing window events."""
     logical_size = glfw_module.get_window_size(window)
@@ -119,6 +255,18 @@ class View:
         self.focused_element = None
         self.input_caret = 0
         self.navigation_handler = None
+        # Page text selection (independent of `select_anchor`/`caret` above,
+        # which are the address bar's own). `_selectable_runs` is every line
+        # of rendered text as a `paint.TextRun`, rebuilt alongside the
+        # display list (`relayout()`/`rebuild_display_list()`) -- what
+        # `text_selection` (`(start_run, start_char, end_run, end_char)`,
+        # in document order, or `None`) indexes into. `_mouse_down_pos` and
+        # `_selection_drag_anchor` are transient press-drag-release state;
+        # see `begin_selection`/`update_selection`/`end_selection`.
+        self._selectable_runs = []
+        self.text_selection = None
+        self._mouse_down_pos = None
+        self._selection_drag_anchor = None
         # Set by `run()` once the real GLFW window exists. `commit_page`
         # re-attaches it to each newly-loaded page's own `domonic.window.
         # Window` so `document.defaultView` always represents the real
@@ -134,6 +282,9 @@ class View:
         # wiring) instead of the dropped paths going nowhere.
         self.dropped_files = []
         self.status = ''
+        self.stylesheets_enabled = True
+        self.view_source_open = False
+        self.view_source_scroll_y = 0.0
         self.loading = False
         self.dirty = True
         self._image_generation = 0
@@ -189,11 +340,19 @@ class View:
                 return self.navigation_handler(url, mode=mode, jump_index=jump_index, method=method, data=data)
             page = (self.loader(url) if method == 'GET' and data is None
                     else browser.load(url, method=method, data=data))
+            return self.commit_page(page, url, mode=mode, jump_index=jump_index)
         except Exception as error:
-            self.status = str(error)
+            # `commit_page` (title/history/window-attach, on top of the
+            # `relayout()` it triggers) is inside this same `try` -- a page
+            # tripping a bug anywhere in that pipeline must land back here
+            # as a status message, not crash the process. `relayout()`
+            # already catches its own layout/paint failures; this is the
+            # broader net for everything around it.
+            _log.exception("chromonic: navigation failed for %s", url)
+            self.status = f"Chromonic cannot currently support this page: {error}"
+            self.loading = False
             self.dirty = True
             return False
-        return self.commit_page(page, url, mode=mode, jump_index=jump_index)
 
     def commit_page(self, page, url, *, mode='push', jump_index=None):
         # `page.url` is the real, final URL `browser.load` fetched (after
@@ -303,13 +462,22 @@ class View:
         return self.navigate(self.history[target], mode='jump', jump_index=target)
 
     def on_file_drop(self, paths):
-        """GLFW's drop callback hands us real OS file paths -- store them
-        and surface a status message. No DragEvent/DataTransfer yet, and
-        nothing populates an `<input type=file>` from this; a real DOM
-        wiring is future work, this just keeps the paths from going
-        nowhere in the meantime."""
+        """GLFW's drop callback hands us real OS file paths -- navigate to
+        the first one, the same as dropping a file onto a real browser
+        window. `browser.py`'s `_synthetic_local_page` makes an image show
+        as an image, a plain-text file show as text, and an actual HTML
+        file render normally, all through the ordinary `navigate()` path
+        (so history/the address bar/errors all behave exactly like any
+        other navigation). This window has no tabs, so any further dropped
+        paths are only recorded (`dropped_files`), not opened. Not wired
+        into `DataTransfer`/a real `drop` DOM event yet -- a page's own
+        `ondrop` handler still sees nothing."""
         self.dropped_files = list(paths)
-        self.status = f"Dropped {len(self.dropped_files)} file(s): {', '.join(self.dropped_files)}"
+        if not paths:
+            return
+        opened = self.navigate(paths[0])
+        if opened and len(paths) > 1:
+            self.status = f"Opened {paths[0]}; {len(paths) - 1} more file(s) dropped but not opened"
         self.dirty = True
 
     @staticmethod
@@ -324,6 +492,11 @@ class View:
         started = time.perf_counter()
         self.display_list = paint.build_display_list(self.page.document.body)
         self._refresh_page_image_urls()
+        # Geometry didn't change (this path is paint-only, see the
+        # docstring), so previously computed run indices stay valid --
+        # rebuilt anyway since it's cheap and keeps it in lockstep with
+        # `self.display_list`, but the active selection itself survives.
+        self._selectable_runs = _collect_selectable_runs(self.display_list)
         self.last_display_list_ms = (time.perf_counter() - started) * 1000.0
         self.dirty = True
 
@@ -421,47 +594,73 @@ class View:
         per-element resolved-style cache. Resize, DOM events, and navigation
         use the default full style pass because they may affect media queries,
         classes, inline styles, or stylesheets.
+
+        A page that trips a real layout/paint bug (an unsupported CSS value,
+        a domonic/Rust-layer edge case, ...) must not take the whole browser
+        down with it -- everything below is wrapped in one broad `except`:
+        on failure this falls back to a blank page plus a status-bar error
+        (`self.status`) instead of propagating out of the render loop, which
+        previously meant one bad page crashed the entire process. `self.page`
+        itself is left alone, so the toolbar/address bar/navigation still
+        work and the user can just try a different URL.
         """
         if self.page is None:
             self.dirty = True
             return
 
         started = time.perf_counter()
-        browser.set_viewport(self.page, self.width, self.viewport_height)
-        doc = self.page.document
+        try:
+            browser.set_viewport(self.page, self.width, self.viewport_height)
+            doc = self.page.document
 
-        # Invalidating this index on the fast path defeats a meaningful part
-        # of style reuse. Only a full style pass needs a fresh selector index.
-        if not reuse_styles and hasattr(doc, '_cssom_rule_index'):
-            doc._cssom_rule_index = None
+            # Invalidating this index on the fast path defeats a meaningful
+            # part of style reuse. Only a full style pass needs a fresh
+            # selector index.
+            if not reuse_styles and hasattr(doc, '_cssom_rule_index'):
+                doc._cssom_rule_index = None
 
-        nodes = self.layout_projection.layout(
-            doc.body,
-            width=self.width,
-            height=None,
-            reuse_styles=reuse_styles,
-            viewport_height=self.viewport_height,
-        )
-        self.content_height = max(
-            (
-                max(
-                    box.y + box.height,
-                    float(element.__dict__.get('_chromonic_scroll_extent', 0.0)),
-                )
-                for element in nodes.values()
-                if (box := element.__dict__.get('_layout_box')) is not None
-            ),
-            default=0.0,
-        )
-        display_started = time.perf_counter()
-        self.display_list = paint.build_display_list(doc.body)
-        self._refresh_page_image_urls()
-        self.last_display_list_ms = (time.perf_counter() - display_started) * 1000.0
-        max_scroll = max(0.0, self.content_height - self.viewport_height)
-        self.scroll_y = min(self.scroll_y, max_scroll)
-        # `nodes` already represents the elements participating in layout;
-        # don't walk the DOM again just to feed the profiler.
-        self.dom_element_count = len(nodes)
+            nodes = self.layout_projection.layout(
+                doc.body,
+                width=self.width,
+                height=None,
+                reuse_styles=reuse_styles,
+                viewport_height=self.viewport_height,
+            )
+            self.content_height = max(
+                (
+                    max(
+                        box.y + box.height,
+                        float(element.__dict__.get('_chromonic_scroll_extent', 0.0)),
+                    )
+                    for element in nodes.values()
+                    if (box := element.__dict__.get('_layout_box')) is not None
+                ),
+                default=0.0,
+            )
+            display_started = time.perf_counter()
+            self.display_list = paint.build_display_list(doc.body)
+            self._refresh_page_image_urls()
+            self.last_display_list_ms = (time.perf_counter() - display_started) * 1000.0
+            max_scroll = max(0.0, self.content_height - self.viewport_height)
+            self.scroll_y = min(self.scroll_y, max_scroll)
+            # `nodes` already represents the elements participating in
+            # layout; don't walk the DOM again just to feed the profiler.
+            self.dom_element_count = len(nodes)
+            # Real geometry may have just changed underneath any run index a
+            # prior selection referenced -- rebuild the runs and drop the
+            # selection itself rather than risk it now pointing at the wrong
+            # text (a full layout pass, unlike `rebuild_display_list()`'s
+            # paint-only one, can genuinely change line-wrapping/positions).
+            self._selectable_runs = _collect_selectable_runs(self.display_list)
+            self.text_selection = None
+        except Exception as error:
+            _log.exception("chromonic: layout/paint failed for %s", self.url)
+            self.display_list = []
+            self.content_height = 0.0
+            self.scroll_y = 0.0
+            self._selectable_runs = []
+            self.text_selection = None
+            self.status = f"Chromonic cannot currently render this page: {error}"
         self.last_layout_ms = (time.perf_counter() - started) * 1000.0
         self.avg_layout_ms = self._ema(self.avg_layout_ms, self.last_layout_ms)
         self.layout_count += 1
@@ -517,15 +716,19 @@ class View:
     def resize(self, width, height, *, defer=False):
         if width > 0 and height > 0 and (width, height) != (self.width, self.height):
             self.width, self.height = width, height
-            if defer:
+            if defer and self.avg_layout_ms > _LIVE_RESIZE_BUDGET_MS:
                 self.dirty = True
                 self.request_relayout(delay=0.06, reuse_styles=False)
             else:
                 self.relayout()
 
     def scroll(self, delta):
-        self.scroll_y = max(0, min(self.scroll_y + delta,
-                                  max(0, self.content_height - self.viewport_height)))
+        if self.view_source_open:
+            max_scroll = max(0.0, self._view_source_content_height() - self.viewport_height)
+            self.view_source_scroll_y = max(0.0, min(self.view_source_scroll_y + delta, max_scroll))
+        else:
+            self.scroll_y = max(0, min(self.scroll_y + delta,
+                                      max(0, self.content_height - self.viewport_height)))
         self.dirty = True  # scrolling only repaints; it never relayouts
 
     @staticmethod
@@ -653,6 +856,7 @@ class View:
 
         self.editing = False
         self.select_anchor = None
+        self.text_selection = None
         if self.page is None:
             return
 
@@ -701,6 +905,138 @@ class View:
 
         if element is not None:
             self.relayout()
+
+    def begin_selection(self, x, y):
+        """Mouse-down in the page area: record where a drag *might* start a
+        text selection, without committing to one yet -- `WindowInput.
+        on_mouse_button` still runs a normal `click()` on release if the
+        pointer never actually moved (see `end_selection`)."""
+        self._mouse_down_pos = (x, y)
+        self._selection_drag_anchor = None
+        self.text_selection = None
+        self.dirty = True
+
+    def update_selection(self, x, y):
+        """Extend the in-progress selection to the pointer's current
+        position; a no-op until the drag clears `_SELECTION_DRAG_THRESHOLD`
+        (so a stationary press-release still reaches `click()`) and there is
+        text under the pointer to select at all."""
+        if self._mouse_down_pos is None or not self._selectable_runs:
+            return
+        down_x, down_y = self._mouse_down_pos
+        if (self.text_selection is None
+                and abs(x - down_x) < _SELECTION_DRAG_THRESHOLD
+                and abs(y - down_y) < _SELECTION_DRAG_THRESHOLD):
+            return
+        if self._selection_drag_anchor is None:
+            self._selection_drag_anchor = _hit_run(
+                self._selectable_runs, down_x, down_y - TOOLBAR + self.scroll_y)
+            if self._selection_drag_anchor is None:
+                return
+        current = _hit_run(self._selectable_runs, x, y - TOOLBAR + self.scroll_y)
+        if current is None:
+            return
+        start, end = self._selection_drag_anchor, current
+        if end < start:
+            start, end = end, start
+        self.text_selection = (start[0], start[1], end[0], end[1])
+        self.dirty = True
+
+    def end_selection(self) -> bool:
+        """Clear press-drag tracking; returns whether a real text selection
+        resulted, so the caller knows whether to still treat this as an
+        ordinary click (see `WindowInput.on_mouse_button`)."""
+        self._mouse_down_pos = None
+        self._selection_drag_anchor = None
+        return self.text_selection is not None
+
+    def selected_text(self) -> str:
+        """The current page selection's plain text, document-order and
+        spanning as many runs/elements as it covers -- what Cmd+C copies.
+        Consecutive runs join with a space (covers both a mid-paragraph
+        wrapped line and two inline elements sharing one visual line, e.g.
+        `<b>bold</b> text`) unless the vertical gap between them is bigger
+        than one line, which reads as an actual paragraph/block break and
+        joins with a blank line instead -- an approximation (real "what
+        would a screen reader/other browser copy here" semantics are far
+        more involved) but a reasonable one for this browser's purposes."""
+        if self.text_selection is None:
+            return ""
+        runs = self._selectable_runs
+        start_i, start_c, end_i, end_c = self.text_selection
+        if not runs or start_i >= len(runs) or end_i >= len(runs):
+            return ""
+        if start_i == end_i:
+            return runs[start_i].text[start_c:end_c]
+        pieces = [runs[start_i].text[start_c:]]
+        for i in range(start_i + 1, end_i + 1):
+            prev, run = runs[i - 1], runs[i]
+            gap = run.baseline_y - prev.baseline_y
+            pieces.append("\n\n" if gap > prev.height * 1.5 else " ")
+            pieces.append(run.text[:end_c] if i == end_i else run.text)
+        return "".join(pieces)
+
+    def draw_text_selection(self, canvas):
+        """Highlight rects for the current page selection, drawn over the
+        already-painted text (see `View.draw`) -- not strictly the same
+        stacking order a real browser uses (highlight under, then text
+        redrawn on top), but a translucent fill keeps the glyphs legible
+        through it, and this browser's paint pass doesn't split text
+        drawing from its own background/border pass in a way that would let
+        a highlight land strictly underneath without repainting each
+        element twice."""
+        if self.text_selection is None:
+            return
+        runs = self._selectable_runs
+        start_i, start_c, end_i, end_c = self.text_selection
+        if not runs or start_i >= len(runs) or end_i >= len(runs):
+            return
+        highlight = skia.Paint(Color=0x5533aaff, AntiAlias=True)
+        for i in range(start_i, end_i + 1):
+            run = runs[i]
+            left = run.x + (run.font.measureText(run.text[:start_c]) if i == start_i else 0.0)
+            right = run.x + (run.font.measureText(run.text[:end_c]) if i == end_i else run.width)
+            top = run.baseline_y - run.height * 0.8
+            canvas.drawRect(skia.Rect.MakeLTRB(left, top, right, top + run.height), highlight)
+
+    def save_hovered_image(self, x, y) -> "str | None":
+        """Save the `<img>` under window position `(x, y)` to `~/Desktop`,
+        returning the saved path, or `None` if there's nothing there to
+        save. Bound to Cmd+S -- this browser has no native OS drag session
+        to offer for "drag an image out" (GLFW has no API for being a drag
+        *source*, only for receiving one), so hover the image and press
+        Cmd+S instead, closest practical equivalent.
+
+        Prefers `skia.Image.refEncodedData()` -- confirmed directly that
+        skia retains the *original* encoded bytes from `MakeFromEncoded()`
+        (what `browser_images.py`'s decoder uses), so this writes out the
+        exact original file, original format included, not a re-encode --
+        and only falls back to a fresh PNG via `encodeToData()` for
+        whatever skia didn't keep those bytes for."""
+        if self.page is None:
+            return None
+        document_y = y - TOOLBAR + self.scroll_y
+        element = hittest.hit_test(self.page.document.body, x, document_y)
+        img_element = _ancestor(
+            element, lambda el: (getattr(el, 'tagName', '') or '').lower() == 'img')
+        if img_element is None:
+            return None
+        src = img_element.getAttribute('src')
+        if not src:
+            return None
+        image = browser_images.load_image(src)
+        if image is None:
+            return None
+        encoded = image.refEncodedData() or image.encodeToData()
+        if encoded is None:
+            return None
+        raw = bytes(encoded)
+        name = Path(urllib.parse.urlparse(src).path).name or "image"
+        if not Path(name).suffix:
+            name += _sniff_image_suffix(raw)
+        target = _unique_desktop_path(name)
+        target.write_bytes(raw)
+        return str(target)
 
     def cursor_kind(self, x, y):
         """Cursor shape for (x, y) in window coordinates -- 'pointer',
@@ -978,9 +1314,80 @@ class View:
                 break
         canvas.restore()
 
+    def draw_view_source(self, canvas):
+        canvas.save()
+        canvas.clipRect(skia.Rect.MakeXYWH(0, TOOLBAR, self.width, self.viewport_height))
+        canvas.drawRect(skia.Rect.MakeXYWH(0, TOOLBAR, self.width, self.viewport_height),
+                        skia.Paint(Color=0xfff7f7f2))
+        font = paint._font(13, family='monospace')
+        ink = skia.Paint(Color=0xff1a1a1a, AntiAlias=True)
+        line_height = self.VIEW_SOURCE_LINE_HEIGHT
+        lines = self._view_source_lines()
+        if not lines:
+            canvas.drawString('(no source available for this page)', 8, TOOLBAR + 20, font, ink)
+            canvas.restore()
+            return
+        top_index = int(self.view_source_scroll_y // line_height)
+        y = TOOLBAR + line_height - (self.view_source_scroll_y - top_index * line_height)
+        index = top_index
+        bottom = TOOLBAR + self.viewport_height
+        while index < len(lines) and y - line_height < bottom:
+            if lines[index]:
+                canvas.drawString(lines[index], 8, y, font, ink)
+            y += line_height
+            index += 1
+        canvas.restore()
+
     def toggle_perf(self):
         self.perf_open = not self.perf_open
         self.dirty = True
+
+    def toggle_stylesheets(self):
+        """Flip every author stylesheet's `disabled` flag, leaving the
+        `data-chromonic-ua` UA-default sheet alone -- so this shows the page
+        the way `ua_style.py` alone renders it (headings still look like
+        headings, `<body>` still has its usual margin) minus whatever the
+        page's own CSS did, the same shape as a real browser's "no author
+        styles" view rather than reverting all the way to raw CSS initial
+        values. `domonic_stylesheet_disabled_patch.py` makes the cascade
+        actually respect `.disabled` (it didn't before); `relayout()`'s
+        default `reuse_styles=False` already invalidates the cached rule
+        index this depends on."""
+        if self.page is None:
+            return
+        self.stylesheets_enabled = not self.stylesheets_enabled
+        for sheet in self.page.document.styleSheets:
+            owner = getattr(sheet, 'ownerNode', None)
+            has_ua_marker = owner is not None and getattr(owner, 'hasAttribute', None) is not None \
+                and owner.hasAttribute('data-chromonic-ua')
+            if not has_ua_marker:
+                sheet.disabled = not self.stylesheets_enabled
+        self.status = 'Stylesheets: on' if self.stylesheets_enabled else 'Stylesheets: off'
+        self.relayout()
+
+    VIEW_SOURCE_LINE_HEIGHT = 16
+
+    def toggle_view_source(self):
+        """F8: swap the rendered page for its own raw fetched source (see
+        `browser.py`'s `page.source`, captured at load time before domonic/
+        myjs parsed it), monospaced and line-numbered-by-scroll like a real
+        browser's `view-source:`. Independent scroll position
+        (`view_source_scroll_y`) from the rendered page's own, so toggling
+        back returns you exactly where you left off."""
+        self.view_source_open = not self.view_source_open
+        if self.view_source_open:
+            self.view_source_scroll_y = 0.0
+            self.focused_element = None
+            self.editing = False
+            self.text_selection = None
+        self.dirty = True
+
+    def _view_source_lines(self):
+        text = getattr(self.page, 'source', None) if self.page is not None else None
+        return text.splitlines() if text else []
+
+    def _view_source_content_height(self):
+        return len(self._view_source_lines()) * self.VIEW_SOURCE_LINE_HEIGHT
 
     def record_frame_time(self, elapsed_ms):
         self.last_frame_ms = elapsed_ms
@@ -1052,7 +1459,9 @@ class View:
 
     def draw(self, canvas):
         canvas.clear(skia.ColorWHITE)
-        if self.page is not None:
+        if self.view_source_open:
+            self.draw_view_source(canvas)
+        elif self.page is not None:
             canvas.save()
             canvas.clipRect(skia.Rect.MakeXYWH(0, TOOLBAR, self.width, self.viewport_height))
             canvas.translate(0, TOOLBAR - self.scroll_y)
@@ -1060,6 +1469,7 @@ class View:
                 canvas, self.display_list,
                 top=self.scroll_y, bottom=self.scroll_y + self.viewport_height,
             )
+            self.draw_text_selection(canvas)
             self.draw_input_caret(canvas)
             canvas.restore()
         canvas.drawRect(skia.Rect.MakeWH(self.width, TOOLBAR), skia.Paint(Color=0xffe2e8f0))
@@ -1179,16 +1589,28 @@ class Navigation:
         try:
             page = future.result()
         except Exception as error:
-            self.view.status = str(error)
+            _log.exception("chromonic: fetch failed for %s", url)
+            self.view.status = f"Chromonic cannot currently support this page: {error}"
             self.view.loading = False
             self.view.dirty = True
-        else:
-            # Do not discard text typed while a request was in flight.
-            edit = (self.view.address, self.view.caret, self.view.select_anchor) if self.view.editing else None
+            return
+        # Do not discard text typed while a request was in flight.
+        edit = (self.view.address, self.view.caret, self.view.select_anchor) if self.view.editing else None
+        try:
             self.view.commit_page(page, url, mode=mode, jump_index=jump_index)
-            if edit is not None:
-                self.view.address, self.view.caret, self.view.select_anchor = edit
-                self.view.editing = True
+        except Exception as error:
+            # `relayout()` (called from `commit_page`) already catches its
+            # own layout/paint failures -- this is the net for everything
+            # else in `commit_page` (title/history/window-attach), so a bug
+            # there surfaces as a status message instead of taking the
+            # whole render loop down with it.
+            _log.exception("chromonic: commit failed for %s", url)
+            self.view.status = f"Chromonic cannot currently support this page: {error}"
+            self.view.loading = False
+            self.view.dirty = True
+        if edit is not None:
+            self.view.address, self.view.caret, self.view.select_anchor = edit
+            self.view.editing = True
 
     def close(self):
         self.view.navigation_handler = None
@@ -1203,10 +1625,11 @@ class WindowInput:
     lifecycle, polling, and rendering.
     """
 
-    def __init__(self, glfw_module, window, view):
+    def __init__(self, glfw_module, window, view, renderer):
         self.glfw = glfw_module
         self.window = window
         self.view = view
+        self.renderer = renderer
         self._cursors = {}
         self._last_cursor_kind = None
         # `getattr(..., self.glfw.ARROW_CURSOR)` for the GLFW-3.4-only
@@ -1235,10 +1658,23 @@ class WindowInput:
         g.set_mouse_button_callback(w, self.on_mouse_button)
         g.set_scroll_callback(w, self.on_scroll)
         g.set_cursor_pos_callback(w, self.on_cursor_pos)
-        # Resizing is coalesced in the main loop; callbacks only request paint.
-        g.set_window_size_callback(w, self._mark_dirty)
-        g.set_framebuffer_size_callback(w, self._mark_dirty)
-        g.set_window_refresh_callback(w, self._mark_dirty)
+        # On macOS (and similarly elsewhere), an OS-driven window-resize
+        # drag runs GLFW's event dispatch inside a *modal* nested loop --
+        # this project's own `while not window_should_close` loop in `run()`
+        # never regains control until the pointer is released, so a
+        # size/refresh callback that only sets `view.dirty = True` (as these
+        # used to, relying on the main loop to notice and redraw) never
+        # actually gets drawn until the drag ends: the window shows a
+        # frozen last-good frame, stretched to whatever size it's being
+        # dragged to, for the whole gesture. Calling `_live_redraw` directly
+        # from these callbacks instead -- reflow-if-needed, paint, swap --
+        # runs that real work synchronously from inside GLFW's own nested
+        # loop (same thread, same GL context, so it's safe), which is what
+        # actually makes a resize track the pointer live rather than just
+        # snapping into place on release.
+        g.set_window_size_callback(w, self._live_redraw)
+        g.set_framebuffer_size_callback(w, self._live_redraw)
+        g.set_window_refresh_callback(w, self._live_redraw)
 
     def close(self):
         destroy = getattr(self.glfw, 'destroy_cursor', None)
@@ -1247,8 +1683,12 @@ class WindowInput:
                 destroy(cursor)
         self._cursors.clear()
 
-    def _mark_dirty(self, *_args):
-        self.view.dirty = True
+    def _live_redraw(self, *_args):
+        g = self.glfw
+        sync_window_size(self.view, self.window, g)
+        if self.view.dirty:
+            self.renderer.draw(self.view, g.get_framebuffer_size(self.window))
+            g.swap_buffers(self.window)
 
     def _command_pressed(self, mods):
         return bool(mods & (self.glfw.MOD_CONTROL | self.glfw.MOD_SUPER))
@@ -1288,10 +1728,21 @@ class WindowInput:
             or ((mods & g.MOD_SUPER) and key == g.KEY_RIGHT_BRACKET)
         )
 
-        if key == g.KEY_F10:
+        if key == g.KEY_F8:
+            self.view.toggle_view_source()
+        elif key == g.KEY_F9:
+            self.view.toggle_stylesheets()
+        elif key == g.KEY_F10:
             self.view.toggle_perf()
         elif key == g.KEY_F12:
             self.view.toggle_console()
+        elif command and key == g.KEY_C and self.view.text_selection is not None:
+            g.set_clipboard_string(self.window, self.view.selected_text())
+        elif command and key == g.KEY_S:
+            saved = self.view.save_hovered_image(*g.get_cursor_pos(self.window))
+            if saved:
+                self.view.status = f'Saved image to {saved}'
+                self.view.dirty = True
         elif self.view.console_open:
             self._console_key(key, command)
         elif command and key == g.KEY_L:
@@ -1378,13 +1829,32 @@ class WindowInput:
 
     def on_mouse_button(self, _window, button, action, _mods):
         g = self.glfw
-        if button == g.MOUSE_BUTTON_LEFT and action == g.PRESS:
-            self.view.click(*g.get_cursor_pos(self.window))
+        if button != g.MOUSE_BUTTON_LEFT:
+            return
+        x, y = g.get_cursor_pos(self.window)
+        if action == g.PRESS:
+            # A toolbar press (back/address bar/reload) always acts
+            # immediately, same as before -- only a press over the page
+            # itself might turn into a text-selection drag, so only that
+            # one defers its `click()` to release (see `on_mouse_button`'s
+            # `RELEASE` branch below). The page area is inert while
+            # view-source (F8) covers it -- nothing under the pointer there
+            # is what's actually on screen.
+            if y < TOOLBAR:
+                self.view.click(x, y)
+            elif not self.view.view_source_open:
+                self.view.begin_selection(x, y)
+        elif action == g.RELEASE:
+            was_pending = self.view._mouse_down_pos is not None
+            selected = self.view.end_selection()
+            if was_pending and not selected:
+                self.view.click(x, y)
 
     def on_scroll(self, _window, _dx, dy):
         self.view.scroll(-dy * 40)
 
     def on_cursor_pos(self, _window, x, y):
+        self.view.update_selection(x, y)
         kind = self.view.cursor_kind(x, y)
         if kind == self._last_cursor_kind:
             return
@@ -1427,7 +1897,7 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
         renderer = GLRenderer()
         view = View(*glfw.get_window_size(win))
         navigation = Navigation(view)
-        input_controller = WindowInput(glfw, win, view)
+        input_controller = WindowInput(glfw, win, view, renderer)
         input_controller.install()
 
         # `GLFWWindowHost` gives each loaded page's `document.defaultView`
@@ -1467,26 +1937,43 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
         current_title = title
 
         while not glfw.window_should_close(win):
-            sync_window_size(view, win, glfw)
-            host.sync_state()
+            # Everything in this block touches the currently loaded page
+            # (DOM events, RAF callbacks, resource/deferred-layout polling)
+            # -- `relayout()`/`commit_page()` already catch their own
+            # failures, but this is the backstop for anything else in here
+            # that a sufficiently unusual page could still trip. Without it,
+            # any escaping exception unwinds straight out of this loop and
+            # takes the whole browser process down over one bad page/value;
+            # logging + a status message keeps the window (and every other
+            # tab's worth of functionality this app has, i.e. navigation)
+            # usable instead.
+            try:
+                sync_window_size(view, win, glfw)
+                host.sync_state()
 
-            # `Window.requestAnimationFrame` already routes to
-            # `host.request_animation_frame` instead of domonic's headless
-            # `threading.Timer` fallback whenever a host is attached (see
-            # `Window.requestAnimationFrame`/`.cancelAnimationFrame`) -- so
-            # callbacks just sit queued on the host until flushed here, tied
-            # to this render loop's own cadence rather than a background
-            # timer thread racing chromonic's layout/paint. Flushed before
-            # `poll_deferred_work()` so a callback's DOM/style mutations are
-            # picked up by the same frame's layout pass, not the next one;
-            # `request_relayout()`'s default zero delay means that deferred
-            # pass fires immediately, in this same iteration.
-            if host.window is not None and host.flush_animation_frames(host.window.performance.now() * 1000.0):
-                view.request_relayout()
+                # `Window.requestAnimationFrame` already routes to
+                # `host.request_animation_frame` instead of domonic's
+                # headless `threading.Timer` fallback whenever a host is
+                # attached (see `Window.requestAnimationFrame`/
+                # `.cancelAnimationFrame`) -- so callbacks just sit queued
+                # on the host until flushed here, tied to this render
+                # loop's own cadence rather than a background timer thread
+                # racing chromonic's layout/paint. Flushed before
+                # `poll_deferred_work()` so a callback's DOM/style
+                # mutations are picked up by the same frame's layout pass,
+                # not the next one; `request_relayout()`'s default zero
+                # delay means that deferred pass fires immediately, in
+                # this same iteration.
+                if host.window is not None and host.flush_animation_frames(host.window.performance.now() * 1000.0):
+                    view.request_relayout()
 
-            navigation.poll()
-            view.poll_images()
-            view.poll_deferred_work()
+                navigation.poll()
+                view.poll_images()
+                view.poll_deferred_work()
+            except Exception as error:
+                _log.exception("chromonic: frame update failed for %s", view.url)
+                view.status = f"Chromonic cannot currently support this page: {error}"
+                view.dirty = True
 
             wanted_title = view.page_title or title
             if wanted_title != current_title:

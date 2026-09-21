@@ -114,19 +114,45 @@ browser.run()
 ```
 
 
-## Direct GPU browser (`browse2.py`)
+## Direct GPU browser (`ibrowse.py`)
 
 ```bash
-python examples/browse2.py https://example.com/
+python examples/ibrowse.py https://example.com/
 python -m pytest tests
 python chromonic/benchmarks/smoke_native.py
-python chromonic/examples/browse2.py https://example.com/ --frames 2
+python chromonic/examples/ibrowse.py https://example.com/ --frames 2
 ```
 
-Press `F12` for a devtools-style console (green-on-black, drops down from the
-toolbar). It evaluates input as Python against the loaded page's `document`/
-`window`, so JS-style one-liners like `document.getElementById('x').textContent`
-work as-is since domonic's DOM mirrors the real API.
+### Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `F5` / `Cmd+R` | Reload the current page |
+| `F8` | Toggle view-source: the page's raw fetched HTML, monospaced |
+| `F9` | Toggle author stylesheets on/off (page CSS off still keeps chromonic's own UA defaults, so a heading still looks like a heading -- useful for isolating a page's own styling from layout bugs) |
+| `F10` | Toggle the performance HUD (layout/frame timings, image cache stats) |
+| `F12` | Toggle a devtools-style console (green-on-black, drops down from the toolbar). Evaluates input as Python against the loaded page's `document`/`window`, so JS-style one-liners like `document.getElementById('x').textContent` work as-is since domonic's DOM mirrors the real API |
+| `Cmd+L` | Focus the address bar |
+| `Option+Left` / `Cmd+[` | Back |
+| `Option+Right` / `Cmd+]` | Forward |
+| `Up` / `Down` / `Page Up` / `Page Down` / `Space` / `Shift+Space` / `Home` / `End` | Scroll the page (or, while `F8`'s view-source is open, the source text) |
+| Click-drag over page text | Select it (highlighted); `Cmd+C` copies the selection as plain text |
+| Hover an image, `Cmd+S` | Save it to `~/Desktop` (its exact original bytes/format when available, not a re-encode) -- the closest equivalent to dragging it out, since there's no OS drag-*source* API this browser can hook into |
+| Click a link/button, or the address bar | Navigate / edit, as usual |
+
+Address-bar editing and the `F12` console additionally support the usual mac
+text-field bindings while focused: `Left`/`Right`/`Home`/`End`/`Backspace`/
+`Delete`, `Option+Left`/`Option+Right` to move by word, `Shift` to extend a
+selection, and `Cmd+V` to paste.
+
+### Local files
+
+Typing or dropping a local file's path (or a `file://` URI) onto the window
+navigates to it, same as any other address. An `.html` file renders normally;
+an image (`.png`/`.jpg`/`.gif`/`.webp`/...) shows as an image, with its path
+in the address bar; anything else recognized as text shows as plain,
+monospaced text -- none of it is parsed as markup. Dropping several files at
+once opens the first and ignores the rest.
 
 
 ## Web fonts

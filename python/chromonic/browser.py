@@ -8,7 +8,9 @@ JS bridge, PNG transport, or base64 frame swapping.
 from __future__ import annotations
 
 import base64
+import html
 import json
+import mimetypes
 import re
 from types import SimpleNamespace
 import urllib.parse
@@ -19,9 +21,12 @@ import urllib.request
 from . import (
     domonic_ch_unit_patch,
     domonic_ex_unit_patch,
+    domonic_flex_flow_patch,
     domonic_presentational_hint_patch,
     domonic_print_media_patch,
     domonic_selector_fallback_patch,
+    domonic_stylesheet_disabled_patch,
+    domonic_var_font_size_patch,
     hittest,
     tree,
     window,
@@ -49,6 +54,14 @@ def _normalize_address(value: str) -> str:
         return "http://127.0.0.1" + value
 
     lowered = value.lower()
+
+    # An absolute/relative filesystem path or an explicit `file:` URI --
+    # left alone rather than falling through to the "looks like a domain"
+    # branch below, which would otherwise mangle e.g. `/Users/x/photo.png`
+    # into `https:///Users/x/photo.png` (it has a dot and no space, so it
+    # matched that check too) instead of loading the local file.
+    if value.startswith(("/", "~/", "./", "../")) or lowered.startswith("file:"):
+        return value
 
     if lowered.startswith(
         (
@@ -101,14 +114,21 @@ def _local_path(value: str) -> Path:
 
 
 def _validate_navigable(url: str) -> None:
-    """Only allow absolute http(s) URLs."""
+    """Allow an absolute http(s) URL, or a reference to a local file: a
+    `file:` URI, or a plain/`~`/relative filesystem path (what dropping a
+    file onto the window, or typing its path into the address bar, produces
+    after `_normalize_address` leaves it alone -- see its own docstring).
+    Any other scheme (`javascript:`, `data:`, `ftp:`, ...) is rejected as a
+    navigation target, the same as before this allowed local files too."""
+    if _is_url(url):
+        return
     parsed = urllib.parse.urlparse(url)
-
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError(
-            "chromonic's browser only navigates absolute "
-            f"http(s) URLs, got: {url!r}"
-        )
+    if parsed.scheme in ("", "file"):
+        return
+    raise ValueError(
+        "chromonic's browser only navigates absolute http(s) URLs or a local file, "
+        f"got: {url!r}"
+    )
 
 
 def warm_interpreter() -> None:
@@ -175,6 +195,44 @@ def _apply_presentational_attributes(document) -> None:
             element._chromonic_presentational_hints = hints
 
 
+def _synthetic_local_page(path: Path) -> "tuple[str, str] | None":
+    """A minimal HTML wrapper for a local file that isn't itself HTML, plus
+    what `page.source` (view-source, F8) should show for it -- or `None` to
+    fall through to parsing `path`'s own content as HTML, unchanged.
+
+    A real browser doesn't try to parse a dropped/navigated-to image or
+    plain-text file as markup; it synthesizes a trivial document around it
+    instead (an image viewer page for the former, a monospace `<pre>` for
+    the latter). `_load_local` needs the same distinction -- without it, an
+    image's binary bytes either fail UTF-8 decoding outright or, for a
+    plain-text file, render unstyled and with its whitespace/newlines
+    collapsed by ordinary HTML flow instead of preserved.
+
+    Detection is by extension only (`mimetypes.guess_type`) -- deliberately
+    no content-sniffing; an unrecognized or missing extension keeps today's
+    behavior (parse as HTML) rather than guessing further."""
+    guessed, _encoding = mimetypes.guess_type(str(path))
+    if guessed is None or guessed == "text/html":
+        return None
+    title = html.escape(path.name)
+    if guessed.startswith("image/"):
+        return (
+            f"<!DOCTYPE html><html><head><title>{title}</title></head>"
+            f'<body style="margin:0"><img src="{html.escape(path.resolve().as_uri())}"></body></html>',
+            None,
+        )
+    if guessed.startswith("text/"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        wrapped = (
+            f"<!DOCTYPE html><html><head><title>{title}</title></head>"
+            f'<body style="margin:8px"><pre style="font-family:monospace;'
+            f'white-space:pre-wrap;word-wrap:break-word;margin:0">'
+            f"{html.escape(text)}</pre></body></html>"
+        )
+        return (wrapped, text)
+    return None
+
+
 def _load_local(url: str):
     from myjs import Page
     from myjs._engine import JSError
@@ -239,6 +297,13 @@ def _load_local(url: str):
                                                name="Error"))
 
     source = _local_path(url)
+    synthetic = _synthetic_local_page(source)
+
+    if synthetic is not None:
+        wrapped_html, view_source_text = synthetic
+        page = FontAwarePage(wrapped_html, base_dir=source.parent, url=source.as_uri(), run=False)
+        page.source = view_source_text
+        return page
 
     page = FontAwarePage.load(
         source,
@@ -247,6 +312,15 @@ def _load_local(url: str):
 
     # Keep a URL-shaped base for relative CSS/images/fonts.
     page.url = source.as_uri()
+    # The raw bytes as fetched, before myjs/domonic parsed them -- what
+    # `native_browser.py`'s view-source (F8) shows. Best-effort: a page this
+    # far into loading successfully has already been read once, so this
+    # essentially never fails, but view-source itself isn't worth failing
+    # the whole navigation over if it somehow does.
+    try:
+        page.source = source.read_text(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 -- view-source unavailable is not a load failure
+        page.source = None
 
     return page
 
@@ -303,12 +377,27 @@ def _load_remote(url: str, *, method: str = "GET", data=None, http_session=None)
 
     session = http_session or _shared_http_session()
     response = session.request(method, url, data=data, timeout=30, allow_redirects=True)
-    document = _parse(_RequestsResponseAdapter(response), None, css=True, attach=True)
+    # `_parse(css=True)` fetches every `<link rel=stylesheet>` itself, via a
+    # bare `requests.request(...)` with no headers of its own -- unlike the
+    # page fetch above, that call never goes through `session`, so it never
+    # gets `session`'s identifying User-Agent. Plenty of real sites (Wikipedia
+    # confirmed directly: `403 Please set a user-agent...`) reject the
+    # resulting anonymous request outright, silently leaving every external
+    # stylesheet at 0 rules -- the same class of block `_shared_http_session`
+    # already exists to dodge for the page itself, just not wired through to
+    # this second, independent fetch path.
+    document = _parse(
+        _RequestsResponseAdapter(response), None, css=True, attach=True,
+        request_kwargs={"headers": dict(session.headers)},
+    )
     default_view = getattr(document, "defaultView", None)
     page = SimpleNamespace(
         document=document,
         url=response.url,
         session=SimpleNamespace(window=default_view),
+        # The raw response body, before domonic parsed it -- what
+        # `native_browser.py`'s view-source (F8) shows.
+        source=response.text,
     )
     return page
 

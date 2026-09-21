@@ -134,3 +134,44 @@ That makes spec-style RAF code that divides by 1000 appear frozen because it
 is running 1000x too slowly. Chromonic's GLFW hosts temporarily multiply the
 timestamp by 1000 when flushing queued RAF callbacks; domonic should either
 make `Performance.now()` return milliseconds or convert at RAF dispatch.
+
+
+
+3
+
+------
+
+Found fixing real-site rendering (Wikipedia), all patched in
+`domonic_*_patch.py`:
+
+- `_scrape._load_external_stylesheets`/`_fetch_one` fetch every `<link
+  rel=stylesheet>` with no headers, so any site that 403s an anonymous
+  `requests` UA (Wikipedia does) silently gets 0 rules from every external
+  stylesheet. Patched by passing `_load_remote`'s own session headers
+  through as `request_kwargs`.
+- `_cssom.expand_shorthand`'s generic single-token branch broadcasts that
+  token to every longhand -- wrong for `flex-flow`, whose two longhands
+  have disjoint keyword sets (`flex-flow:row` set `flex-wrap:row`, which
+  then crashed the Rust layout engine outright). Patched in
+  `domonic_flex_flow_patch.py`.
+- `ComputedStyleDeclaration._font_size_px` reads its raw `font-size`
+  without expanding `var()` first (every other property already does this
+  before `_to_used_length`), so `font-size: var(--x, 0.875rem)` -- common
+  on any site using CSS custom-property design tokens -- silently computes
+  as the inherited size instead. Patched in
+  `domonic_var_font_size_patch.py`.
+
+
+
+4
+
+------
+
+Found building the stylesheets on/off toggle (F9): `CSSStyleSheet.
+disabled` is a plain, inert `bool` -- the cascade never checks it at all,
+and even fixed, toggling it wouldn't invalidate either the per-document
+rule-index cache or the per-element computed-style cache, both keyed on
+`_cssom.stylesheet_epoch()`, which only `insertRule`/`deleteRule`/
+`replace(Sync)` bump. Patched in `domonic_stylesheet_disabled_patch.py`:
+`_build_rule_index` now skips disabled sheets, and `disabled` is a real
+property that bumps the epoch when it actually changes.

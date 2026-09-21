@@ -27,6 +27,7 @@ from __future__ import annotations
 import functools
 import re
 import urllib.parse
+from collections import namedtuple
 
 import skia
 
@@ -350,6 +351,76 @@ def _paint_style(element) -> dict:
     return _tree._extract_paint_style(ComputedStyleDeclaration(element))
 
 
+#: One rendered line of an element's own text: `x`/`baseline_y` match exactly
+#: what `canvas.drawString(text, x, baseline_y, font, ...)` is given for it,
+#: so a caller measuring/highlighting against `font`/`text` lands on the same
+#: pixels that actually got painted. `element` is whichever node the text
+#: belongs to (the owning element, or an anonymous inline-fragment "element"
+#: for mixed inline content -- see `paint_element`'s own `fragments` handling).
+TextRun = namedtuple("TextRun", "x baseline_y width height font text element")
+
+
+def text_line_runs(element, box, style):
+    """This element's own text, broken into per-line paint geometry.
+
+    Extracted out of `paint_element` so text-selection hit-testing/highlight
+    rendering (`native_browser.py`) can share the *exact* same line-wrapping,
+    alignment, and baseline math the drawing path uses, rather than a second,
+    independently-derived approximation that could silently drift from what's
+    actually on screen. `paint_element` is the only other caller."""
+    lines = getattr(element, "_chromonic_text_lines", None)
+    if lines is None:
+        from . import tree as _tree
+        text = " ".join(_tree._rendering_text_content(element).split())
+        lines = [text] if text else []
+    if not lines or not any(lines):
+        return
+    padding = getattr(element, "_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
+    pad_top, pad_right, _pad_bottom, pad_left = padding
+    font_size = _px(style["font_size"], 16.0)
+    bold = _fontmetrics.is_bold(style["font_weight"])
+    italic = fonts.is_italic(style["font_style"])
+    font = _font(font_size, bold=bold, italic=italic, family=style["font_family"])
+    # Parley's own real per-font line height (`tree.py`'s `_make_measure`),
+    # not a re-derived Helvetica-table guess -- falls back to the same rough
+    # multiple used before Parley, for anything painted without a prior
+    # `tree.layout()` pass.
+    line_height = getattr(element, "_chromonic_line_height", None) or font_size * 1.2
+    text_x = box.x + box.border_left + pad_left
+    line_widths = getattr(element, "_chromonic_text_line_widths", [])
+    content_width = box.client_width - pad_left - pad_right
+    align = (style.get("text_align") or "").strip().lower()
+    # CSS Text 3 `text-align-last`: a block's own final formatted line uses
+    # this instead, when set to something other than the `auto` default
+    # (which just means "same as text-align").
+    align_last = (style.get("text_align_last") or "auto").strip().lower()
+    if align in ("start", "", "end") or align_last in ("start", "end"):
+        from . import tree as _tree
+        is_rtl = _tree._element_direction(element) == "rtl"
+        if align in ("start", ""):
+            align = "right" if is_rtl else "left"
+        elif align == "end":
+            align = "left" if is_rtl else "right"
+        if align_last == "start":
+            align_last = "right" if is_rtl else "left"
+        elif align_last == "end":
+            align_last = "left" if is_rtl else "right"
+    for index, line in enumerate(lines):
+        if not line:
+            continue
+        line_align = align_last if (index == len(lines) - 1 and align_last != "auto") else align
+        line_x = text_x
+        width = line_widths[index] if index < len(line_widths) else font.measureText(line)
+        if line_align == "center":
+            line_x += max(0.0, (content_width - width) / 2.0)
+        elif line_align in ("right", "end"):
+            line_x += max(0.0, content_width - width)
+        # a simple top-aligned baseline per line, line_height apart
+        baseline_y = box.y + box.border_top + pad_top + font_size + index * line_height
+        yield TextRun(x=line_x, baseline_y=baseline_y, width=width, height=line_height,
+                       font=font, text=line, element=element)
+
+
 def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
     box = element.__dict__.get("_layout_box") if box is None else box
     if box is None:
@@ -398,64 +469,10 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
             _is_element(child) for child in (element.childNodes or [])
         )
     if not has_layout_children:
-        # `tree.py`'s measure callback already word-wrapped this element's
-        # text to whatever width Taffy gave it and stashed the exact lines
-        # here (`_chromonic_text_lines`) -- paint draws precisely those, rather
-        # than re-wrapping (it doesn't have Taffy's resolved width to wrap
-        # against anyway, and shouldn't need to re-derive what layout
-        # already decided). Falls back to the unwrapped single line for
-        # anything painted without a prior `tree.layout()` pass.
-        lines = getattr(element, "_chromonic_text_lines", None)
-        if lines is None:
-            from . import tree as _tree
-            text = " ".join(_tree._rendering_text_content(element).split())
-            lines = [text] if text else []
-        if lines and any(lines):
-            padding = getattr(element, "_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
-            pad_top, _pad_right, _pad_bottom, pad_left = padding
-            font_size = _px(style["font_size"], 16.0)
-            bold = _fontmetrics.is_bold(style["font_weight"])
-            italic = fonts.is_italic(style["font_style"])
-            font = _font(font_size, bold=bold, italic=italic, family=style["font_family"])
-            # Parley's own real per-font line height (`tree.py`'s
-            # `_make_measure`), not a re-derived Helvetica-table guess --
-            # falls back to the same rough multiple text leaves used before
-            # Parley, for anything painted without a prior `tree.layout()`.
-            line_height = getattr(element, "_chromonic_line_height", None) or font_size * 1.2
-            text_color = _color(style["color"]) or skia.Color4f(0, 0, 0, 1)
-            text_x = box.x + box.border_left + pad_left
-            paint_ = skia.Paint(Color4f=text_color, AntiAlias=True)
-            line_widths = getattr(element, "_chromonic_text_line_widths", [])
-            content_width = box.client_width - pad_left - _pad_right
-            align = (style.get("text_align") or "").strip().lower()
-            # CSS Text 3 `text-align-last`: a block's own final formatted
-            # line uses this instead, when set to something other than the
-            # `auto` default (which just means "same as text-align").
-            align_last = (style.get("text_align_last") or "auto").strip().lower()
-            if align in ("start", "", "end") or align_last in ("start", "end"):
-                from . import tree as _tree
-                is_rtl = _tree._element_direction(element) == "rtl"
-                if align in ("start", ""):
-                    align = "right" if is_rtl else "left"
-                elif align == "end":
-                    align = "left" if is_rtl else "right"
-                if align_last == "start":
-                    align_last = "right" if is_rtl else "left"
-                elif align_last == "end":
-                    align_last = "left" if is_rtl else "right"
-            for index, line in enumerate(lines):
-                if not line:
-                    continue
-                line_align = align_last if (index == len(lines) - 1 and align_last != "auto") else align
-                line_x = text_x
-                if index < len(line_widths):
-                    if line_align == "center":
-                        line_x += max(0.0, (content_width - line_widths[index]) / 2.0)
-                    elif line_align in ("right", "end"):
-                        line_x += max(0.0, content_width - line_widths[index])
-                # a simple top-aligned baseline per line, line_height apart
-                baseline_y = box.y + box.border_top + pad_top + font_size + index * line_height
-                canvas.drawString(line, line_x, baseline_y, font, paint_)
+        text_color = _color(style["color"]) or skia.Color4f(0, 0, 0, 1)
+        paint_ = skia.Paint(Color4f=text_color, AntiAlias=True)
+        for run in text_line_runs(element, box, style):
+            canvas.drawString(run.text, run.x, run.baseline_y, run.font, paint_)
 
     # Direct text nodes in mixed inline content (and any `::before`/
     # `::after` generated-content box, see `tree.py`'s `_PseudoElement`)

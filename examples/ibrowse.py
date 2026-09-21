@@ -1,7 +1,7 @@
 """Direct GPU Skia browser: no webview, PNG encoding, or image frame transport.
 
 Install: make develop
-Run: .venv/bin/python chromonic/examples/browse2.py [https://example.com/]
+Run: .venv/bin/python chromonic/examples/ibrowse.py [https://example.com/]
 """
 import argparse
 from pathlib import Path
