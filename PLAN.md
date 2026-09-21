@@ -29,13 +29,14 @@ CSS2/visudet/ - 7/40 PASSING (was 2/40 at the start of this folder). Built:
   Remaining: font-metric rendering noise, and `line-height:normal` only
   using the first font in a fallback list instead of the tallest actually
   used -- not attempted, `fonts.text_metrics` too hot/shared to change safely.
-CSS2/positions/ - 50%
+CSS2/positions/ - ~50%
 CSS2/box-display/
 CSS2/margin-padding-clear/ - 86 failed / 69 errors (out of 739 total)
 CSS2/linebox/
-CSS2/normal-flow/ 524 passed / 230 failed / 37 errors
-
-
+CSS2/normal-flow/ - 524 passed / 230 failed / 37 errors
+CSS2/table/ - ~40% (of 1239 fixtures)
+CSS2/backgrounds - 173/200 PASSING
+CSS2/colors
 left todo: rest of CSS2/, css-box/, css-display/, css-position/, css-flexbox/, css-text/
 
 Agent should NOT run full suite of tests between fixes. It takes too long and waiting ages per fix is not productive. Instead run full verification between batches of fixes.
