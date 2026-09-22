@@ -20,6 +20,22 @@ def _rect_dict(x, y, width, height):
 
 
 def _fragments(element, rect):
+    result = _own_fragments(element, rect)
+    # Text a CSS 2.1 9.2.1.1 anonymous block box (`tree._wrap_inline_runs`)
+    # or a 17.2.1 anonymous table object (`tree._wrap_missing_table_boxes`
+    # -- a cell generated around a row's loose text, or a row-and-cell pair
+    # around a table's) took over from this element is still *this
+    # element's* text to Chrome (`Range.getClientRects()` on its own text
+    # nodes) -- reported here in DOM order alongside anything the element
+    # laid out itself. Recursive: an anonymous row's own cell is stored on
+    # the row.
+    for anonymous in (element.__dict__.get("_chromonic_anonymous_table_boxes") or {}).values():
+        if anonymous.get_layout_box() is not None:
+            result["text"].extend(_fragments(anonymous, anonymous.get_layout_box())["text"])
+    return result
+
+
+def _own_fragments(element, rect):
     if element.get_layout_box() is None:
         return {"element": [], "text": []}
     inline_boxes = getattr(element, "_chromonic_inline_boxes", None)
@@ -61,6 +77,12 @@ def _fragments(element, rect):
             glyph_height = glyph_ascent + glyph_descent
             half_leading = math.floor((line_height - glyph_height) / 2) if line_height else 0.0
             for index, text in enumerate(lines):
+                # Same as the text-lines path below: Chrome's probe skips
+                # a text node whose `textContent.trim()` is empty (JS
+                # `trim()` strips U+00A0 too -- position-relative-033.xht's
+                # six `&nbsp;` nodes report no text rects at all).
+                if not (text or "").strip():
+                    continue
                 leading = float(margins[3]) if index == 0 else 0.0
                 trailing = float(margins[1]) if index == len(lines) - 1 else 0.0
                 text_rects.append(_rect_dict(box.x - leading, box.y + index * line_height + half_leading,
@@ -72,9 +94,19 @@ def _fragments(element, rect):
     text_rects = []
     if lines and not getattr(element, "_chromonic_has_layout_children", False):
         padding = getattr(element, "_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
-        y = rect.y + element.get_layout_box().border_top + padding[0]
+        # A table cell's `vertical-align: middle`/`bottom` content offset
+        # (`tree._align_table_cell_content`) -- the same shift `paint.py`
+        # applies when drawing these lines.
+        y = (rect.y + element.get_layout_box().border_top + padding[0]
+             + float(getattr(element, "_chromonic_content_offset_y", 0.0) or 0.0))
         widths = getattr(element, "_chromonic_text_line_widths", [])
         for index, text in enumerate(lines):
+            # Chrome's probe (`chrome_runner._instrument`) skips any text
+            # node whose `textContent.trim()` is empty -- JS `trim()` strips
+            # U+00A0 too, so a `<div>&nbsp;</div>` reports no text rect at
+            # all; Python's `str.strip()` matches that exactly.
+            if not (text or "").strip():
+                continue
             width = widths[index] if index < len(widths) else rect.width
             paint_style = getattr(element, "_chromonic_paint_style", {})
             font_size = _fontmetrics.parse_length(paint_style.get("font_size"), default=16.0)

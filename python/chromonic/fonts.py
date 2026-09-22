@@ -22,13 +22,20 @@ from functools import lru_cache
 # getting Skia's own default -- already a sans-serif-ish system font on
 # every platform this repo targets -- needs no translation).
 _GENERIC_FAMILIES = {
-    "serif": "Times New Roman",
+    # "Times", not "Times New Roman": Chrome on macOS resolves the generic
+    # `serif` to the system Times (Times.ttc), whose vertical metrics differ
+    # from Times New Roman's by about a pixel at 20px (a 23px vs 22px glyph
+    # box) -- the 1px text-rect offset every `font: 1.25em/1.2 serif`
+    # reference block in `wpt/css/CSS2/tables/fixed-table-layout-003b*`
+    # showed against Chrome, with the geometry itself already matching.
+    # Same face the UA default body text already uses.
+    "serif": "Times",
     "sans-serif": None,
     "monospace": "Menlo" if sys.platform == "darwin" else "Courier New",
     "cursive": "Comic Sans MS",
     "fantasy": "Papyrus",
     "system-ui": None,
-    "ui-serif": "Times New Roman",
+    "ui-serif": "Times",
     "ui-sans-serif": None,
     "ui-monospace": "Menlo" if sys.platform == "darwin" else "Courier New",
     # Browser-internal "use the OS UI font" keywords, not real family names

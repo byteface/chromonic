@@ -26,17 +26,7 @@ TOOLBAR = 44
 # maximum latency so a page streaming resources continuously still gets
 # periodic geometry updates rather than postponing layout forever.
 _IMAGE_RELAYOUT_INTERVAL = 0.2
-_MAX_DEFERRED_LAYOUT_LATENCY = 0.5
-
-# A live window drag calls `resize()` on every intermediate size GLFW
-# reports. A page whose relayout comfortably fits this budget can just run
-# it live, on every one of those ticks, and track the window fluidly instead
-# of stretching the last completed frame to fit and snapping to real layout
-# once the drag pauses. 12ms leaves headroom within a 60fps (~16.7ms) frame
-# for paint/swap on top of layout itself; a page too expensive for that
-# still falls back to the old coalesced-until-idle behavior so a live
-# resize doesn't start dropping frames or lagging input.
-_LIVE_RESIZE_BUDGET_MS = 12.0
+_MAX_DEFERRED_LAYOUT_LATENCY = 0.15
 
 
 def _clipboard_text(glfw_module, window):
@@ -218,9 +208,7 @@ def sync_window_size(view, window, glfw_module):
     logical_size = glfw_module.get_window_size(window)
     if logical_size == (view.width, view.height):
         return False
-    # During a live window drag, don't run a full CSS+Taffy pass for every
-    # intermediate size. Paint immediately and settle geometry shortly after.
-    view.resize(*logical_size, defer=True)
+    view.resize(*logical_size)
     return True
 
 
@@ -256,14 +244,18 @@ class View:
         self.input_caret = 0
         self.navigation_handler = None
         # Page text selection (independent of `select_anchor`/`caret` above,
-        # which are the address bar's own). `_selectable_runs` is every line
-        # of rendered text as a `paint.TextRun`, rebuilt alongside the
-        # display list (`relayout()`/`rebuild_display_list()`) -- what
-        # `text_selection` (`(start_run, start_char, end_run, end_char)`,
-        # in document order, or `None`) indexes into. `_mouse_down_pos` and
+        # which are the address bar's own). `_selectable_runs` (a property,
+        # see below) is every line of rendered text as a `paint.TextRun` --
+        # what `text_selection` (`(start_run, start_char, end_run, end_char)`,
+        # in document order, or `None`) indexes into. It's only ever read
+        # from selection hit-testing/highlighting, not from painting, so it's
+        # built lazily on first read after `display_list` changes rather than
+        # eagerly alongside it (`relayout()`/`rebuild_display_list()` mark it
+        # dirty instead of rebuilding it). `_mouse_down_pos` and
         # `_selection_drag_anchor` are transient press-drag-release state;
         # see `begin_selection`/`update_selection`/`end_selection`.
-        self._selectable_runs = []
+        self._selectable_runs_cache = []
+        self._selectable_runs_dirty = False
         self.text_selection = None
         self._mouse_down_pos = None
         self._selection_drag_anchor = None
@@ -341,13 +333,16 @@ class View:
             page = (self.loader(url) if method == 'GET' and data is None
                     else browser.load(url, method=method, data=data))
             return self.commit_page(page, url, mode=mode, jump_index=jump_index)
-        except Exception as error:
+        except BaseException as error:
             # `commit_page` (title/history/window-attach, on top of the
             # `relayout()` it triggers) is inside this same `try` -- a page
             # tripping a bug anywhere in that pipeline must land back here
             # as a status message, not crash the process. `relayout()`
-            # already catches its own layout/paint failures; this is the
-            # broader net for everything around it.
+            # already catches its own layout/paint failures (panics
+            # included -- see `tree.is_rust_panic`); this is the broader
+            # net for everything around it, so it needs the same widening.
+            if not (isinstance(error, Exception) or tree.is_rust_panic(error)):
+                raise
             _log.exception("chromonic: navigation failed for %s", url)
             self.status = f"Chromonic cannot currently support this page: {error}"
             self.loading = False
@@ -484,6 +479,13 @@ class View:
     def _ema(previous, value, alpha=0.2):
         return value if previous <= 0 else previous + alpha * (value - previous)
 
+    @property
+    def _selectable_runs(self):
+        if self._selectable_runs_dirty:
+            self._selectable_runs_cache = _collect_selectable_runs(self.display_list)
+            self._selectable_runs_dirty = False
+        return self._selectable_runs_cache
+
     def rebuild_display_list(self):
         """Rebuild paint commands without touching CSS or geometry."""
         if self.page is None:
@@ -493,10 +495,11 @@ class View:
         self.display_list = paint.build_display_list(self.page.document.body)
         self._refresh_page_image_urls()
         # Geometry didn't change (this path is paint-only, see the
-        # docstring), so previously computed run indices stay valid --
-        # rebuilt anyway since it's cheap and keeps it in lockstep with
-        # `self.display_list`, but the active selection itself survives.
-        self._selectable_runs = _collect_selectable_runs(self.display_list)
+        # docstring), so previously computed run indices stay valid -- the
+        # active selection itself survives. Just mark the cache dirty rather
+        # than rebuild it now: `_selectable_runs` is lazy, rebuilt on first
+        # read (selection hit-testing/highlighting), not on every repaint.
+        self._selectable_runs_dirty = True
         self.last_display_list_ms = (time.perf_counter() - started) * 1000.0
         self.dirty = True
 
@@ -647,18 +650,26 @@ class View:
             # layout; don't walk the DOM again just to feed the profiler.
             self.dom_element_count = len(nodes)
             # Real geometry may have just changed underneath any run index a
-            # prior selection referenced -- rebuild the runs and drop the
-            # selection itself rather than risk it now pointing at the wrong
-            # text (a full layout pass, unlike `rebuild_display_list()`'s
+            # prior selection referenced -- drop the selection itself and
+            # mark the runs dirty rather than risk it now pointing at the
+            # wrong text (a full layout pass, unlike `rebuild_display_list()`'s
             # paint-only one, can genuinely change line-wrapping/positions).
-            self._selectable_runs = _collect_selectable_runs(self.display_list)
+            # Lazy: rebuilt on first read, not eagerly here.
+            self._selectable_runs_dirty = True
             self.text_selection = None
-        except Exception as error:
+        except BaseException as error:
+            # See `tree.is_rust_panic` -- a bare `except Exception:` here
+            # would never catch a real Rust-side panic (e.g. Taffy's
+            # SlotMap rejecting an already-removed node), defeating the
+            # whole point of this handler for exactly the failures a
+            # native layout engine is most likely to produce.
+            if not (isinstance(error, Exception) or tree.is_rust_panic(error)):
+                raise
             _log.exception("chromonic: layout/paint failed for %s", self.url)
             self.display_list = []
             self.content_height = 0.0
             self.scroll_y = 0.0
-            self._selectable_runs = []
+            self._selectable_runs_dirty = True
             self.text_selection = None
             self.status = f"Chromonic cannot currently render this page: {error}"
         self.last_layout_ms = (time.perf_counter() - started) * 1000.0
@@ -713,14 +724,19 @@ class View:
         self._last_image_relayout = time.monotonic()
         self.request_relayout(delay=_IMAGE_RELAYOUT_INTERVAL, reuse_styles=True)
 
-    def resize(self, width, height, *, defer=False):
+    def resize(self, width, height):
         if width > 0 and height > 0 and (width, height) != (self.width, self.height):
             self.width, self.height = width, height
-            if defer and self.avg_layout_ms > _LIVE_RESIZE_BUDGET_MS:
-                self.dirty = True
-                self.request_relayout(delay=0.06, reuse_styles=False)
-            else:
-                self.relayout()
+            # Just relayout. No pre-emptive guessing about whether this
+            # page/this tick can "afford" it -- a page too expensive to
+            # relayout on every resize tick makes the render loop take
+            # longer that iteration, which naturally paints fewer frames
+            # during the drag. That's a real, honest frame drop with
+            # every painted frame showing correct, current geometry --
+            # strictly better than a coalescing scheme that paints
+            # guaranteed-stale geometry against the live window bounds
+            # for a guessed-in-advance window of time.
+            self.relayout()
 
     def scroll(self, delta):
         if self.view_source_open:
@@ -1349,10 +1365,8 @@ class View:
         headings, `<body>` still has its usual margin) minus whatever the
         page's own CSS did, the same shape as a real browser's "no author
         styles" view rather than reverting all the way to raw CSS initial
-        values. `domonic_stylesheet_disabled_patch.py` makes the cascade
-        actually respect `.disabled` (it didn't before); `relayout()`'s
-        default `reuse_styles=False` already invalidates the cached rule
-        index this depends on."""
+        values. Domonic 1.8.4's cascade respects `.disabled` and invalidates
+        its stylesheet/rule-index cache when the flag changes."""
         if self.page is None:
             return
         self.stylesheets_enabled = not self.stylesheets_enabled
@@ -1598,12 +1612,17 @@ class Navigation:
         edit = (self.view.address, self.view.caret, self.view.select_anchor) if self.view.editing else None
         try:
             self.view.commit_page(page, url, mode=mode, jump_index=jump_index)
-        except Exception as error:
+        except BaseException as error:
             # `relayout()` (called from `commit_page`) already catches its
-            # own layout/paint failures -- this is the net for everything
-            # else in `commit_page` (title/history/window-attach), so a bug
-            # there surfaces as a status message instead of taking the
-            # whole render loop down with it.
+            # own layout/paint failures, panics included (see `tree.
+            # is_rust_panic`) -- this is the net for everything else in
+            # `commit_page` (title/history/window-attach), so a bug there
+            # surfaces as a status message instead of taking the whole
+            # render loop down with it. Widened to `BaseException` for the
+            # same reason as every other handler in this file: a bare
+            # `except Exception:` never actually catches a Rust panic.
+            if not (isinstance(error, Exception) or tree.is_rust_panic(error)):
+                raise
             _log.exception("chromonic: commit failed for %s", url)
             self.view.status = f"Chromonic cannot currently support this page: {error}"
             self.view.loading = False
@@ -1970,7 +1989,21 @@ def run(url='https://google.com/', *, width=1000, height=800, title='chromonic â
                 navigation.poll()
                 view.poll_images()
                 view.poll_deferred_work()
-            except Exception as error:
+            except BaseException as error:
+                # `except Exception:` alone never actually catches a Rust
+                # panic (`pyo3_runtime.PanicException` deliberately
+                # derives from `BaseException`, not `Exception` -- see
+                # `tree.is_rust_panic`) -- this is the outermost backstop
+                # for the whole per-frame work above, so it has to widen
+                # to `BaseException` and explicitly allow panics through
+                # too, or exactly the "one bad page takes the whole
+                # process down" failure this block exists to prevent still
+                # happens, just for a Rust-side bug instead of a Python
+                # one. `KeyboardInterrupt`/`SystemExit` (also `BaseException`)
+                # still propagate normally -- only a real panic is treated
+                # the same as any other recoverable per-frame failure here.
+                if not (isinstance(error, Exception) or tree.is_rust_panic(error)):
+                    raise
                 _log.exception("chromonic: frame update failed for %s", view.url)
                 view.status = f"Chromonic cannot currently support this page: {error}"
                 view.dirty = True

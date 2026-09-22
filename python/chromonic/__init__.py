@@ -27,7 +27,7 @@ __all__ = [
 
 
 def initialize() -> bool:
-    """Install explicit compatibility hooks before page scripts run."""
+    """Install the Path2D-preserving canvas adapter before page scripts run."""
     return domonic_canvas_patch.install()
 
 

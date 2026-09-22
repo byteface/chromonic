@@ -529,13 +529,29 @@ fn measure_via_python(
     let Some(callback) = callback else {
         return taffy::geometry::Size::ZERO;
     };
-    let as_opt = |s: AvailableSpace| -> Option<f32> {
-        match s {
-            AvailableSpace::Definite(v) => Some(v),
-            _ => None,
-        }
-    };
-    let result = callback.call1(py, (known_dimensions.width.or(as_opt(available_space.width)), known_dimensions.height.or(as_opt(available_space.height))));
+    // Width: a `MinContent` request (Taffy sizing a flex item's automatic
+    // minimum, `min-width: auto`, or a `min-content` track) is passed as
+    // the sentinel `-1.0` so the Python measure can wrap at every break
+    // opportunity and report its widest unbreakable piece; `MaxContent`
+    // stays `None` (lay out unconstrained). Both used to collapse to
+    // `None`, so every text item's minimum was its max-content width and
+    // never shrank (`css-flexbox/flex-minimum-width-flex-items-001.xht`:
+    // a 50px-Ahem "IT E" item in a 10px container measured 200px, never
+    // Chrome's 100px two-line minimum).
+    let width_arg = known_dimensions.width.or(match available_space.width {
+        AvailableSpace::Definite(v) => Some(v),
+        AvailableSpace::MinContent => Some(-1.0),
+        AvailableSpace::MaxContent => None,
+    });
+    let height_arg = known_dimensions.height.or(match available_space.height {
+        AvailableSpace::Definite(v) => Some(v),
+        _ => None,
+    });
+    // The known (already-resolved) dimensions are passed separately as a
+    // third and fourth argument: a text leaf wraps to whichever width it
+    // gets, but a replaced leaf (an `<img>` flex item) must only adopt a
+    // *known* size, never the available space it is merely offered.
+    let result = callback.call1(py, (width_arg, height_arg, known_dimensions.width, known_dimensions.height));
     match result.and_then(|r| r.extract::<(f32, f32)>(py)) {
         Ok((w, h)) => taffy::geometry::Size {
             width: known_dimensions.width.unwrap_or(w),

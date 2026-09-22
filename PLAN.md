@@ -1,5 +1,23 @@
 # objective: use the real web-platform-tests suite as a source of already-written CSS2.1/WPT test markup, run it through the Chrome-vs-chromonic geometry harness, and fix whatever chromonic gets wrong. If the issue is with domonic itself patch it for now, log it here so it can be fixed upstream. If the issue is with chromonic's own layer, fix it in this repo.
 
+Domonic 1.8.4 is now the pinned baseline. It incorporates the former
+Chromonic compatibility fixes for `currentcolor`, `:dir()`, `flex-flow`,
+`:link`/`:visited`, negative `line-height`, print media matching, selector
+fallback, stylesheet disabling, and `var()` font sizes, so the obsolete local
+patch modules were removed. It also separates cascade caching from layout-dependent used
+values and caches parsed selectors; on the 5,001-node/200-rule layout fixture,
+retained full-style relayout improved from 695 ms on 1.8.3 to 398 ms on 1.8.4,
+and cached-style relayout from 652 ms to 369 ms (both about 43%).
+
+Follow-up profiling on the same 5,001-node fixture removed two remaining
+unchanged-pass costs: `reuse_styles=True` now reuses the retained anonymous
+table/inline child projection instead of reclassifying the entire DOM, and
+the combined feature scan skips RTL and used-auto-margin correction walks
+when the page has neither feature. Cached relayout fell from 380 ms to 187 ms
+(51%); retained full-style relayout is 372 ms. Native Taffy compute remains
+about 10 ms, so the next material step is dirty-subtree reconciliation rather
+than more work inside the native solver.
+
 tests/layout/harness, and run the whole suite through it. The harness is already written, but needs a local checkout of the real web-platform-tests repo to run against.
 
 ``` bash
@@ -29,7 +47,11 @@ CSS2/visudet/ - 7/40 PASSING (was 2/40 at the start of this folder). Built:
   Remaining: font-metric rendering noise, and `line-height:normal` only
   using the first font in a fallback list instead of the tallest actually
   used -- not attempted, `fonts.text_metrics` too hot/shared to change safely.
-CSS2/positions/ - ~50%
+CSS2/positioning/ - 525/555 captured fixtures (95%) on a chromonic-only
+  replay against the Chrome baseline (23 scripted `dynamic-*`/uncaptured
+  fixtures excluded). Remaining: floats inside inline text, Chrome's
+  per-item client rects for undecorated ("culled") inlines, relative
+  offsets inside scrollable containers, a few inline-rect height details.
 CSS2/box-display/
 CSS2/margin-padding-clear/ - 86 failed / 69 errors (out of 739 total)
 CSS2/linebox/ - sampled ~250 fixtures. Fixed: negative `line-height`
@@ -39,7 +61,11 @@ CSS2/linebox/ - sampled ~250 fixtures. Fixed: negative `line-height`
   `vertical-align` offsets and inline-block baseline computation -- not
   attempted, same scope as the already-noted font-metric rendering noise.
 CSS2/normal-flow/ - 524 passed / 230 failed / 37 errors
-CSS2/table/ - ~40% (of 1239 fixtures)
+CSS2/table/ - 906/962 captured fixtures (94%) on a chromonic-only replay
+  against the Chrome baseline (5 Chrome-timeout fixtures uncaptured).
+  Remaining: script-toggled display and unexplained Chrome behaviour in
+  table-anonymous-objects, inline-table/float inside inline text,
+  abs-positioned cells, Chrome's per-word text rects in collapsed columns.
 CSS2/backgrounds - 173/200 PASSING
 CSS2/colors
 CSS2/positioning/ - swept in full (~575 fixtures). 11 chromonic (tree.py)
@@ -75,26 +101,24 @@ css-display/ - sampled (140 fixtures), not tractable this session: almost
   children render as if it weren't there) -- chromonic doesn't implement
   this at all, a real, sizeable feature (not a quick box-model fix), plus
   more unimplemented-feature/animation noise on top.
-css-flexbox/ - sampled (150 fixtures). A large fraction of the `abspos/`
-  subfolder is JS-testharness-only (no static geometry to compare) or the
-  same modern flex/grid-alignment-based abspos-centering gap already noted
-  under css-position/. Many of the remaining geometry mismatches across
-  css-flexbox (and, on reflection, scattered through every other folder
-  sampled this session) share one consistent ~11.9px per-element offset --
-  traced to real Chrome's `getComputedStyle().fontFamily` reporting the
-  literal string `"DejaVu Sans", "Bitstream Vera Sans", Arial, Sans` on
-  plain unstyled text, where chromonic falls back to `Times`. Neither
-  DejaVu Sans nor Bitstream Vera Sans (both Linux-only fonts) are
-  resolvable on this macOS dev machine either, in domonic's cascade or
-  presumably in headless Chrome's own font lookup -- this looks like
-  Chromium's own internal, environment-specific last-resort fallback for
-  a `sans-serif` generic family when no real font config is found, not
-  something driven by the page's CSS at all. A real fix would mean
-  matching Chrome's exact internal fallback font/metrics for this
-  specific headless-without-fontconfig case -- a deep, environment-
-  specific problem, not a narrow CSS logic bug; refines rather than
-  replaces the existing "font-metric rendering noise" note above, but
-  explains why it recurs so pervasively across unrelated folders/tests.
+css-flexbox/ - 694/1203 captured fixtures (58%; 1448 eligible, 210
+  `flags=dom` skipped, ~35 Chrome timeouts/untaggable). Full sweep in six
+  batches of 250 (`/tmp/wpt_flexbox_f1..f6`). Built this pass: flex items
+  are blockified (a container of inline/inline-block children no longer
+  takes the inline path), `inline-flex`/`inline-grid` as atomic inlines,
+  `order`, `direction: rtl` mirroring, abs-child static position per
+  `justify-content`/`align-self` (incl. `safe`, `self-start`, rtl),
+  `align-self: baseline` on real items, `safe` overflow fallback (cross
+  axis), `min-width: auto` = real min-content (new `MinContent` sentinel
+  in `src/lib.rs`), `width: min/max-content`, `flex-basis: content`,
+  indefinite % basis, stretched/ratio-sized `<img>`/`<canvas>` items,
+  `<br clear>` among floats, Box Alignment keyword normalisation, invalid
+  negative flex values. Harness: testharness.js's `html { font-family }`
+  and `#log` are mirrored into the tagged copy (the old "~11.9px offset"
+  was Arial vs Times). Remaining: vertical writing modes (88 fixtures),
+  `aspect-ratio`/img transfer sizes (~35), nested-container baselines,
+  `flex-wrap: balance` (tentative), calc(), CSS nesting, pseudo-element
+  items, `contain`, older captures with `#log` content (re-capture fixes).
 css-box/, css-text/ - both tiny (10 fixtures each), almost entirely CSS
   Animations tests (unimplemented feature, no static geometry).
 css/selectors/ - swept properly (365 fixtures). 3 real domonic fixes (see
@@ -140,15 +164,28 @@ returns `True`. Minor, pre-existing, not chromonic's to fix.
 ------
 
 
+`_ABSOLUTE_FONT_SIZE_KEYWORDS` in `domonic/style.py` scales the `font-size`
+keywords by CSS 2's 1.2 ratio (`small` 13.333px, `large` 18.667px); browsers
+use the HTML font-size table for a 16px medium: xx-small 9, x-small 10, small
+13, medium 16, large 18, x-large 24, xx-large 32, xxx-large 48 (Blink
+`FontSizeFunctions::FontSizeForKeyword`). Seen on `tables/table-height-
+algorithm-012.xht`. Worked around in `domonic_font_size_keywords_patch.py`
+(updates the table in place).
+
+
+------
+
+
 `CanvasRenderingContext2D._record` only stores `{name, args}` per drawing
 command, no snapshot of the style state (`fillStyle`/`strokeStyle`/
 `globalAlpha`/etc.) active when that command was called -- so replaying
 recorded commands later (chromonic's own paint path does this) uses
 whatever style is current at replay time instead of at record time,
 silently wrong the moment two draws with different styles are interleaved
-with a style mutation. Worked around in `domonic_canvas_patch.py`,
-overriding `_record` to snapshot the full style state alongside each
-command. Not patched upstream.
+with a style mutation. Domonic 1.8.4 now snapshots the style state itself,
+but still stringifies `Path2D` arguments and loses their commands; the narrowed
+`domonic_canvas_patch.py` remains only to preserve replayable path/gradient/
+pattern arguments for Chromonic's Skia command replay.
 
 
 ------
@@ -159,10 +196,8 @@ all -- `all`/`screen`/`print` all just unconditionally return `True`
 regardless of what's actually rendering. Confirmed directly: `@media
 print { ... }` applied during chromonic's own (always screen/interactive)
 rendering, hiding content and applying sizing rules real Chrome never
-does outside an actual print preview. Worked around in `domonic_print_
-media_patch.py`, wrapping `_evaluate` so `print` never matches (chromonic
-has no print/paged-media mode at all, so this is correct for every real
-use, not just a narrow fix). Not patched upstream.
+does outside an actual print preview. Fixed upstream in Domonic 1.8.4;
+the former local workaround was removed.
 
 
 ------
@@ -176,10 +211,8 @@ that whitelist (e.g. `div:nth-of-type(2)`) is silently never matched during
 cascade resolution, even though `Element.matches()` correctly matches the
 same selector (via a further `querySelectorAll()` fallback the cascade never
 calls). Confirmed directly: `div:nth-of-type(2) { line-height: 30px }` never
-applied to any element. Worked around in `domonic_selector_fallback_patch.py`,
-giving `_matchElement` the same per-compound bs4-backed fallback `_matches_
-selector_chain` already uses for each compound of a combinator chain. Not
-patched upstream.
+applied to any element. Fixed upstream in Domonic 1.8.4; the former local
+workaround was removed.
 
 
 ------
@@ -241,14 +274,14 @@ Found fixing real-site rendering (Wikipedia), all patched in
 - `_cssom.expand_shorthand`'s generic single-token branch broadcasts that
   token to every longhand -- wrong for `flex-flow`, whose two longhands
   have disjoint keyword sets (`flex-flow:row` set `flex-wrap:row`, which
-  then crashed the Rust layout engine outright). Patched in
-  `domonic_flex_flow_patch.py`.
+  then crashed the Rust layout engine outright). Fixed upstream in Domonic
+  1.8.4; the former local workaround was removed.
 - `ComputedStyleDeclaration._font_size_px` reads its raw `font-size`
   without expanding `var()` first (every other property already does this
   before `_to_used_length`), so `font-size: var(--x, 0.875rem)` -- common
   on any site using CSS custom-property design tokens -- silently computes
-  as the inherited size instead. Patched in
-  `domonic_var_font_size_patch.py`.
+  as the inherited size instead. Fixed upstream in Domonic 1.8.4; the former
+  local workaround was removed.
 
 
 
@@ -261,9 +294,8 @@ disabled` is a plain, inert `bool` -- the cascade never checks it at all,
 and even fixed, toggling it wouldn't invalidate either the per-document
 rule-index cache or the per-element computed-style cache, both keyed on
 `_cssom.stylesheet_epoch()`, which only `insertRule`/`deleteRule`/
-`replace(Sync)` bump. Patched in `domonic_stylesheet_disabled_patch.py`:
-`_build_rule_index` now skips disabled sheets, and `disabled` is a real
-property that bumps the epoch when it actually changes.
+`replace(Sync)` bump. Fixed upstream in Domonic 1.8.4; the former local
+workaround was removed.
 
 
 
@@ -279,9 +311,8 @@ digit sequence in it (`\45` survives unescaped from a CSS identifier hex
 escape domonic's tokenizer doesn't resolve, e.g. `color: g\re\45n`) is
 read by Python's `re` as a backreference to a nonexistent capture group,
 raising `re.PatternError` and aborting the whole layout pass over one
-CSS declaration. Patched in `domonic_currentcolor_replace_patch.py`: the
-same substitution via `re.sub`'s function form, never interpreted as a
-backreference template regardless of content. The escape-sequence gap
+CSS declaration. Fixed upstream in Domonic 1.8.4; the former local workaround
+was removed. The escape-sequence gap
 that leaves `\45` unresolved in the first place is separate and deeper
 (domonic's CSS tokenizer), not fixed.
 
@@ -297,10 +328,9 @@ disallows negative `line-height`, so real Chrome throws the whole
 declaration out (`getComputedStyle` reports `normal`), but domonic
 used-value-resolves e.g. `line-height: -1pc` straight to `"-16px"`. That
 negative value then reaches `chromonic.tree._resolved_line_height` as a
-real number and collapses the element's line box. Patched in
-`domonic_negative_line_height_patch.py`: wraps `_to_used_length`,
-substituting `"normal"` whenever a `line-height` used-value resolves
-negative. Same folder also showed `_to_used_length` never resolves `ex`
+real number and collapses the element's line box. Fixed upstream in Domonic
+1.8.4; the former local workaround was removed. Same folder also showed
+`_to_used_length` never resolves `ex`
 units for `line-height` at all (falls back to the generic `0.5em`
 placeholder `_length_string_to_px` uses when no real font metrics are
 available) -- extended the existing `domonic_ex_unit_patch.py` to also
@@ -318,15 +348,30 @@ pseudo-classes (present since CSS1) are never matched during the cascade
 at all -- `Element._STRUCTURAL_PSEUDO_CLASSES` (what `_parse_simple_
 selector` accepts) has no `link`/`visited` case, so a rule like `a:link
 { color: #000 }` silently never applies; every link kept chromonic's own
-UA-stylesheet blue instead of the page's real black. Patched in
-`domonic_link_pseudo_patch.py`: chromonic never simulates navigation
-history, so `:link` now matches any `<a>`/`<area>` with a non-empty
+UA-stylesheet blue instead of the page's real black. Fixed upstream in
+Domonic 1.8.4; the former local workaround was removed. Domonic never
+simulates navigation history, so `:link` matches any `<a>`/`<area>` with a non-empty
 `href` (the honest, privacy-safe stance a fresh browser profile already
 takes) and `:visited` never matches anything.
 
 
 
 8
+
+------
+
+Found in `CSS2/tables` (`border-spacing-001.xht`): `border-spacing: -1px`
+is accepted as-is by the cascade (`getComputedStyle` reports `"-1px"`) --
+CSS 2.1 17.6.1 says lengths "may not be negative", so the declaration is
+invalid and Chrome drops it, leaving the UA default `2px`. Worked around
+in `tree.py`'s table-root branch (a negative spacing falls back to 2px).
+Same for a percentage (`border-spacing-percentage-001.xht`: `20%` is
+invalid, Chrome keeps the earlier `0px`; domonic keeps the percentage and
+resolves it) -- read as 0 in `tree.py`. Not patched upstream.
+
+
+
+9
 
 ------
 
@@ -344,3 +389,147 @@ direction`, used elsewhere in this project for real layout, does) --
 resolving a full cascade from inside a bare selector-matching utility
 isn't a small change, and every real use of `:dir()` (this fixture
 included) drives it from the `dir` attribute alone.
+
+
+
+10
+
+------
+
+Found in `CSS2/positioning` (`left-offset-percentage-002.xht`,
+`relpos-calcs-005..007.xht`, `left-113.xht`): a percentage `top`/`right`/
+`bottom`/`left` is resolved by `ComputedStyleDeclaration._to_used_length`
+against the *viewport* width -- CSS 2.1 9.3.2 keeps the computed value
+as the percentage (resolved against the containing block at use, and
+`inherit` copies the percentage). Worked around in
+`domonic_ex_unit_patch.py` (the percentage string passes through
+unchanged). Not patched upstream.
+
+
+
+11
+
+------
+
+Found in `css-flexbox` (`align-items-001.htm` and 21 other BOM-prefixed
+`.htm` fixtures): a leading U+FEFF (UTF-8 byte-order mark) in the source
+is kept as a text node before `<!DOCTYPE>`, so the parser treats it as
+body text and demotes `<title>`/`<link>`/`<style>` into `<body>` after
+it (a rendered first line, everything 26px lower than Chrome). Chrome
+strips the BOM before parsing. Worked around in `browser.py`'s
+`_RequestsResponseAdapter.text()` (which also decodes an undeclared-
+charset body as UTF-8 rather than requests' ISO-8859-1 default). Not
+patched upstream.
+
+
+
+12
+
+------
+
+Found in `css-flexbox` (`align-items-baseline-row-horz.html`): the logical
+size properties `inline-size`/`block-size` and their `min-`/`max-` forms
+are not in `style.py`'s `_LOGICAL_ALIAS_LONGHANDS` table (which already
+maps `margin-inline-start`, `padding-block-end`, `inset-inline-start`...),
+so `inline-size: 100px` never becomes `width` and the element stays
+`auto`. Same for the `border-inline-start`/`border-block-end` side
+aliases. Patched in `domonic_logical_size_patch.py` (table extended in
+place, LTR horizontal only like the rest of the table). Not patched
+upstream.
+
+
+
+13
+
+------
+
+Found in `css-flexbox` (`align-self-baseline-with-flex-wrap.html`): CSS
+Nesting (`.row { width: 20px; .big { width: 30px } }`) is not parsed --
+the nested `.big` rule never applies (computed `width: auto`, Chrome
+`30px`). Not patched (a parser change); the fixture stays failing.
+
+
+
+14
+
+------
+
+Found in `css-flexbox` (`aspect-ratio-intrinsic-size-001.html`, `flex-
+aspect-ratio-cross-size-001.html`): the CSS Sizing 4 `aspect-ratio`
+property is not modelled -- `ComputedStyleDeclaration` has no
+`aspectRatio` and `LayoutStyle` carries nothing for it, so `aspect-ratio:
+2 / 1` never reaches layout (Taffy itself supports an aspect ratio, and
+`tree.py` already feeds it one for `<img>`). Not patched; the ~10
+`aspect-ratio` fixtures stay failing.
+
+
+
+15
+
+------
+
+Found in `css-flexbox` (the Mozilla `flexbox-*.xhtml` fixtures, e.g.
+`flexbox-justify-content-horiz-001a.xhtml`): an XHTML document is parsed
+with the HTML parser, so a self-closing non-void element (`<div class=
+"a"/>`) is read as an open tag and every following sibling nests inside
+it -- Chrome parses `application/xhtml+xml` as XML, where it is a
+complete empty element. Worked around in `browser.py`
+(`_expand_xhtml_self_closing_tags`: for an XHTML content type, XML
+prolog or XHTML namespace, `<tag .../>` becomes `<tag ...></tag>` for
+non-void tags before parsing). Not patched upstream.
+
+
+
+16
+
+------
+
+Found in `css-flexbox` (`flexbox-min-width-auto-001.html`'s `width:
+calc(10% + 50px)`, `auto-margins-001.html`'s `calc(100% - 4em)`,
+`flex-item-compressible-001.html`): `calc()` is never evaluated -- the
+value reaches `LayoutStyle` as an opaque `Keyword`, which
+`style_bridge._len()` drops to `auto`. Not patched (needs a real
+expression evaluator in the cascade, with percentages kept symbolic);
+these fixtures stay failing.
+
+
+
+17
+
+------
+
+Found in `css-flexbox` (`flexbox_flex-0-0-1-unitless-basis.html`,
+`flexbox_flex-0-0-N-unitless-basis.html`): `flex: 0 0 4` (a unitless,
+non-zero third value) is an invalid declaration that Chrome drops
+(leaving `flex: 0 1 auto`); domonic accepts it and reports `flex-basis:
+0%` (the same computed value it gives a valid `flex: 1 2 0`), so the
+items collapse to a 0 basis. Not patched (indistinguishable from a valid
+`0%` at the computed level); the two fixtures stay failing.
+
+
+
+18
+
+------
+
+Found in `css-flexbox` (`flexbox-mbp-horiz-003.xhtml` and its `-reverse`/
+`v` variants): an HTML comment (`<!-- ... -->`) between rules inside a
+`<style>` block makes the CSS parser drop the rule that follows it (the
+`.borderA` rule never applied, so three containers lost their borders).
+CSS Syntax 3 §5.4.1 ignores CDO/CDC tokens at the top level of a
+stylesheet, as Chrome does. Worked around in `browser.py`
+(`_strip_html_comments_in_style`, applied to fetched documents). Not
+patched upstream.
+
+
+
+19
+
+------
+
+Found in `css-flexbox` (`flexbox-safe-overflow-position-003.html`):
+`justify-content: safe flex-start` computes to plain `flex-start` -- the
+`safe` overflow-position prefix is dropped for `justify-content` (and
+`align-content`), while `align-self`/`align-items` keep it (`"safe
+center"`). `tree._fix_flex_safe_alignment` can therefore only honour
+`safe` on the cross axis. Not patched upstream.

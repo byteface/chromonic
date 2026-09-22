@@ -1,4 +1,10 @@
-"""Reversible state snapshots for Domonic's recorded Canvas commands."""
+"""Preserve replayable Path2D arguments in Domonic canvas commands.
+
+Domonic 1.8.4 snapshots drawing state, but its generic JSON conversion
+stringifies ``Path2D`` arguments. Chromonic needs their recorded commands for
+Skia replay, so this adapter retains Domonic's command/state shape while
+serializing replayable canvas values.
+"""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -29,30 +35,16 @@ def _snapshot_value(value):
     return deepcopy(_canvas._json_safe(value))
 
 
-def _snapshot_state(context):
-    return {
-        "fillStyle": _snapshot_value(context.fillStyle),
-        "strokeStyle": _snapshot_value(context.strokeStyle),
-        "globalAlpha": float(context.globalAlpha),
-        "lineWidth": float(context.lineWidth),
-        "lineCap": str(context.lineCap),
-        "lineJoin": str(context.lineJoin),
-        "font": str(context.font),
-        "textAlign": str(context.textAlign),
-        "textBaseline": str(context.textBaseline),
-        "lineDash": deepcopy(list(context._line_dash)),
-        "transform": tuple(context._transform),
-    }
-
-
 def _chromonic_record(self, name, *args):
-    self.commands.append({"name": name,
-                          "args": [_snapshot_value(arg) for arg in args],
-                          "state": _snapshot_state(self)})
+    self.commands.append({
+        "name": name,
+        "args": [_snapshot_value(arg) for arg in args],
+        "state": {key: _snapshot_value(value)
+                  for key, value in self._capture_style_state().items()},
+    })
 
 
 def install() -> bool:
-    """Install once and return whether this call changed Domonic."""
     global _INSTALLED
     if _INSTALLED:
         return False

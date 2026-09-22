@@ -698,7 +698,6 @@ class GravityView:
 # ---------------------------------------------------------------------
 
 def run(count=DEFAULT_COUNT, frames=None):
-
     chromonic.initialize()
 
     if not glfw.init():

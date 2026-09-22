@@ -21,6 +21,8 @@ from chromonic import paint, tree
 from chromonic.native_browser import GLRenderer
 from domonic.html import body, canvas, div, h1, p
 
+chromonic.initialize()
+
 
 WIDTH = 900
 HEIGHT = 600
@@ -29,7 +31,6 @@ CANVAS_W = 860
 CANVAS_H = 500
 
 
-chromonic.initialize()
 
 
 class Particle:

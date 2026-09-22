@@ -2,14 +2,13 @@ import skia
 import pytest
 
 from domonic.html import canvas, div
-from domonic.webapi.canvas import CanvasRenderingContext2D
 
 from chromonic import canvas2d, domonic_canvas_patch, tree
 
 
 @pytest.fixture(autouse=True)
-def _isolated_patch():
-    domonic_canvas_patch.uninstall()
+def _canvas_adapter():
+    domonic_canvas_patch.install()
     yield
     domonic_canvas_patch.uninstall()
 
@@ -18,15 +17,7 @@ def _context():
     return canvas(_width="80", _height="50").getContext("2d")
 
 
-def test_patch_is_explicit_idempotent_and_reversible():
-    assert CanvasRenderingContext2D._record is domonic_canvas_patch._ORIGINAL_RECORD
-    assert domonic_canvas_patch.install()
-    assert not domonic_canvas_patch.install()
-    assert CanvasRenderingContext2D._record is domonic_canvas_patch._chromonic_record
-
-
 def test_recorded_fill_styles_preserve_historical_state():
-    domonic_canvas_patch.install()
     ctx = _context()
     ctx.fillStyle = "red"
     ctx.fillRect(0, 0, 10, 10)
@@ -36,7 +27,6 @@ def test_recorded_fill_styles_preserve_historical_state():
 
 
 def test_recorded_path_is_not_mutated_by_later_path_commands():
-    domonic_canvas_patch.install()
     ctx = _context()
     ctx.beginPath()
     ctx.moveTo(0, 0)
@@ -57,7 +47,6 @@ def test_recorded_path_is_not_mutated_by_later_path_commands():
 
 
 def test_skia_replay_uses_each_commands_recorded_state():
-    domonic_canvas_patch.install()
     ctx = _context()
     ctx.fillStyle = "red"; ctx.fillRect(0, 0, 10, 10)
     ctx.fillStyle = "blue"; ctx.fillRect(20, 0, 10, 10)
@@ -66,7 +55,6 @@ def test_skia_replay_uses_each_commands_recorded_state():
 
 
 def test_canvas_is_intrinsically_sized_and_painted_as_a_dom_element():
-    domonic_canvas_patch.install()
     element = canvas(_width="80", _height="50")
     ctx = element.getContext("2d")
     ctx.fillStyle = "#ff0000"

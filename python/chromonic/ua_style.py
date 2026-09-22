@@ -84,7 +84,8 @@ html, body, div, section, article, header, footer, nav, main, aside,
 figure, figcaption, address, blockquote, form, fieldset, table, dl, dd,
 dt, pre, p, ul, ol, li, hr,
 h1, h2, h3, h4, h5, h6 { display: block; }
-body { margin: 8px; font: 16px Times; }
+html { font-family: Times; }
+body { margin: 8px; font-size: medium; }
 p, dl, form, hr,
 h1, h2, h3, h4, h5, h6, ul, ol { margin: 1em 0; }
 blockquote, figure { margin: 1em 40px; }
@@ -96,15 +97,15 @@ h5 { font-size: 0.83em; font-weight: bold; margin: 1.67em 0; }
 h6 { font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
 ul, ol { padding: 0 0 0 40px; }
 b, strong { font-weight: bold; }
-th { font-weight: bold; text-align: center; }
-table { border-spacing: 2px; }
+th { font-weight: bold; }
+caption { display: table-caption; text-align: center; }
 pre, code, kbd, samp { font-family: monospace; }
 pre { white-space: pre; }
 small { font-size: 0.83em; }
 a { color: #0000ee; }
 hr { margin: 0.5em 0; border: 1px solid; height: 0; }
 button, input { display: inline-block; font: 13.3333px Arial; margin: 0; }
-button { height: 21px; padding: 1px 6px; border: 2px solid; box-sizing: border-box; text-align: center; }
+button { padding: 1px 6px; border: 2px solid; box-sizing: border-box; text-align: center; }
 input { width: 145px; height: 15px; padding: 1px 2px; border: 2px solid; box-sizing: content-box; overflow: clip; }
 iframe { display: inline-block; width: 300px; height: 150px; border: 2px solid; box-sizing: content-box; }
 """.strip()

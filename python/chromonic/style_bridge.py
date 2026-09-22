@@ -89,6 +89,18 @@ def _non_negative(value):
     return value
 
 
+def _non_negative_or_auto(value):
+    """A negative `flex-basis` (`css-flexbox/flex-basis-004.html`: `-50px`)
+    is an invalid declaration -- dropped by the cascade, leaving the
+    initial `auto` (so `width: 30px` sizes the item). domonic keeps it,
+    and Taffy would size the item at 0."""
+    if isinstance(value, (int, float)) and value < 0:
+        return "auto"
+    if isinstance(value, tuple) and len(value) == 2 and value[0] == "pct" and value[1] < 0:
+        return "auto"
+    return value
+
+
 def _padding_edges(edges: Edges) -> list:
     # CSS 2.1 8.4: a negative `padding` is an invalid value, so the whole
     # declaration is dropped and padding stays at its initial value, `0`.
@@ -146,8 +158,14 @@ def _display(kw: Keyword) -> str:
     fallback = _SIMPLE_VAR_FALLBACK.match(value)
     if fallback:
         value = fallback.group(1).strip()
-    if value in ("-ms-flexbox", "-webkit-flex"):
+    if value in ("-ms-flexbox", "-webkit-flex", "inline-flex", "-webkit-inline-flex", "-ms-inline-flexbox"):
+        # `inline-flex` is a flex container too -- only its *outer*
+        # display differs (an atomic inline, handled by `tree.py`'s
+        # inline paths); mapped to "block" before, its items stacked
+        # vertically (`flexbox-align-self-horiz-001-block.xhtml`).
         return "flex"
+    if value == "inline-grid":
+        return "grid"
     if value in ("flex", "grid", "none"):
         return value
     return "block"  # inline, inline-block, list-item, table, ... -- not modelled here
@@ -171,6 +189,70 @@ def _keyword(kw: Keyword) -> str:
     # CSS keywords already match Taffy's vocabulary 1:1 except grid-auto-flow's
     # "row dense" / "column dense" (space-separated in CSS, hyphenated here).
     return kw.value.replace(" ", "-")
+
+
+def _align_keyword(kw: Keyword, *, content: bool, inline_axis: bool = True) -> str:
+    """CSS Box Alignment 3's full `align-*`/`justify-*` vocabulary, reduced
+    to the subset `src/lib.rs`'s `parse_align_items`/`parse_align_content`
+    accept (the old `_keyword()` pass-through let `safe center`, `last
+    baseline`, `self-start` and friends reach the Rust side as-is, where the
+    unrecognised keyword raised a `ValueError` for the whole page -- every
+    `css-flexbox/abspos/*align-self*` fixture errored out that way).
+
+    - `safe`/`unsafe` overflow-safety prefixes are dropped: Taffy has no
+      overflow-position notion, and `unsafe` is exactly the plain keyword.
+    - `first baseline` is `baseline`; `last baseline` (no Taffy equivalent)
+      also falls back to `baseline` on the items axis, and to `flex-end` on
+      the content axis where Box Alignment's fallback for it is `end`
+      (`first`/plain `baseline` on `align-content` falls back to `start`).
+    - `self-start`/`self-end` are the item's own writing-mode start/end;
+      Taffy has no writing mode, so they are `start`/`end`.
+    - `left`/`right` (justify-content/-self only) are physical; with no
+      vertical writing modes here they are the same as `start`/`end`.
+    - Anything still unknown (`anchor-center`, an unresolved `var()`...)
+      becomes `normal` rather than an error.
+    """
+    parts = [part for part in kw.value.replace("-", " ").lower().split()
+             if part not in ("safe", "unsafe")]
+    if not parts:
+        return "normal"
+    if parts[-1] == "baseline":
+        last = parts[0] == "last"
+        if content:
+            return "flex-end" if last else "flex-start"
+        return "baseline"
+    word = "-".join(parts)
+    if word in ("left", "right") and not inline_axis:
+        # CSS Box Alignment 3: `left`/`right` on an axis that isn't the
+        # inline axis (justify-content in a column flex container,
+        # flexbox-justify-content-vert-001a.xhtml) behave as `start`.
+        return "start"
+    word = {"self-start": "start", "self-end": "end", "left": "start", "right": "end",
+            "space-between": "space-between", "space-around": "space-around",
+            "space-evenly": "space-evenly", "flex-start": "flex-start",
+            "flex-end": "flex-end"}.get(word, word)
+    known = {"normal", "auto", "start", "end", "flex-start", "flex-end", "center", "stretch"}
+    if content:
+        known |= {"space-between", "space-around", "space-evenly"}
+    return word if word in known else "normal"
+
+
+def _flex_wrap(kw: Keyword) -> str:
+    """`flex-wrap`, reduced to Taffy's `nowrap`/`wrap`/`wrap-reverse`. The
+    tentative `balance` keyword (`css-flexbox/flex-wrap-balance-*.html`,
+    `wrap-reverse balance`) asks for the lines to be balanced -- not
+    modelled, so it wraps like plain `wrap`/`wrap-reverse` instead of
+    erroring out of the whole page; anything else unknown is `nowrap`."""
+    parts = kw.value.replace("-", " ").lower().split()
+    reverse = "reverse" in parts
+    if "wrap" in parts or "balance" in parts:
+        return "wrap-reverse" if reverse else "wrap"
+    return "nowrap"
+
+
+def _flex_direction(kw: Keyword) -> str:
+    value = kw.value.strip().lower()
+    return value if value in ("row", "row-reverse", "column", "column-reverse") else "row"
 
 
 def _grid_line(value):
@@ -220,15 +302,23 @@ def to_dict(style: LayoutStyle) -> dict:
         "padding": _padding_edges(style.padding),
         "border": _edges(style.borderWidth),
         "gap": (_len(style.gap.row, default=0.0), _len(style.gap.column, default=0.0)),
-        "flex_direction": _keyword(style.flexDirection),
-        "flex_wrap": _keyword(style.flexWrap),
-        "flex_grow": float(style.flexGrow) if not isinstance(style.flexGrow, Keyword) else 0.0,
-        "flex_shrink": float(style.flexShrink) if not isinstance(style.flexShrink, Keyword) else 1.0,
-        "flex_basis": _len(style.flexBasis),
-        "align_items": _keyword(style.alignItems),
-        "align_self": _keyword(style.alignSelf),
-        "align_content": _keyword(style.alignContent),
-        "justify_content": _keyword(style.justifyContent),
+        "flex_direction": _flex_direction(style.flexDirection),
+        "flex_wrap": _flex_wrap(style.flexWrap),
+        # A negative `flex-grow`/`flex-shrink` is an invalid declaration
+        # (`css-flexbox/flex-shrink-002.html`: `flex-shrink: -2` is dropped,
+        # leaving the initial `1`); domonic keeps it and Taffy would treat
+        # it as a real negative factor.
+        "flex_grow": (float(style.flexGrow) if not isinstance(style.flexGrow, Keyword)
+                      and float(style.flexGrow) >= 0 else 0.0),
+        "flex_shrink": (float(style.flexShrink) if not isinstance(style.flexShrink, Keyword)
+                        and float(style.flexShrink) >= 0 else 1.0),
+        "flex_basis": _non_negative_or_auto(_len(style.flexBasis)),
+        "align_items": _align_keyword(style.alignItems, content=False),
+        "align_self": _align_keyword(style.alignSelf, content=False),
+        "align_content": _align_keyword(style.alignContent, content=True),
+        "justify_content": _align_keyword(
+            style.justifyContent, content=True,
+            inline_axis=not _flex_direction(style.flexDirection).startswith("column")),
         "grid_auto_flow": _keyword(style.gridAutoFlow),
         "grid_template_columns": _tracks(style.gridTemplateColumns),
         "grid_template_rows": _tracks(style.gridTemplateRows),

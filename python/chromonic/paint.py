@@ -387,6 +387,9 @@ def text_line_runs(element, box, style):
     # `tree.layout()` pass.
     line_height = getattr(element, "_chromonic_line_height", None) or font_size * 1.2
     text_x = box.x + box.border_left + pad_left
+    # A table cell's `vertical-align: middle`/`bottom` pushes its own text
+    # down inside the (row-height) box -- see `tree._align_table_cell_content`.
+    content_offset_y = float(getattr(element, "_chromonic_content_offset_y", 0.0) or 0.0)
     line_widths = getattr(element, "_chromonic_text_line_widths", [])
     content_width = box.client_width - pad_left - pad_right
     align = (style.get("text_align") or "").strip().lower()
@@ -416,7 +419,7 @@ def text_line_runs(element, box, style):
         elif line_align in ("right", "end"):
             line_x += max(0.0, content_width - width)
         # a simple top-aligned baseline per line, line_height apart
-        baseline_y = box.y + box.border_top + pad_top + font_size + index * line_height
+        baseline_y = box.y + box.border_top + pad_top + content_offset_y + font_size + index * line_height
         yield TextRun(x=line_x, baseline_y=baseline_y, width=width, height=line_height,
                        font=font, text=line, element=element)
 
@@ -521,6 +524,19 @@ def paint_tree(canvas: "skia.Canvas", root_element) -> None:
     for child in (root_element.childNodes or []):
         if _is_element(child):
             paint_tree(canvas, child)
+    _paint_anonymous_boxes(canvas, root_element)
+
+
+def _paint_anonymous_boxes(canvas: "skia.Canvas", element) -> None:
+    """CSS 2.1 anonymous boxes `tree.py` generated under `element`
+    (`_AnonymousTableBox`: anonymous tables/rows/cells and the anonymous
+    block around loose text) live outside the DOM -- their own boxes (a
+    text-only anonymous block/cell paints its lines) are painted here; the
+    real nodes they wrap are already reached by the DOM walk above."""
+    for anonymous in (element.__dict__.get("_chromonic_anonymous_table_boxes") or {}).values():
+        if anonymous.__dict__.get("_layout_box") is not None:
+            paint_element(canvas, anonymous)
+        _paint_anonymous_boxes(canvas, anonymous)
 
 
 def build_display_list(root_element) -> list:
@@ -532,6 +548,14 @@ def build_display_list(root_element) -> list:
     """
     result = []
 
+    def walk_anonymous(element):
+        # Same anonymous boxes `_paint_anonymous_boxes` covers for the
+        # direct paint path -- own boxes only, never their real children.
+        for anonymous in (element.__dict__.get("_chromonic_anonymous_table_boxes") or {}).values():
+            if anonymous.__dict__.get("_layout_box") is not None:
+                result.append(anonymous)
+            walk_anonymous(anonymous)
+
     def walk(element):
         if element.__dict__.get("_layout_box") is not None:
             result.append(element)
@@ -540,6 +564,7 @@ def build_display_list(root_element) -> list:
         for child in (element.childNodes or []):
             if _is_element(child):
                 walk(child)
+        walk_anonymous(element)
 
     walk(root_element)
     return result

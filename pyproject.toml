@@ -15,7 +15,7 @@ dependencies = [
     # see PLAN.md's "domonic version" note for the bump procedure (check
     # the diff, update this pin, audit `domonic_*_patch.py` for now-
     # redundant/broken patches, verify, only then bump).
-    "domonic==1.8.3",
+    "domonic==1.8.4",
     "fonttools[woff]>=4.0",
     "glfw>=2.7",
     # Also pinned exactly -- myjs pulls in `domonic-libs`, which only

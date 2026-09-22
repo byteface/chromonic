@@ -122,7 +122,7 @@ the current auto-tagging snippet if you get to this step, or check
   fixture under `tests/layout/fixtures/` so it stays fixed.
 - If the bug is in **domonic** (the DOM/CSSOM library chromonic sits on top
   of), don't edit the installed package — write a small patch module
-  following the pattern in `python/chromonic/domonic_canvas_patch.py`
+  following the pattern in `python/chromonic/domonic_ex_unit_patch.py`
   (or the newer `domonic_logical_properties_patch.py` /
   `domonic_layout_calc_var_patch.py`): an `install()`/`uninstall()` pair that
   monkeypatches the specific broken function, applied automatically when

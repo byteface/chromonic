@@ -17,23 +17,36 @@ import urllib.parse
 from pathlib import Path
 import urllib.request
 
+import domonic.style
 
 from . import (
     domonic_ch_unit_patch,
-    domonic_currentcolor_replace_patch,
-    domonic_dir_pseudo_patch,
     domonic_ex_unit_patch,
-    domonic_flex_flow_patch,
-    domonic_link_pseudo_patch,
-    domonic_negative_line_height_patch,
-    domonic_presentational_hint_patch,
-    domonic_print_media_patch,
-    domonic_selector_fallback_patch,
-    domonic_stylesheet_disabled_patch,
-    domonic_var_font_size_patch,
+    # Domonic 1.8.4 expands var() in `_font_size_px` itself. This remaining
+    # patch only supplies the browser-specific monospace default-size rule.
+    domonic_monospace_font_size_patch,
+    domonic_font_size_keywords_patch,
+    domonic_logical_size_patch,
     hittest,
     tree,
     window,
+)
+
+# Presentational-attribute hints (`bgcolor`, an `<img>`'s `width`/`height`,
+# ...) used to be folded into the cascade via `domonic_presentational_hint_
+# patch`, which monkeypatched `ComputedStyleDeclaration._collect_author_
+# declarations` -- a private method, and a previous version of that same
+# patch already silently regressed twice when domonic rewrote `_resolve`
+# out from under it. Domonic 1.8.4 added a real extension point for exactly
+# this (`set_presentational_hint_resolver`), consulted natively inside
+# `_collect_author_declarations` at the correct cascade priority (weaker
+# than any author rule, stronger than the initial value) -- so registering
+# through it instead means this can never drift out of sync with `_resolve`
+# again. `_apply_presentational_attributes` below still populates the same
+# `element._chromonic_presentational_hints` dict; this just hands it to
+# domonic through the supported channel instead of a monkeypatch.
+domonic.style.set_presentational_hint_resolver(
+    lambda element: getattr(element, "_chromonic_presentational_hints", None)
 )
 
 
@@ -156,9 +169,10 @@ def _apply_presentational_attributes(document) -> None:
     before resolving styles.
 
     Recorded as ``element._chromonic_presentational_hints`` -- a plain
-    ``{property: value}`` dict consulted by ``domonic_presentational_hint_
-    patch`` -- rather than written into the element's real ``style=""``
-    text. A presentational attribute is the *weakest* possible declaration
+    ``{property: value}`` dict handed to domonic's ``set_presentational_
+    hint_resolver`` (registered above) -- rather than written into the
+    element's real ``style=""`` text. A presentational attribute is the
+    *weakest* possible declaration
     per the real CSS cascade (conceptually the first rule of the document),
     so it must lose to *any* later author stylesheet rule for the same
     property regardless of specificity; real inline ``style=""`` text does
@@ -183,20 +197,121 @@ def _apply_presentational_attributes(document) -> None:
             return value
         return f"{value}px"
 
+    # Every hint is a physical *longhand*: `_collect_author_declarations`
+    # already has fully expanded longhands by the point it folds hints in,
+    # and a hint is only merged for a property name with no declaration at
+    # all -- a shorthand hint (`padding`) would never be blocked by an
+    # author `padding-left`, nor expanded downstream.
+    hints_by_id: dict = {}
+
+    def hint(element, name, value):
+        entry = hints_by_id.get(id(element))
+        if entry is None:
+            entry = hints_by_id[id(element)] = (element, {})
+        entry[1][name] = value
+
+    def nearest_table(element):
+        ancestor = getattr(element, "parentElement", None)
+        while ancestor is not None and (getattr(ancestor, "tagName", "") or "").lower() != "table":
+            ancestor = getattr(ancestor, "parentElement", None)
+        return ancestor
+
+    def attribute(element, name):
+        value = element.getAttribute(name)
+        return (value or "").strip().lower() if value is not None else None
+
+    sides = ("top", "right", "bottom", "left")
+    valigns = {"top", "middle", "bottom", "baseline"}
+    aligns = {"left", "center", "right", "justify"}
     for element in document.getElementsByTagName("*"):
-        hints = {}
+        tag = (getattr(element, "tagName", "") or "").lower()
         bgcolor = element.getAttribute("bgcolor")
         if bgcolor:
-            hints["background-color"] = bgcolor
-        if (getattr(element, "tagName", "") or "").lower() in {"img", "table"}:
+            hint(element, "background-color", bgcolor)
+        if tag in {"img", "table", "td", "th"}:
             width = length(element.getAttribute("width"))
             height = length(element.getAttribute("height"))
             if width:
-                hints["width"] = width
+                hint(element, "width", width)
             if height:
-                hints["height"] = height
-        if hints:
-            element._chromonic_presentational_hints = hints
+                hint(element, "height", height)
+        # HTML's own table rendering defaults (WHATWG HTML §15.3.11: `td, th
+        # { padding: 1px; vertical-align: inherit }`, `tr/thead/tbody/tfoot
+        # { vertical-align: middle }`, `table { border-spacing: 2px }`, `th
+        # { text-align: center }`) live *here* as hints rather than in
+        # `ua_style.py`, because the legacy attributes that override them
+        # (`cellpadding`/`cellspacing`/`valign`/`align`) are themselves
+        # hints, and a hint can't beat a UA-stylesheet rule in this
+        # project's cascade (see `set_presentational_hint_resolver` above)
+        # -- as hints, the attribute simply replaces the default, and either one
+        # still loses to any real author rule, exactly as in a real UA.
+        if tag in {"td", "th"}:
+            table = nearest_table(element)
+            cellpadding = length(table.getAttribute("cellpadding")) if table is not None else None
+            for side in sides:
+                hint(element, f"padding-{side}", cellpadding or "1px")
+            valign = attribute(element, "valign")
+            hint(element, "vertical-align", valign if valign in valigns else "inherit")
+            align = attribute(element, "align")
+            if align in aligns:
+                hint(element, "text-align", align)
+            elif tag == "th":
+                hint(element, "text-align", "center")
+            if element.getAttribute("nowrap") is not None:
+                hint(element, "white-space", "nowrap")
+        elif tag in {"tr", "thead", "tbody", "tfoot"}:
+            valign = attribute(element, "valign")
+            hint(element, "vertical-align", valign if valign in valigns else "middle")
+            align = attribute(element, "align")
+            if align in aligns:
+                hint(element, "text-align", align)
+        elif tag == "table":
+            cellspacing = length(element.getAttribute("cellspacing"))
+            hint(element, "border-spacing", cellspacing or "2px")
+            if attribute(element, "align") == "center":
+                hint(element, "margin-left", "auto")
+                hint(element, "margin-right", "auto")
+            rules = attribute(element, "rules")
+            if rules in ("none", "groups", "rows", "cols", "all"):
+                # HTML's `rules` attribute (rendering section): the table
+                # collapses its borders, its own frame is hidden unless a
+                # `frame` attribute says otherwise, and every cell gets 1px
+                # solid rules on the sides the value names (table-columns-
+                # example-001.xht: `rules="cols"` draws the lines between
+                # columns only -- the outer cells stay 34.5px, no edge line).
+                hint(element, "border-collapse", "collapse")
+                if element.getAttribute("frame") is None:
+                    for side in sides:
+                        hint(element, f"border-{side}-style", "hidden")
+                rule_sides = {"rows": ("top", "bottom"), "cols": ("left", "right"),
+                              "all": tuple(sides), "none": (), "groups": ()}[rules]
+                for cell_tag in ("td", "th"):
+                    for cell in element.getElementsByTagName(cell_tag):
+                        if nearest_table(cell) is element:
+                            for side in rule_sides:
+                                hint(cell, f"border-{side}-width", "1px")
+                                hint(cell, f"border-{side}-style", "solid")
+            border = element.getAttribute("border")
+            if border is not None:
+                # `<table border>`/`border="N"`: an N px outset frame on the
+                # table and a 1px inset border on each of its own cells --
+                # a bare/unparsable value means 1, `0` means no frame.
+                try:
+                    frame = max(0, int(float(border.strip()))) if border.strip() else 1
+                except ValueError:
+                    frame = 1
+                for side in sides:
+                    hint(element, f"border-{side}-width", f"{frame}px")
+                    hint(element, f"border-{side}-style", "outset")
+                if frame > 0:
+                    for cell_tag in ("td", "th"):
+                        for cell in element.getElementsByTagName(cell_tag):
+                            if nearest_table(cell) is element:
+                                for side in sides:
+                                    hint(cell, f"border-{side}-width", "1px")
+                                    hint(cell, f"border-{side}-style", "inset")
+    for element, hints in hints_by_id.values():
+        element._chromonic_presentational_hints = hints
 
 
 def _synthetic_local_page(path: Path) -> "tuple[str, str] | None":
@@ -373,26 +488,101 @@ class _RequestsResponseAdapter:
         self.url = response.url
 
     def text(self):
-        return self._response.text
+        # `requests.Response.text` decodes a `text/*` body with no declared
+        # charset as ISO-8859-1 (the HTTP/1.1 default), so a UTF-8 file's
+        # BOM came through as the three characters `ï»¿` before the
+        # `<!DOCTYPE>` -- domonic's parser then treated that as body text
+        # (a whole first line, with `<title>`/`<link>`/`<style>` demoted
+        # into `<body>` after it, 26px below Chrome on every one of the 22
+        # BOM-prefixed `css-flexbox/*.htm` fixtures). Chrome sniffs the
+        # BOM first, then the declared charset, then falls back to UTF-8
+        # for a well-formed body; the same order here. The BOM itself is
+        # dropped: domonic keeps a leading U+FEFF as a text node (logged
+        # in PLAN.md).
+        content = self._response.content
+        content_type = (self._response.headers.get("content-type") or "").lower()
+        if content.startswith(b"\xef\xbb\xbf"):
+            text = content[3:].decode("utf-8", errors="replace")
+        elif "charset=" in content_type and self._response.encoding:
+            text = self._response.text.lstrip("﻿")
+        else:
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                text = self._response.text
+        if "xhtml+xml" in content_type or _looks_like_xhtml(text):
+            text = _expand_xhtml_self_closing_tags(text)
+        return _strip_html_comments_in_style(text)
+
+
+_STYLE_BLOCK_RE = re.compile(r"(<style\b[^>]*>)(.*?)(</style>)", re.I | re.S)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+
+
+def _strip_html_comments_in_style(text: str) -> str:
+    """CSS Syntax 3 §5.4.1: `<!--`/`-->` (CDO/CDC) inside a stylesheet
+    are ignored, so an HTML-style comment between rules in a `<style>`
+    block is harmless to Chrome. domonic's CSS parser doesn't drop them
+    and loses the rule that follows (`css-flexbox/flexbox-mbp-horiz-
+    003.xhtml`: the `.borderA` rule after `<!-- customizations ... -->`
+    never applied). Removed here before parsing; logged in PLAN.md."""
+    return _STYLE_BLOCK_RE.sub(
+        lambda m: m.group(1) + _HTML_COMMENT_RE.sub(" ", m.group(2)) + m.group(3), text)
+
+
+_VOID_HTML_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+    "param", "source", "track", "wbr",
+})
+_SELF_CLOSING_TAG_RE = re.compile(r"<([a-zA-Z][\w:.-]*)((?:\s+[^<>]*?)?)\s*/>")
+
+
+def _looks_like_xhtml(text: str) -> bool:
+    head = text[:2048]
+    return head.lstrip().startswith("<?xml") or 'xmlns="http://www.w3.org/1999/xhtml"' in head
+
+
+def _expand_xhtml_self_closing_tags(text: str) -> str:
+    """An XHTML document (served as `application/xhtml+xml`, or an XML
+    prolog / the XHTML namespace on its root) is parsed by Chrome as XML,
+    where `<div class="a"/>` is a complete, empty element. domonic parses
+    everything as HTML, where the `/` on a non-void start tag is ignored
+    and every following sibling nests *inside* that `<div>` (the Mozilla
+    `css-flexbox/flexbox-*.xhtml` fixtures: `<div class="a"/><div class=
+    "b"/>` became one item containing the other, 200px wide instead of
+    10px). Rewritten here into explicit `<div ...></div>` pairs, leaving
+    HTML's void elements (`<br/>`, `<img/>`...) alone. Logged in PLAN.md."""
+    def expand(match):
+        tag = match.group(1)
+        if tag.lower() in _VOID_HTML_TAGS:
+            return match.group(0)
+        return f"<{tag}{match.group(2)}></{tag}>"
+    return _SELF_CLOSING_TAG_RE.sub(expand, text)
 
 
 def _load_remote(url: str, *, method: str = "GET", data=None, http_session=None):
     from domonic._scrape import _parse
+    from domonic.webapi.fetch import Request
 
     session = http_session or _shared_http_session()
     response = session.request(method, url, data=data, timeout=30, allow_redirects=True)
-    # `_parse(css=True)` fetches every `<link rel=stylesheet>` itself, via a
-    # bare `requests.request(...)` with no headers of its own -- unlike the
-    # page fetch above, that call never goes through `session`, so it never
-    # gets `session`'s identifying User-Agent. Plenty of real sites (Wikipedia
-    # confirmed directly: `403 Please set a user-agent...`) reject the
-    # resulting anonymous request outright, silently leaving every external
-    # stylesheet at 0 rules -- the same class of block `_shared_http_session`
-    # already exists to dodge for the page itself, just not wired through to
-    # this second, independent fetch path.
+    # Domonic 1.8.4 requires the source Request so external stylesheets can
+    # inherit credentials/headers only when they are same-origin. Build it
+    # from requests' actual prepared request (which includes session headers
+    # and cookies), rather than reconstructing it from the caller's inputs.
+    prepared = response.request
+    source_request = Request(
+        response.url,
+        method=prepared.method,
+        headers=dict(prepared.headers),
+        redirect="follow",
+    )
     document = _parse(
-        _RequestsResponseAdapter(response), None, css=True, attach=True,
-        request_kwargs={"headers": dict(session.headers)},
+        _RequestsResponseAdapter(response), None,
+        source_request=source_request,
+        css=True,
+        attach=True,
+        request_kwargs={"timeout": 30, "allow_redirects": True},
     )
     default_view = getattr(document, "defaultView", None)
     page = SimpleNamespace(
@@ -422,7 +612,7 @@ def _ensure_window(page) -> None:
 
 
 def load(url: str, *, method: str = "GET", data=None, http_session=None):
-    """Fetch + parse `url` with domonic 1.8.3 for HTTP(S), myjs for local files.
+    """Fetch + parse `url` with domonic 1.8.4 for HTTP(S), myjs for local files.
 
     `method`/`data` (ignored for local files -- forms don't target them in
     practice) let a caller submit a real HTML form: `method="POST"` with

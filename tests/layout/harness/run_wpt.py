@@ -152,6 +152,28 @@ def auto_tag(source):
         flags=re.I | re.S,
     )
 
+    # `/resources/testharness.js` (loaded by every `checkLayout()`-style
+    # fixture) injects `html { font-family: DejaVu Sans, Bitstream Vera
+    # Sans, Arial, Sans }` at run time -- Chrome executes it and measures
+    # every unstyled text run in Arial (on this Mac), while chromonic runs
+    # no script and kept its Times default, 1px-per-line and ~12px-per-
+    # element off on every such fixture (the "consistent ~11.9px offset"
+    # seen across css-flexbox). Written into the throwaway copy so both
+    # sides resolve the same family list.
+    if re.search(r'<script\b[^>]*src=["\'][^"\']*testharness\.js["\']', source, re.I):
+        # `#log` is where testharness.js writes its results in Chrome --
+        # when a fixture places its own `<div id=log>` *before* the test
+        # content (flex-minimum-height-flex-items-012.html), everything
+        # after it sits 460px lower in Chrome than in chromonic, where the
+        # div stays empty. Hidden on both sides; an empty block and a
+        # `display: none` one occupy the same nothing.
+        rule = ("<style>html { font-family: DejaVu Sans, Bitstream Vera Sans, Arial, Sans; } "
+                "#log { display: none !important; }</style>")
+        source, count = re.subn(r"(<head\b[^>]*>)", lambda m: m.group(1) + rule, source, count=1, flags=re.I)
+        if not count:
+            source = re.sub(r"(<html\b[^>]*>)", lambda m: m.group(1) + "<head>" + rule + "</head>",
+                            source, count=1, flags=re.I)
+
     tagger = LayoutTagger(source)
     tagger.feed(source)
     tagger.close()

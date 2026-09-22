@@ -153,7 +153,7 @@ def test_navigation_failure_preserves_page_and_history():
         raise OSError('offline')
     view.loader = fail
     assert not view.navigate('https://example.com/next')
-    assert view.page is page and view.status == 'offline'
+    assert view.page is page and view.status == 'Chromonic cannot currently support this page: offline'
 
 
 def test_address_selection_and_unicode_input():
@@ -280,7 +280,7 @@ def test_failed_background_load_keeps_current_document():
     executor.futures[0].set_exception(OSError('offline'))
     navigation.poll()
     assert view.page is page
-    assert view.status == 'offline'
+    assert view.status == 'Chromonic cannot currently support this page: offline'
 
 
 def test_display_list_culls_offscreen_elements_without_relayout(monkeypatch):

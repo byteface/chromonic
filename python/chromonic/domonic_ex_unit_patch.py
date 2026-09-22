@@ -132,10 +132,43 @@ def _parse_length_or_percent_with_ex(raw, computed, **kwargs):
 
 
 def _to_used_length_with_ex_line_height(self, target, value):
+    if target in ("top", "right", "bottom", "left") and isinstance(value, str) and value.strip().endswith("%"):
+        # CSS 2.1 9.3.2: a percentage inset's *computed* value is the
+        # percentage (resolved against the containing block only at use;
+        # `inherit` copies the percentage). domonic resolved it here
+        # against the viewport width -- `left: 50%` of a 600px containing
+        # block became 512px, and `left: inherit` copied the pixels
+        # (`wpt/css/CSS2/positioning/left-offset-percentage-002.xht`,
+        # `relpos-calcs-005..007.xht`, `left-113.xht`). Not patched
+        # upstream; logged in PLAN.md.
+        return value.strip()
     if target == "line-height":
         resolved = _resolve_ex_px(value, self)
         if resolved is not None:
             return _style._px_str(resolved)
+    if target == "border-spacing":
+        # Same gap for `border-spacing` (one or two lengths): domonic used
+        # the generic half-an-em placeholder here too -- `7.5ex` in 20px
+        # Ahem (x-height 16px) came back as `75px` instead of `120px`
+        # (`wpt/css/CSS2/tables/border-spacing-083.xht`). Each `ex` token
+        # is resolved against the real font; anything else passes through.
+        parts = (value or "").split()
+        if any(part.endswith("%") for part in parts):
+            # CSS 2.1 17.6.1: `border-spacing` takes lengths, never a
+            # percentage -- the declaration is invalid. domonic accepts
+            # it and would resolve the percentage against the containing
+            # block here (`wpt/css/CSS2/tables/border-spacing-percentage-
+            # 001.xht`: `0px` then `20%` is 0px in Chrome, 20% of the
+            # container here); the valid declaration it displaced is
+            # already gone, so 0 is the closest available reading.
+            value = "0px"
+            parts = ["0px"]
+        if any(part.lower().endswith("ex") for part in parts):
+            resolved_parts = []
+            for part in parts:
+                resolved = _resolve_ex_px(part, self) if part.lower().endswith("ex") else None
+                resolved_parts.append(_style._px_str(resolved) if resolved is not None else part)
+            value = " ".join(resolved_parts)
     return _ORIGINAL_TO_USED_LENGTH(self, target, value)
 
 

@@ -313,7 +313,39 @@ def _svg_intrinsic_metadata(data: bytes) -> "tuple[float | None, float | None, f
 def _decode_image(data: bytes) -> "skia.Image | None":
     image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(data))
     if image is not None:
-        return image
+        # A lazy `Image`'s declared `width()`/`height()` are free metadata
+        # reads (no decode triggered) -- checked before `makeRasterImage()`
+        # below, the same decoded-pixel-memory ceiling the SVG branch
+        # already enforces for the same reason, so a pathological image
+        # (small encoded size, huge real dimensions -- well within
+        # `_MAX_IMAGE_BYTES`'s *encoded*-bytes limit, which says nothing
+        # about decoded size) fails cleanly here instead of decoding
+        # (and, worse, later GPU-texturing) a multi-hundred-megabyte
+        # bitmap.
+        if image.width() * image.height() * 4 > _CACHE_BUDGET_BYTES:
+            return None
+        # `MakeFromEncoded` deliberately does *not* decode pixels here --
+        # per its own docs, it "attempt[s] to defer decoding until the
+        # image is actually used/drawn". This function only ever runs on
+        # this module's background decode pool (`_decode_stage`/`_data_
+        # stage`, both submitted via `_submit("decode", ...)`), which is
+        # the whole point of decoding off-thread in the first place -- but
+        # a still-lazy `image` silently breaks that: the real decode cost
+        # gets paid on whatever thread first *draws* it instead, which in
+        # practice is `paint.py`'s `canvas.drawImageRect` on the UI/render
+        # thread. For an ordinary small image that first paint-time decode
+        # is unnoticeable; for a large, expensive-to-decode one (high
+        # resolution and/or a compression format Skia decodes slowly) it
+        # can block the render loop for a long time on first paint --
+        # exactly the "hangs hard, have to force-quit, often on pages with
+        # large images" symptom, since nothing here was actually moving
+        # that cost off the UI thread despite the module's own docstring
+        # claiming it does. `makeRasterImage()` forces the decode now, on
+        # this background thread, and returns an already-decoded raster
+        # image `canvas.drawImageRect` can use directly with no further
+        # decode cost later.
+        raster = image.makeRasterImage()
+        return raster if raster is not None else image
 
     # Skia's encoded raster path does not handle SVG, but SVGDOM does.  Render
     # it once to a bitmap because the rest of Chromonic already consumes
