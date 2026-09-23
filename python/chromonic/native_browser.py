@@ -1755,6 +1755,17 @@ class WindowInput:
             self.view.toggle_perf()
         elif key == g.KEY_F12:
             self.view.toggle_console()
+        elif command and key == g.KEY_C and self.view.editing and self.view._selection_range() is not None:
+            # The address bar's own selection (`select_anchor`/`caret`) is
+            # separate state from `text_selection` below (a drag-selection
+            # over the *page's* rendered text) -- `focus_address()` already
+            # selects the whole URL on click/Cmd+L, but nothing ever copied
+            # it: this `elif` chain fell straight through to the page-
+            # selection branch, which is `None` whenever nothing on the
+            # page itself has been dragged over, so Cmd+C while the address
+            # bar was focused silently did nothing.
+            start, end = self.view._selection_range()
+            g.set_clipboard_string(self.window, self.view.address[start:end])
         elif command and key == g.KEY_C and self.view.text_selection is not None:
             g.set_clipboard_string(self.window, self.view.selected_text())
         elif command and key == g.KEY_S:
@@ -1885,7 +1896,7 @@ class WindowInput:
         self.glfw.set_cursor(self.window, cursor)
 
 
-def run(url='https://google.com/', *, width=1000, height=800, title='chromonic — direct Skia v3', frames=None):
+def run(url='chromonic://home', *, width=1000, height=800, title='chromonic — direct Skia v3', frames=None):
     """Run the native browser window on the calling thread.
 
     ``frames`` bounds deterministic display/smoke tests. Network fetches stay

@@ -47,7 +47,7 @@ CSS2/visudet/ - 7/40 PASSING (was 2/40 at the start of this folder). Built:
   Remaining: font-metric rendering noise, and `line-height:normal` only
   using the first font in a fallback list instead of the tallest actually
   used -- not attempted, `fonts.text_metrics` too hot/shared to change safely.
-CSS2/positioning/ - 525/555 captured fixtures (95%) on a chromonic-only
+CSS2/positioning/ - 527/555 captured fixtures (95%) on a chromonic-only
   replay against the Chrome baseline (23 scripted `dynamic-*`/uncaptured
   fixtures excluded). Remaining: floats inside inline text, Chrome's
   per-item client rects for undecorated ("culled") inlines, relative
@@ -61,7 +61,7 @@ CSS2/linebox/ - sampled ~250 fixtures. Fixed: negative `line-height`
   `vertical-align` offsets and inline-block baseline computation -- not
   attempted, same scope as the already-noted font-metric rendering noise.
 CSS2/normal-flow/ - 524 passed / 230 failed / 37 errors
-CSS2/table/ - 906/962 captured fixtures (94%) on a chromonic-only replay
+CSS2/table/ - 909/962 captured fixtures (94%) on a chromonic-only replay
   against the Chrome baseline (5 Chrome-timeout fixtures uncaptured).
   Remaining: script-toggled display and unexplained Chrome behaviour in
   table-anonymous-objects, inline-table/float inside inline text,
@@ -101,7 +101,7 @@ css-display/ - sampled (140 fixtures), not tractable this session: almost
   children render as if it weren't there) -- chromonic doesn't implement
   this at all, a real, sizeable feature (not a quick box-model fix), plus
   more unimplemented-feature/animation noise on top.
-css-flexbox/ - 694/1203 captured fixtures (58%; 1448 eligible, 210
+css-flexbox/ - 706/1203 captured fixtures (59%; 1448 eligible, 210
   `flags=dom` skipped, ~35 Chrome timeouts/untaggable). Full sweep in six
   batches of 250 (`/tmp/wpt_flexbox_f1..f6`). Built this pass: flex items
   are blockified (a container of inline/inline-block children no longer
@@ -118,9 +118,154 @@ css-flexbox/ - 694/1203 captured fixtures (58%; 1448 eligible, 210
   was Arial vs Times). Remaining: vertical writing modes (88 fixtures),
   `aspect-ratio`/img transfer sizes (~35), nested-container baselines,
   `flex-wrap: balance` (tentative), calc(), CSS nesting, pseudo-element
-  items, `contain`, older captures with `#log` content (re-capture fixes).
-css-box/, css-text/ - both tiny (10 fixtures each), almost entirely CSS
-  Animations tests (unimplemented feature, no static geometry).
+  items, `contain`. KNOWN CAPTURE BUG (found and fixed later, during
+  css-grid, not yet re-applied here): `run_wpt.py`'s `#log`-hiding rule
+  only inserted if the fixture had an explicit `<head>` or `<html>` tag;
+  a bare `<!DOCTYPE html><title>...</title><style>...` fixture (common,
+  valid HTML5) silently kept `#log` visible, so its Chrome capture has
+  testharness.js's real per-assertion results table inflating the page
+  height, corrupting every later element's `y`. 243 of the 372
+  `flags=dom`-eligible-ish (testharness.js-using) css-flexbox fixtures
+  lack a `<head>`/`<html>` tag and may be affected -- the 694/1203 figure
+  above is against that possibly-corrupted baseline for some fraction of
+  them. Re-capturing is a `--start/--limit` batch sweep away but not done
+  this session (budget); flagged here rather than silently left wrong.
+css-grid/ - 257/551 captured fixtures (47%). `grid-lanes` (CSS Grid 3
+  masonry, a different `display` value, 1707 fixtures) deliberately never
+  captured -- unimplemented feature, out of scope. Swept: all seven core
+  layout folders (grid-definition/grid-model/layout-algorithm/parsing/
+  placement/implicit-grids/grid-items, 503 eligible) plus one 250-fixture
+  batch of `alignment` (430 eligible); `abspos` (215) and `subgrid` (135)
+  not started. Before this pass grid was essentially unexercised --
+  `justify_items`/`justify_self`, `grid_auto_rows`/`grid_auto_columns`,
+  `minmax()`, `fit-content()`, and `repeat()` (literal count and
+  `auto-fill`/`auto-fit`, via a real Taffy `GridTemplateComponent::Repeat`
+  now, not flattened) were entirely unwired in `src/lib.rs`/
+  `style_bridge.py`; all added this pass. Also fixed: a grid item's own
+  `min-width: auto` was unconditionally forced to `0` (predated this
+  session's flex `width:auto`-substitution exclusion that made it
+  unnecessary; killed every grid item's real automatic-minimum
+  contribution), `grid-area` shorthand not expanded by domonic (worked
+  around), a table row's/cell's *specified* height being included in the
+  proportional-surplus-height split instead of held fixed (CSS 2.1
+  17.5.3), and `overflow != visible` wrongly blocking a block's own
+  top-margin collapse with its first child's (should only block a
+  *grandchild's* margin escaping past it) -- the last three are general
+  engine fixes, not grid-specific, and lifted CSS2/table to 909/962,
+  CSS2/positioning to 527/555, and css-flexbox to 699/1203 too (numbers
+  above already updated). SEPARATELY, an unrelated regression was found
+  and fixed this session: `browser.py`'s new `set_presentational_hint_
+  resolver` call used plain `domonic.style.` attribute access, which
+  `domonic/__init__.py`'s own `from domonic.html import ..., style, ...`
+  shadows (the `<style>` tag class, not the submodule) -- this broke
+  *every* chromonic import outright until fixed via the established
+  `sys.modules["domonic.style"]` workaround every other `domonic_*_patch`
+  module already uses. Remaining: an unresolved, unreproduced-in-
+  isolation bug where a *later* occurrence of an otherwise-identical
+  `repeat(auto-fill/auto-fit, ...)` grid (same CSS, same available width)
+  sometimes gets a completely different track count than an earlier one
+  (`grid-definition/grid-auto-fill-columns-001.html`; several minimal
+  repros with matching structure did not reproduce it); a parallel
+  column-width version of the row-height fix above (an explicit column
+  width still gets redistributed into by extra table width) in the same
+  fixture's reference table; `aspect-ratio` (already logged, unmodelled);
+  named lines/`grid-template-areas` (unmodelled); `calc()` (unmodelled).
+CSS2/floats/ + CSS2/floats-clear/ - 110/366 captured fixtures (30%; 25
+  dom-skipped). Previously floats were a heuristic on top of Taffy's
+  `flex-wrap` with one real structural gap: a float that is a *direct
+  element child of a block that also has real text* (the single most
+  common float pattern -- `<p>text <img style="float:left"> more
+  text</p>`) made `_inline_mixed_content`'s own child-qualification gate
+  reject the whole container outright (a float was simply never an
+  accepted child there), which fell through to a fallback with *no
+  notion of direct text at all* -- not just the float's position, the
+  entire surrounding paragraph's text silently vanished. Fixed: a float
+  now qualifies there (mirroring how an absolutely positioned child
+  already did), and `build()`'s own text/element flex-row approximation
+  now tracks any float it contains separately from its ordinary row
+  members (never baseline-aligned) and hands them to a new pass,
+  `_fix_inline_float_position`, which corrects only each float's own `x`
+  -- flush to the container's left/right content edge (CSS 2.1 9.5.1),
+  dropped below an earlier same-container float it would otherwise
+  overlap (rule 7) -- leaving Taffy's own row-wrap `y` and every other
+  row member's position untouched. Deliberately narrow to keep the
+  change low-risk: does *not* yet narrow surrounding text around the
+  float's rectangle (real "inline layout consults active floats" line-
+  shortening is a substantially bigger feature); a float mixed with an
+  *other, non-floated inline-level element* sibling (not text) still
+  isn't real-packed, since `_fix_float_flow_after_block_sibling` bails
+  its whole container whenever a qualifying-but-not-floated sibling is
+  present (`floats-clear/floats-001.xht`: an inline-block next to a
+  float on the same line) -- a natural next extension of the same
+  pattern, not attempted this pass. Verified zero regressions across
+  CSS2/table (909/962), CSS2/positioning (527/555), css-flexbox
+  (699/1203), and css-grid (254/551) before and after. Remaining, by
+  family: `clear`/`float` applying to table-internal displays
+  (`clear-applies-to-*`, `float-applies-to-*`), various margin-collapse-
+  with-float interactions (`margin-collapse-clear-*`, `margin-collapse-
+  *`), multicol (`floats-clear-multicol-*`, unimplemented feature).
+css-sizing/ - 205/608 captured fixtures (34%; 0 errors). Swept the whole
+  folder in three 250-fixture batches (not split by subfolder). `aspect-
+  ratio` was entirely unwired going in: added `Style.aspect_ratio` ->
+  `style_bridge._aspect_ratio()` (a domonic `Ratio` -> plain `width/height`
+  float, guarded against a CSS-invalid zero-length ratio component -- see
+  domonic log below), a declared ratio overriding an image's *natural*
+  ratio in `_apply_image_intrinsic_size`, and a `_has_ratio_derived_height`
+  guard stopping `_fix_nested_bfc_float_auto_height`/`_fix_float_flow_
+  container_auto_height` from silently overwriting Taffy's own correct
+  ratio-derived height with a summed-content one. Also fixed a real crash
+  (`OverflowError: cannot convert float infinity to integer` on a `0`-
+  length ratio component). Separately, `position:absolute` boxes with an
+  `aspect-ratio` were fully ignoring it in both of CSS 2.1 10.3.7/10.6.4's
+  inset-constraint-equation solvers (`_fix_absolute_width_against_
+  containing_block`/`_fix_absolute_height_against_containing_block`),
+  always stretching to fill both axes via insets regardless of the ratio;
+  fixed per CSS Position 3's abspos-auto-size rule (block axis is ratio-
+  dependent unless only the inline axis has an auto inset, in which case
+  inline is) for the two unambiguous, narrow cases: all four insets
+  definite (height derives from the already-inset-solved width), and one
+  definite dimension + the other auto with a ratio (the auto one derives
+  from the ratio, overriding the insets equation) -- 14/22 `aspect-ratio/
+  abspos-*` fixtures now pass, up from a handful. Confirmed as a genuine
+  cross-cutting improvement: css-flexbox +7 (699->706/1203), css-grid +3
+  (254->257/551), zero regressions elsewhere. Deliberately deferred (all
+  narrow, spec-advanced, or unimplemented-feature gaps): the CSS Sizing 4
+  "aspect-ratio minimum size contribution" (a box whose content would
+  overflow its ratio-derived size gets an automatic-minimum clamp that
+  respects content size -- the same underlying mechanism as the already-
+  known flex automatic-minimum-size gap, just also reachable from plain
+  abspos boxes, e.g. `abspos-012`/`abspos-013`); the mirrored inline-axis-
+  has-the-lone-auto-inset case (would need a coordinated two-axis pre-pass
+  since the two insets-equation functions currently run and mutate
+  independently); re-deriving the *stretch* axis from the ratio after the
+  *ratio* axis gets min/max-clamped (`abspos-021`); percentage `height`/
+  `width` on an abspos ratio box (`abspos-009`); `contain-intrinsic-size`/
+  `contain:size` (unimplemented CSS Containment feature, unrelated to
+  aspect-ratio); vertical writing modes (no support at all); the `auto
+  <ratio>` combined-syntax domonic gap (already logged). Also deferred,
+  unrelated to aspect-ratio: `stretch-fit`/`stretch-quirk`/`stretch-table`
+  sizing keywords, SVG intrinsic sizing (`svg-intrinsic-size-*`, 8
+  fixtures), and a large `vert-block-size-*` fixture (247 fragment
+  mismatches -- likely a distinct, bigger bug, not investigated).
+css-box/ - tiny (10 fixtures), almost entirely CSS Animations tests
+  (unimplemented feature, no static geometry).
+css-text/ + css-text-decor/ - in progress (2927 + 665 fixtures; an
+  earlier "10 fixtures, mostly animations" note here was simply wrong --
+  that was some other, smaller folder). `word-break`/`overflow-wrap` were
+  entirely unwired going in -- both map close to 1:1 onto Parley's own
+  `WordBreak`/`OverflowWrap` style properties (`src/lib.rs`'s
+  `layout_text` binding now takes and forwards both), so this was a
+  wiring job, not new line-breaking logic: Parley already does real
+  Unicode-aware intra-word breaking. Also handled: CSS Sizing 3's min-
+  content carve-out for `overflow-wrap: break-word` specifically (must
+  *not* shrink min-content, unlike `word-break: break-all`/`overflow-
+  wrap: anywhere`, which do) -- confirmed directly (`break-word` and
+  `normal` both report the same min-content width; `break-all`/`anywhere`
+  correctly shrink it). Capture batches running; the `_InlineFormattingPlan`
+  fallback path (mixed text+inline-element content, its own token-by-
+  token placement rather than Parley's paragraph layout) doesn't have
+  this yet -- only the single-text-leaf `_make_measure` path -- deferred
+  pending real fixture results showing whether it's needed.
 css/selectors/ - swept properly (365 fixtures). 3 real domonic fixes (see
   log below: `:link`/`:visited`, `:dir()`, and a broader bug in chromonic's
   own existing single-compound cascade-matching fallback that was
@@ -498,6 +643,20 @@ these fixtures stay failing.
 
 ------
 
+Found in `css-grid` (`grid-items/grid-inline-order-property-painting-
+*.html`, `grid-inline-z-axis-ordering-*.html`, and any other fixture
+placing an item with `grid-area`): the `grid-area` shorthand (`<row-
+start> / <column-start> / <row-end> / <column-end>`) is never expanded
+into its four longhands -- `grid-row-start`/`grid-column-start`/etc. all
+stay their own initial `auto`, so every `grid-area`-placed item falls
+through to ordinary auto-placement instead (two items both declared
+`grid-area: 1 / 1` landed in two separate auto-placed cells instead of
+overlapping in the same one). Worked around in `tree.py`
+(`_parse_grid_area`, reading the raw cascade the same way
+`justify-items` above already needs to). Not patched upstream.
+
+
+
 Found in `css-flexbox` (`flexbox_flex-0-0-1-unitless-basis.html`,
 `flexbox_flex-0-0-N-unitless-basis.html`): `flex: 0 0 4` (a unitless,
 non-zero third value) is an invalid declaration that Chrome drops
@@ -533,3 +692,91 @@ Found in `css-flexbox` (`flexbox-safe-overflow-position-003.html`):
 `align-content`), while `align-self`/`align-items` keep it (`"safe
 center"`). `tree._fix_flex_safe_alignment` can therefore only honour
 `safe` on the cross axis. Not patched upstream.
+
+
+
+20
+
+------
+
+Found in `css-sizing` (`aspect-ratio/zero-or-infinity-001.html`): CSS
+Sizing 4's `<ratio>` requires both numbers to be non-zero (a `0` on
+either side makes the whole declaration invalid, falling back to the
+property's initial `auto`) -- domonic's `_parse_aspect_ratio` accepts
+`aspect-ratio: 0/1` as a real `Ratio(0.0, 1.0)` regardless. Worked around
+in `style_bridge._aspect_ratio` (a non-positive component reads as `auto`
+instead). Not patched upstream.
+
+
+
+21
+
+------
+
+Found in `css-sizing` (`aspect-ratio/block-aspect-ratio-004.html`/
+`-006.html`): the `auto <ratio>` combined `aspect-ratio` syntax (CSS
+Sizing 4 -- "use the box's own natural ratio if it has one, else fall
+back to `<ratio>`") is indistinguishable from a bare `<ratio>` once
+parsed -- `_parse_aspect_ratio` strips the `auto` token before matching,
+so `aspect-ratio: auto 4/1` and `aspect-ratio: 4/1` both resolve to the
+same `Ratio(4.0, 1.0)`, with no way to tell whether `auto` was also
+written. Immaterial for a replaced element with its own natural ratio
+(the common case this syntax exists for), but wrong for a non-replaced
+box, where Chrome's actual resolution of the `auto`-combined form
+doesn't match using the ratio outright either (still unexplained --
+`-004.html`'s second `<div>` measured a height matching neither its own
+`auto 1/1` ratio nor its sibling's plain `2/1`). Not patched upstream;
+narrow in practice.
+
+
+
+------
+
+22
+
+------
+
+Found running a real page's JS (`readthedocs-addons.js`, ordinary docs
+site): the JS interpreter's auto-bound-globals collection (`domonic_libs.
+acorn.interpret._collect_domonic_globals`) is missing a wide swath of
+real DOM/CSSOM interfaces, for two different reasons. (1)
+`_GLOBAL_DENYLIST` deliberately excludes `Document`/`Node`/`Element`/
+`Window`/`Text`/`Comment`/`CharacterData`/`Attr`, even though `domonic.
+dom`/`domonic.window` have a real class for every one of them. (2) The
+whole CSSOM (`CSSStyleSheet`/`CSSRule`/`CSSStyleDeclaration`/`MediaList`/
+...) lives in `domonic.style`, a module `_collect_domonic_globals` never
+scans at all (only `domonic.javascript`/`domonic.webapi.*`/`domonic.dom`
+are). A real browser exposes every one of these as a bare global for
+ordinary `instanceof`/`typeof` feature-detection, so a script checking
+`typeof Document` or `typeof CSSStyleSheet` hits `ReferenceError: ... is
+not defined` instead. Worked around in `js_sandbox._dom_interface_globals`/
+`_cssom_interface_globals` (chromonic's own sandboxed scope override for
+remote-page scripts, not the vendored package). Not patched upstream.
+
+
+
+------
+
+23
+
+------
+
+Found running a real page's JS (same `readthedocs-addons.js`, past the
+`Document`/`CSSStyleSheet` gaps above): `domonic_libs.acorn.interpret`
+has no `Proxy`/`Reflect` support -- an explicit, stated scope boundary,
+not an oversight: its own module docstring says plainly "Not covered --
+real prototype chains, `Proxy` / `Symbol`, `with`." (`Symbol` is the same
+boundary and likely to surface the same way on some other real site.)
+Unlike entry 22, this is not a missing-global fix -- `Proxy` is a core
+ECMAScript language feature
+requiring the interpreter itself to intercept every property get/set/
+has/delete on an object and route it through trap functions; there is no
+existing domonic class to point a global at, the way `Document`/
+`CSSStyleSheet` had one. A real implementation is a genuine interpreter
+feature, upstream `domonic_libs`/`myjs` work, not a `js_sandbox.py`-side
+workaround -- and not attempted as a partial/fake shim, since a `Proxy`
+that exists but doesn't actually trap property access would fail in more
+confusing ways than today's clean `ReferenceError`. Expect this on other
+real sites too (`Proxy` is common in modern reactive-framework code --
+Vue 3, MobX, plain "reactive object" patterns); each occurrence is this
+same gap, not a new bug. Not patched upstream.

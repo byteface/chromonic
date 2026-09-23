@@ -10,14 +10,18 @@ from __future__ import annotations
 import base64
 import html
 import json
+import logging
 import mimetypes
 import re
+import sys
 from types import SimpleNamespace
 import urllib.parse
 from pathlib import Path
 import urllib.request
 
-import domonic.style
+import domonic.style  # noqa: F401 -- ensures the real submodule is registered in `sys.modules`
+
+_log = logging.getLogger(__name__)
 
 from . import (
     domonic_ch_unit_patch,
@@ -28,9 +32,12 @@ from . import (
     domonic_font_size_keywords_patch,
     domonic_logical_size_patch,
     hittest,
+    netlog,
     tree,
     window,
 )
+
+netlog.install()
 
 # Presentational-attribute hints (`bgcolor`, an `<img>`'s `width`/`height`,
 # ...) used to be folded into the cascade via `domonic_presentational_hint_
@@ -45,7 +52,18 @@ from . import (
 # again. `_apply_presentational_attributes` below still populates the same
 # `element._chromonic_presentational_hints` dict; this just hands it to
 # domonic through the supported channel instead of a monkeypatch.
-domonic.style.set_presentational_hint_resolver(
+#
+# `domonic.style` (plain attribute access) is *not* the submodule here --
+# `domonic/__init__.py` does `from domonic.html import ..., style, ...`
+# (the `<style>` tag class), which shadows the real `domonic.style`
+# submodule on the package object itself, the same "only a `sys.modules`
+# lookup by dotted name reaches the real submodule" caveat every
+# `domonic_*_patch` module in this package already works around. Plain
+# `domonic.style.set_presentational_hint_resolver(...)` here resolved to
+# the `<style>` tag class instead and broke every import of chromonic
+# outright (`AttributeError: type object 'style' has no attribute
+# 'set_presentational_hint_resolver'`).
+sys.modules["domonic.style"].set_presentational_hint_resolver(
     lambda element: getattr(element, "_chromonic_presentational_hints", None)
 )
 
@@ -55,6 +73,12 @@ def _is_url(s: str) -> bool:
         isinstance(s, str)
         and s.split(":", 1)[0].lower() in ("http", "https")
     )
+
+
+def _is_internal_url(s: str) -> bool:
+    """A `chromonic://...` page -- the built-in start/settings page `homepage.py`
+    generates on the fly, never fetched or read from disk."""
+    return isinstance(s, str) and s.split(":", 1)[0].lower() == "chromonic"
 
 
 def _normalize_address(value: str) -> str:
@@ -109,6 +133,15 @@ def _normalize_address(value: str) -> str:
     if parsed.scheme in ("http", "https") and parsed.netloc:
         return value
 
+    # An internal `chromonic://` page (the settings form's own "save"
+    # action carries the new homepage URL, dots and all, in its query
+    # string) -- left alone rather than falling into the "looks like a
+    # domain" heuristic below, which would otherwise see that embedded
+    # dot and prepend a *second*, wrong scheme
+    # (`https://chromonic://save-settings?...`).
+    if parsed.scheme.lower() == "chromonic":
+        return value
+
     if "." in value and " " not in value:
         return "https://" + value
 
@@ -132,12 +165,13 @@ def _local_path(value: str) -> Path:
 
 def _validate_navigable(url: str) -> None:
     """Allow an absolute http(s) URL, or a reference to a local file: a
-    `file:` URI, or a plain/`~`/relative filesystem path (what dropping a
+    `file:` URI, a plain/`~`/relative filesystem path (what dropping a
     file onto the window, or typing its path into the address bar, produces
-    after `_normalize_address` leaves it alone -- see its own docstring).
-    Any other scheme (`javascript:`, `data:`, `ftp:`, ...) is rejected as a
-    navigation target, the same as before this allowed local files too."""
-    if _is_url(url):
+    after `_normalize_address` leaves it alone -- see its own docstring), or
+    a `chromonic://` internal page. Any other scheme (`javascript:`,
+    `data:`, `ftp:`, ...) is rejected as a navigation target, the same as
+    before this allowed local files too."""
+    if _is_url(url) or _is_internal_url(url):
         return
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme in ("", "file"):
@@ -564,8 +598,12 @@ def _load_remote(url: str, *, method: str = "GET", data=None, http_session=None)
     from domonic._scrape import _parse
     from domonic.webapi.fetch import Request
 
+    from . import netlog
+
     session = http_session or _shared_http_session()
+    netlog.log("net", f"{method} {url}")
     response = session.request(method, url, data=data, timeout=30, allow_redirects=True)
+    netlog.log("net", f"{response.status_code} {response.url} ({len(response.content)} bytes)")
     # Domonic 1.8.4 requires the source Request so external stylesheets can
     # inherit credentials/headers only when they are same-origin. Build it
     # from requests' actual prepared request (which includes session headers
@@ -596,6 +634,48 @@ def _load_remote(url: str, *, method: str = "GET", data=None, http_session=None)
     return page
 
 
+def _load_internal(url: str):
+    """Build a `page` for a `chromonic://...` URL straight from `homepage.py`'s
+    generated HTML -- no fetch, no file on disk. Mirrors `_load_local`'s
+    synthetic-page construction (a bare `myjs.Page(html_string, url=...)`),
+    just with domonic-generated markup instead of an f-string wrapper.
+
+    `chromonic://save-settings?homepage=...` is not really a page: it
+    persists the new preference to `homepage.save_prefs`, then serves the
+    settings page back (with `page.url` set to the *settings* URL, not the
+    save action, so the address bar lands on `chromonic://settings` after
+    saving -- the same "the final `page.url` wins" redirect behaviour
+    `native_browser.commit_page` already gives a real HTTP redirect)."""
+    from myjs import Page
+
+    from . import homepage
+
+    parsed = urllib.parse.urlparse(url)
+    name = (parsed.netloc or parsed.path).strip("/").lower() or "home"
+    saved = False
+
+    if name == "save-settings":
+        query = urllib.parse.parse_qs(parsed.query)
+        new_homepage = (query.get("homepage", [""])[0]).strip()
+        prefs = homepage.load_prefs()
+        if new_homepage:
+            prefs["homepage"] = new_homepage
+        else:
+            prefs.pop("homepage", None)
+        homepage.save_prefs(prefs)
+        saved = True
+        name = "settings"
+
+    if name == "settings":
+        source = homepage.build_settings_html(saved=saved)
+        final_url = homepage.SETTINGS_URL
+    else:
+        source = homepage.build_homepage_html()
+        final_url = homepage.HOME_URL
+
+    return Page(source, url=final_url, run=False)
+
+
 def _ensure_window(page) -> None:
     """Every loaded page gets a real `domonic.window.Window` as its
     `document.defaultView` -- a remote page already gets one from
@@ -622,8 +702,10 @@ def load(url: str, *, method: str = "GET", data=None, http_session=None):
     cookie jar; almost nothing needs this."""
     from . import browser_images, ua_style, webfonts
 
-    page = (_load_remote(url, method=method, data=data, http_session=http_session)
-            if _is_url(url) else _load_local(url))
+    is_remote = _is_url(url)
+    page = (_load_internal(url) if _is_internal_url(url) else
+            _load_remote(url, method=method, data=data, http_session=http_session)
+            if is_remote else _load_local(url))
     page.document._chromonic_base_url = page.url
     _ensure_window(page)
 
@@ -643,6 +725,25 @@ def load(url: str, *, method: str = "GET", data=None, http_session=None):
         page.document,
         page.url,
     )
+
+    # Run the page's own `<script>` elements -- ordinary browser behaviour,
+    # same as any other browser does on every site -- against a sandboxed
+    # `myjs` session (see `js_sandbox`'s own docstring for why: unlike
+    # `pyscript.py`'s deliberately unsandboxed first-party model, a remote
+    # page's script could be anything, so it never gets a real filesystem,
+    # shell, or `require()` of an arbitrary Python module). Local files and
+    # chromonic's own internal pages don't run scripts at all yet -- out of
+    # scope here, and neither needs the remote case's sandboxing anyway.
+    if is_remote:
+        from . import js_sandbox
+        session = http_session or _shared_http_session()
+        try:
+            script_page = js_sandbox.run_scripts(page.document, url=page.url, http_session=session)
+        except Exception:  # noqa: BLE001 -- a broken script environment must not fail the whole load
+            _log.exception("chromonic: script execution failed for %s", page.url)
+        else:
+            page.session = script_page.session
+            page.js_errors = script_page.errors
 
     return page
 

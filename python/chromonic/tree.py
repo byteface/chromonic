@@ -306,6 +306,42 @@ def _layout_parent(node):
     return anonymous if anonymous is not None else getattr(node, "parentElement", None)
 
 
+_GRID_AREA_SPAN_RE = re.compile(r"^span\s+(\d+)$", re.I)
+_GRID_AREA_LINE_RE = re.compile(r"^[+-]?\d+$")
+
+
+def _parse_grid_area_token(token: str):
+    """One `/`-separated `grid-area` component -> the same (line-number,
+    `("span", n)`, or `None`-for-auto) shape `src/lib.rs`'s
+    `parse_grid_placement` accepts. A named line/area (`<custom-ident>`,
+    real but not modelled -- see PLAN.md) falls back to `None`/auto
+    rather than guessing a line number."""
+    token = token.strip()
+    if not token or token.lower() == "auto":
+        return None
+    span = _GRID_AREA_SPAN_RE.match(token)
+    if span:
+        return ("span", int(span.group(1)))
+    if _GRID_AREA_LINE_RE.match(token):
+        return int(token)
+    return None  # a named line/custom-ident -- not modelled, falls back to auto
+
+
+def _parse_grid_area(area: str):
+    """CSS Grid 1 §8.3.1 `grid-area: <row-start> [/ <column-start> [/
+    <row-end> [/ <column-end>]]]` -- omitted trailing components are
+    `auto` (the named-line "inherit the previous component's ident"
+    special case doesn't apply here: every component this function
+    resolves to a real line number/span is already a plain integer/`span
+    N`, never a `<custom-ident>`). Returns `((row_start, row_end),
+    (col_start, col_end))`, each component already in `_grid_line()`'s
+    output shape."""
+    parts = [p.strip() for p in area.split("/")]
+    parts += ["auto"] * (4 - len(parts))
+    row_start, col_start, row_end, col_end = (_parse_grid_area_token(p) for p in parts[:4])
+    return (row_start, row_end), (col_start, col_end)
+
+
 def _css_order(computed) -> int:
     """The computed `order` (CSS Flexbox 5.4) as an int; 0 when unset,
     unparsable, or for an anonymous item with no computed style."""
@@ -1019,6 +1055,8 @@ def _extract_paint_style(computed) -> dict:
         "word_spacing": computed.getPropertyValue("word-spacing"),
         "line_height": computed.getPropertyValue("line-height"),
         "white_space": computed.getPropertyValue("white-space"),
+        "word_break": computed.getPropertyValue("word-break") or "normal",
+        "overflow_wrap": computed.getPropertyValue("overflow-wrap") or "normal",
         "text_align": computed.getPropertyValue("text-align"),
         # Domonic's generated IDL getter supplies this initial value while
         # getPropertyValue() currently returns an empty string when unset.
@@ -1684,7 +1722,24 @@ def _inline_mixed_content(element, children, element_is_inline=False):
     # Keep them in the retained projection so Taffy can anchor them, while the
     # surrounding direct text still gets its own measurable fragment.
     # <br> elements are handled as forced line-breaks and are always permitted.
-    if any(not _child_qualifies(child, style_obj) for child, _computed, style_obj in children):
+    # CSS 2.1 9.5: a float doesn't break an inline formatting run either --
+    # like an absolutely positioned child, it's out of flow -- but *only*
+    # once real direct text already earned this container a plan above
+    # (`_is_floated`, unlike the other `_child_qualifies` cases, is never
+    # consulted for `has_inline_only_children`: a *pure*-float sibling
+    # group with no text at all must keep going through the older,
+    # more capable `elif children:` -> `_approximate_inline_flow` ->
+    # `_fix_float_flow_after_block_sibling` block-packing path exactly as
+    # before -- confirmed directly on `zero-available-space-float-
+    # positioning.html`, two floats and no text, regressed by this
+    # exact function accepting them here too). With real text present,
+    # though, rejecting the container outright loses every text sibling
+    # to that same fallback, which has no notion of direct text at all --
+    # found on any `<p>text <img style="float:left"> more text</p>`-
+    # shaped fixture throughout `CSS2/floats`: the *entire paragraph's*
+    # text silently vanished, not just the float's own position.
+    if any(not (_child_qualifies(child, style_obj) or (has_direct_text and _is_floated(computed)))
+           for child, computed, style_obj in children):
         return None
     items = []
     pending_space = False
@@ -2618,6 +2673,15 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
     alone between two blocks inside an inline span was simply dropped)."""
     if any(kind == "element" and (
             (_is_absolutely_positioned(child_style) and not allow_escapees)
+            # CSS 2.1 9.5: a float, like an abs-pos item, is out of flow --
+            # but unlike abs-pos this plan has no escapee/static-position
+            # handling for one (real float positioning needs the
+            # block-level packer, `_fix_float_flow_after_block_sibling`-
+            # style logic, not a text-flow static position) -- always
+            # bails to the `elif inline_items:` flex-row fallback, which
+            # `build()` gives its own float handling
+            # (`_chromonic_inline_floats`/`_fix_inline_float_position`).
+            or _is_floated(child_computed)
             or isinstance(item, _PseudoElement)
             # A *real* nested element with only text children (no further
             # element nesting) would otherwise be absorbed straight into
@@ -2674,7 +2738,7 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
             # (see `_USUALLY_INLINE_TAGS` picking up `img`/`canvas`/`svg`/
             # `iframe`).
             or (getattr(item, "tagName", "") or "").lower() in _REPLACED_OR_CONTROL_TAGS)
-           for kind, item, _text, _computed, child_style in inline_items):
+           for kind, item, _text, child_computed, child_style in inline_items):
         # A generated-content pseudo-element needs its own real box (own
         # font, own position, possibly absolute) -- this shared-plan path
         # only ever measures *text runs* sharing one Taffy leaf, with no
@@ -3047,6 +3111,20 @@ def _make_measure(paint_style: dict, text: str, element):
     letter_spacing = _fontmetrics.parse_length(paint_style["letter_spacing"], default=0.0)
     word_spacing = _fontmetrics.parse_length(paint_style["word_spacing"], default=0.0)
     line_height = _resolved_line_height(paint_style["line_height"])
+    word_break = (paint_style.get("word_break") or "normal").strip().lower()
+    overflow_wrap = (paint_style.get("overflow_wrap") or "normal").strip().lower()
+    # CSS Sizing 3's min-content carve-out: `overflow-wrap: break-word`
+    # (unlike `anywhere`) must *not* shrink the min-content contribution
+    # below "widest whole word" -- it only breaks a word that would
+    # otherwise overflow its line, which by definition never happens at
+    # a min-content query's own (infinitely narrow) constraint. `word-
+    # break: break-all` has no such carve-out; it always may break
+    # anywhere. Matches Parley's own `OverflowWrap::BreakWord` doc note
+    # ("treated differently for min-content sizing"); handled here
+    # rather than assumed inside Parley itself, since the `max_width:
+    # 1.0` call below is this function's own proxy for "give me min-
+    # content", not a dedicated min-content request Parley can key off.
+    breaks_within_words_at_min_content = word_break == "break-all" or overflow_wrap == "anywhere"
     ascent, descent, normal_height = fonts.text_metrics(font_family, font_size, font_weight >= 600, italic)
 
     def measure(available_width, available_height, _known_width=None, _known_height=None):
@@ -3063,11 +3141,18 @@ def _make_measure(paint_style: dict, text: str, element):
             max_width=(None if paint_style.get("white_space") in ("pre", "nowrap")
                        else 1.0 if min_content else available_width),
             letter_spacing=letter_spacing, word_spacing=word_spacing, line_height=line_height,
+            word_break=word_break, overflow_wrap=overflow_wrap,
         )
-        if min_content and paint_style.get("white_space") not in ("pre", "nowrap"):
+        if (min_content and paint_style.get("white_space") not in ("pre", "nowrap")
+                and not breaks_within_words_at_min_content):
             # A wrapped line's width from Parley keeps its trailing space
             # (`"IT "` = 150px in 50px Ahem); the min-content width is the
-            # widest *word* (`"IT"` = 100px, Chrome's answer).
+            # widest *word* (`"IT"` = 100px, Chrome's answer). Skipped
+            # above when `word-break`/`overflow-wrap` allow breaking
+            # *within* a word -- there, `width` already reflects that
+            # (the `max_width: 1.0` call above forces every break Parley
+            # will take), and re-measuring whole whitespace-delimited
+            # words here would silently ignore it, overstating min-content.
             words = [word for word in re.split(r"[ \t\n\r\f]+", text) if word]
             if words:
                 width = max(layout_text(word, font_family, font_size, font_weight=font_weight, italic=italic,
@@ -3216,6 +3301,16 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
     intrinsic_width, intrinsic_height, _ratio = browser_images.natural_size(src)
     has_complete_pair = intrinsic_width is not None and intrinsic_height is not None
     intrinsic_ratio = intrinsic_width / intrinsic_height if has_complete_pair and intrinsic_height else None
+    # CSS Sizing 4: a declared `aspect-ratio` (a bare `<ratio>`, not the
+    # `auto <ratio>` form -- domonic's own parser doesn't keep the two
+    # distinguishable, see `style_bridge._aspect_ratio`) always wins over
+    # the image's own natural ratio for sizing purposes, so it's swapped
+    # in for `intrinsic_ratio` here, once, and the rest of this function's
+    # existing ratio-driven sizing logic (already correct for the
+    # natural-ratio case) applies to it unchanged.
+    declared_ratio = style.get("aspect_ratio")
+    if isinstance(declared_ratio, (int, float)):
+        intrinsic_ratio = declared_ratio
     # CSS Images 3 5.2's own fallback when nothing intrinsic is known at
     # all on the needed axis -- 300x150, the same UA default `<canvas>`/
     # `<iframe>` already use elsewhere in this file.
@@ -4665,10 +4760,48 @@ def build(
             overflow_x if overflow_x in _valid_overflow else "visible",
             overflow_y if overflow_y in _valid_overflow else "visible",
         )
+        # `justify-items` (CSS Box Alignment 3, grid's own inline-axis
+        # counterpart to `align-items` -- flexbox has no such axis) isn't
+        # in domonic's recognised-property list at all, so `LayoutStyle`
+        # has no field for it and `computed.justifyItems`'s own getter is
+        # simply never populated (raises `AttributeError`). The raw
+        # cascade dict itself isn't filtered by that list, though --
+        # `LayoutStyle.from_computed`'s own `justifySelf` field already
+        # reads the identically-unlisted `justify-self` this same way.
+        style["justify_items"] = style_bridge._align_keyword(
+            Keyword((computed._resolved.get("justify-items") or "").strip().lower()), content=False)
+        # `grid-area` (the `grid-row-start / grid-column-start /
+        # grid-row-end / grid-column-end` shorthand) isn't expanded into
+        # its four longhands by domonic's cascade at all -- each longhand
+        # stays its own initial `auto`, so every item using it (extremely
+        # common; `grid-area: 1 / 1` places two items in the same cell in
+        # `css-grid/grid-items/grid-inline-order-property-painting-*.html`)
+        # falls through to ordinary auto-placement instead. Parsed
+        # straight from the raw cascade here, the same raw-cascade
+        # workaround `justify-items` above already needs.
+        if style["grid_column"] == (None, None) and style["grid_row"] == (None, None):
+            area = (computed._resolved.get("grid-area") or "").strip()
+            if area and area.lower() != "auto":
+                row, col = _parse_grid_area(area)
+                if row != (None, None):
+                    style["grid_row"] = row
+                if col != (None, None):
+                    style["grid_column"] = col
         element._chromonic_native_style = style
-    if is_grid_item and style["min_width"] == "auto":
-        # Prevent an auto-width block descendant from feeding its containing
-        # grid's full available width back as the track's intrinsic minimum.
+    if False and is_grid_item and style["min_width"] == "auto":
+        # Disabled: this predates `_is_flex_or_grid_item`'s exclusion of
+        # flex/grid items from the generic `width:auto` -> `pct(1.0)`
+        # "fill the container" substitution elsewhere in `build()` -- back
+        # when *every* auto-width block got that substitution regardless
+        # of its parent, a grid item's own `width:100%` (the substitute)
+        # read back to Taffy's automatic-minimum-size algorithm as a
+        # definite, container-filling minimum, exactly the "feeds the
+        # track its full available width" bug this worked around. With
+        # that root cause gone, forcing 0 here instead throws away a
+        # grid item's *real* automatic minimum (its min-content size,
+        # CSS Grid 1 §6.6) -- confirmed on `grid-layout-auto-tracks.html`:
+        # `.b`'s own 50px-wide child never contributed to its auto
+        # column's width, which came out 0 instead of 50.
         style["min_width"] = 0.0
     if ((getattr(computed, "flexBasis", "") or "").strip().lower() == "content"
             and _is_flex_or_grid_item(element)):
@@ -5795,6 +5928,20 @@ def build(
         # (sometimes wrong, see that function) baseline placement their
         # `y` positions alone can no longer be trusted to say so.
         row_members = []
+        # CSS 2.1 9.5: a float mixed into running text (`<p>text <img
+        # style="float:left"> more text</p>`) is pulled out of normal
+        # flow -- it doesn't take a slot in the line the way an ordinary
+        # inline/inline-block item does, and real text wraps around it.
+        # This approximation still lets Taffy place it as an ordinary
+        # flex-row member (so it gets a real, content-sized box and a
+        # reasonable *line* to sit on, via the row's own wrap point) --
+        # `_fix_inline_float_position` below corrects only its final x
+        # (flush to the container's own left/right content edge, CSS
+        # 2.1 9.5.1) afterward, leaving every other row member's Taffy
+        # position untouched. Does not (yet) narrow surrounding text
+        # around the float's rectangle -- a real "text reflows around
+        # floats" implementation, out of scope here; logged in PLAN.md.
+        inline_floats = []
         for item_index, (kind, item, text, child_computed, child_style) in enumerate(inline_items):
             if kind == "element":
                 # An absolutely-positioned item counts as "inline" for
@@ -5834,7 +5981,14 @@ def build(
                         computed_cache=computed_cache, is_containing_block=child_is_cb, escapees=own_escapees,
                         reuse_styles=reuse_styles, projection=projection,
                     ))
-                    row_members.append(item)
+                    if _is_floated(child_computed):
+                        # Never a baseline participant (CSS 2.1 10.8.1
+                        # baseline alignment only ever considers in-flow
+                        # boxes) -- `_fix_inline_float_position` positions
+                        # it afterward.
+                        inline_floats.append(item)
+                    else:
+                        row_members.append(item)
                 if isinstance(item, _PseudoElement):
                     # Not a real DOM child -- reaches paint only via this
                     # side-channel list, same as retained text fragments.
@@ -5864,6 +6018,7 @@ def build(
             row_members.append(item)
         element._chromonic_inline_fragments = fragments
         element._chromonic_flex_row_members = row_members
+        element._chromonic_inline_floats = inline_floats
         all_child_ids = normal_child_ids + (own_escapees if is_containing_block else [])
         node_id = (projection.upsert(element, style, all_child_ids, None, None)
                    if projection else tree.new_with_children(style, all_child_ids))
@@ -6584,7 +6739,31 @@ def _distribute_table_extra_height_in(table) -> None:
             # The table's own box only: `_settle_table` propagates the
             # table's net growth to what follows it, once.
             _grow_box_height(element, growth)
-        targets = [row for row in rows if not getattr(row, "_chromonic_table_row_empty", False)] or rows
+        # CSS 2.1 17.5.3: a row (or any of its own cells) with a real
+        # specified height is not a candidate for the surplus at all --
+        # only rows left to their own auto/content height take a share
+        # of it. Found on `wpt/css/css-grid/grid-model/display-grid.html`'s
+        # own reference `<table>`: a `height:100%` table with one row's
+        # `td`s given an explicit `height:30px` and the other row left
+        # auto split the surplus 37.5/62.5 (proportional to *both* rows'
+        # current heights) instead of leaving the explicit row at its own
+        # 30px and handing the auto row the entire remainder (70).
+        def _has_specified_height(row) -> bool:
+            # A row's or cell's own declared `height` is converted to
+            # `min_height` (with `height` itself reset to `auto`) back in
+            # `build()`'s `is_table_row`/`is_table_cell` branches, per CSS
+            # 2.1 17.5.3's "specified height is a minimum" -- so the
+            # signal to read here is `min_height`, not `height` (which is
+            # always `"auto"` on a table row/cell by this point).
+            row_native = getattr(row, "_chromonic_native_style", None) or {}
+            if isinstance(row_native.get("min_height"), (int, float)) and row_native["min_height"] > 0.0:
+                return True
+            return any(isinstance((getattr(cell, "_chromonic_native_style", None) or {}).get("min_height"),
+                                  (int, float))
+                       and (getattr(cell, "_chromonic_native_style", None) or {})["min_height"] > 0.0
+                       for cell in getattr(row, "_chromonic_table_cells", None) or ())
+        non_empty = [row for row in rows if not getattr(row, "_chromonic_table_row_empty", False)] or rows
+        targets = [row for row in non_empty if not _has_specified_height(row)] or non_empty
         weights = [row.__dict__["_layout_box"].height for row in targets]
         total = sum(weights)
         deltas = ({id(row): extra * weight / total for row, weight in zip(targets, weights)}
@@ -7895,6 +8074,27 @@ def _bfc_descendant_float_bottom(element, floor: float) -> float:
     return best
 
 
+def _has_ratio_derived_height(native: dict) -> bool:
+    """CSS Sizing 4 `aspect-ratio`: when `height` is `auto` but `width` is
+    definite and a ratio was declared, the *used* height comes from the
+    ratio (Taffy's own `aspect_ratio` field already resolves it inside
+    Taffy's layout), not from summed content -- so any pass that would
+    otherwise recompute a `height:auto` element's height from its
+    children's own extent must leave this one alone. Confirmed directly
+    on `css-sizing/aspect-ratio/block-aspect-ratio-010.html`: a
+    `width:100px; aspect-ratio:1/1; overflow:hidden` block holding a
+    500px-tall child was recomputed to `600px` (the summed children,
+    completely ignoring the ratio) instead of staying the ratio's own
+    `100px`. Narrow on purpose: only the "definite width, auto height"
+    case -- `min-height` clamping past the ratio (needing the *bigger*
+    of the two) is a real, separate CSS Sizing 4 rule this doesn't
+    attempt, and an *indefinite* width leaves the ratio unresolved,
+    where content-based sizing is still exactly right."""
+    return (isinstance(native.get("aspect_ratio"), (int, float))
+            and isinstance(native.get("width"), (int, float))
+            and native.get("height") == "auto")
+
+
 def _fix_nested_bfc_float_auto_height(node_map: dict) -> None:
     """The same CSS 2.1 10.6.3/10.6.7 rule `_fix_float_flow_container_
     auto_height` applies (a `height:auto` box never counts a float unless
@@ -7924,6 +8124,8 @@ def _fix_nested_bfc_float_auto_height(node_map: dict) -> None:
             continue
         native = getattr(element, "_chromonic_native_style", None)
         if native is None or native.get("height") != "auto":
+            continue
+        if _has_ratio_derived_height(native):
             continue
         if native.get("display") in ("flex", "grid"):
             # `float` always computes to `none` on a flex/grid item, so
@@ -8034,6 +8236,8 @@ def _fix_float_flow_container_auto_height(node_map: dict) -> None:
             continue
         native = getattr(element, "_chromonic_native_style", None)
         if native is None or native.get("height") != "auto":
+            continue
+        if _has_ratio_derived_height(native):
             continue
         box = element.__dict__.get("_layout_box")
         if box is None:
@@ -8929,7 +9133,18 @@ def _adjust_body_collapsed_margins(root_element):
     # Taffy), so simply leaving it alone here and letting `_apply_root_
     # margin_offset` add body's own margin normally on top, unmodified,
     # already gives the correct, uncollapsed result.
-    if any(value != "visible" for value in style.get("overflow", ("visible", "visible"))):
+    if False and any(value != "visible" for value in style.get("overflow", ("visible", "visible"))):
+        # Disabled: CSS 2.1 8.3.1's adjoining-margins list for a block and
+        # its first/last in-flow child doesn't actually name the block's
+        # own `overflow` as a blocking condition (only border/padding
+        # between them, or the child's own clearance) -- `overflow`
+        # establishing a BFC stops a *grandchild*'s margin from escaping
+        # past this element to things outside it, a different pairing
+        # than this element's own margin against its direct child's.
+        # Found on `css-grid/layout-algorithm/grid-as-flex-item-should-
+        # not-shrink-to-fit-001.html`: `body { overflow: hidden }`'s
+        # first-child `<p>`'s 16px margin still collapsed with body's own
+        # 8px in Chrome (`y: 16`, `max(8, 16)`), not stacked (`y: 24`).
         return
     boxes = []
     visible_boxes = []
@@ -9458,10 +9673,25 @@ def _fix_absolute_width_against_containing_block(node_map: dict) -> None:
         mr = _resolve_inset(margin_right_raw, cb_width)
         left_v = _resolve_inset(left, cb_width) or 0.0
         right_v = _resolve_inset(right, cb_width) or 0.0
-        new_width = max(0.0, cb_width - left_v - (ml or 0.0) - right_v - (mr or 0.0))
+        # CSS Sizing 4 aspect-ratio: a definite `height` alongside `width:
+        # auto` and a preferred aspect ratio derives the used width from
+        # that ratio, taking priority over this box's own left/right-inset
+        # equation (confirmed on aspect-ratio/abspos-006.html: `height:
+        # 100px; aspect-ratio: 1/1; left: 0; right: 0` -- Chrome's 100px
+        # width, not the 500px the insets equation alone would solve for).
+        # Narrowed to an already-*numeric* height (a resolved length, not
+        # `auto` or an unresolved percent tuple) so this never fires for
+        # the ordinary insets-only case this function otherwise handles.
+        ratio = style.get("aspect_ratio")
+        ratio_derived = (isinstance(ratio, (int, float)) and ratio > 0
+                         and isinstance(style.get("height"), (int, float)))
+        if ratio_derived:
+            new_width = max(0.0, box.height * ratio)
+        else:
+            new_width = max(0.0, cb_width - left_v - (ml or 0.0) - right_v - (mr or 0.0))
         max_width_v = _resolve_inset(style.get("max_width"), cb_width)
         min_width_v = _resolve_inset(style.get("min_width"), cb_width)
-        clamped = False
+        clamped = ratio_derived
         if max_width_v is not None and new_width > max_width_v:
             new_width, clamped = max_width_v, True
         elif min_width_v is not None and new_width < min_width_v:
@@ -9553,10 +9783,28 @@ def _fix_absolute_height_against_containing_block(node_map: dict) -> None:
         mb = _resolve_inset(margin_bottom_raw, cb_height)
         top_v = _resolve_inset(top, cb_height) or 0.0
         bottom_v = _resolve_inset(bottom, cb_height) or 0.0
-        new_height = max(0.0, cb_height - top_v - (mt or 0.0) - bottom_v - (mb or 0.0))
+        # CSS Position 3 abspos-auto-size + CSS Sizing 4 aspect-ratio: when
+        # both width and height are auto and every inset is definite (this
+        # function's own left/right-auto guard would otherwise leave this
+        # to the ordinary equation below -- narrowed here to exactly that
+        # "all four insets given" case, since that's the only one where the
+        # spec unambiguously names the block axis (height) as ratio-
+        # dependent; the mirrored case -- only one inset auto, on the
+        # *inline* axis -- makes width the ratio-dependent axis instead,
+        # left to the existing insets-equation height below, which is
+        # already correct for it). `_fix_absolute_width_against_containing_
+        # block` runs first in the pipeline, so `box.width` here is already
+        # the inset-stretched value to derive the ratio height from.
+        ratio = style.get("aspect_ratio")
+        ratio_derived = (isinstance(ratio, (int, float)) and ratio > 0
+                         and inset[3] != "auto" and inset[1] != "auto")
+        if ratio_derived:
+            new_height = max(0.0, box.width / ratio)
+        else:
+            new_height = max(0.0, cb_height - top_v - (mt or 0.0) - bottom_v - (mb or 0.0))
         max_height_v = _resolve_inset(style.get("max_height"), cb_height)
         min_height_v = _resolve_inset(style.get("min_height"), cb_height)
-        clamped = False
+        clamped = ratio_derived
         if max_height_v is not None and new_height > max_height_v:
             new_height, clamped = max_height_v, True
         elif min_height_v is not None and new_height < min_height_v:
@@ -10374,6 +10622,83 @@ def _fix_flex_row_baseline_alignment(node_map: dict) -> None:
 _BASELINE_ALIGNMENTS = ("baseline", "first-baseline", "last-baseline")
 
 
+def _fix_inline_float_position(node_map: dict) -> None:
+    """CSS 2.1 9.5: correct the position of a float found mixed into
+    running text (`elif inline_items:`'s flex-row-of-text approximation
+    marks these on `element._chromonic_inline_floats`, in DOM order,
+    excluded from that row's own baseline alignment). Taffy already gave
+    each one a real, content-sized box, wrapped onto some row by the
+    row's own flex-wrap -- treated here as a reasonable stand-in for
+    "which line of text it interrupted" (its own `y`), corrected only in
+    `x`: flush to the container's left/right content edge (rule 1), and
+    dropped below any earlier same-container float it would otherwise
+    overlap (rule 7), via a per-container running list so two floats in
+    the same paragraph still stack correctly. Does not narrow the
+    surrounding text around the float's own rectangle (a real "inline
+    layout consults active floats" implementation is a substantially
+    bigger feature -- logged in PLAN.md) -- only the float's own
+    geometry is corrected."""
+    for element in list(node_map.values()):
+        floats = getattr(element, "_chromonic_inline_floats", None) if hasattr(element, "__dict__") else None
+        if not floats:
+            continue
+        box = element.__dict__.get("_layout_box")
+        if box is None:
+            continue
+        pt, pr, pb, pl = element.__dict__.get("_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
+        content_left = box.x + box.border_left + pl
+        content_right = content_left + (box.client_width - pl - pr)
+        active_floats: list = []
+        for child in floats:
+            child_box = child.__dict__.get("_layout_box")
+            if child_box is None:
+                continue
+            child_resolved = getattr(child, "_chromonic_resolved_style", None)
+            child_computed = child_resolved[0] if child_resolved is not None else None
+            side = "left"
+            if child_computed is not None:
+                float_value = (getattr(child_computed, "float", None) or "").strip().lower()
+                if float_value == "right":
+                    side = "right"
+            margin = (getattr(child, "_chromonic_native_style", None) or {}).get("margin") or (0.0,) * 4
+            mt, mr, mb, ml = (_numeric_edge(v) for v in margin)
+            top = child_box.y
+            top = _cleared_y(child_computed, active_floats, top)
+            # Rule 7: this float's own outer top may not be higher than
+            # any earlier same-container float it would otherwise
+            # overlap -- dropped below the lowest blocking one, same
+            # collision check `_fix_float_flow_after_block_sibling` uses
+            # for block-level float siblings.
+            while True:
+                blocking = [a for a in active_floats
+                            if a["top"] < top + child_box.height and a["bottom"] > top]
+                if not blocking:
+                    break
+                new_top = min(a["bottom"] for a in blocking)
+                if new_top <= top + 1e-6:
+                    break
+                top = new_top
+            if side == "right":
+                new_x = content_right - mr - child_box.width
+                left_blocking = [a for a in active_floats if a["side"] == "left"
+                                 and a["top"] < top + child_box.height and a["bottom"] > top]
+                if left_blocking:
+                    new_x = max(new_x, max(a["edge"] for a in left_blocking))
+            else:
+                new_x = content_left + ml
+                right_blocking = [a for a in active_floats if a["side"] == "right"
+                                  and a["top"] < top + child_box.height and a["bottom"] > top]
+                if right_blocking:
+                    new_x = min(new_x, min(a["edge"] for a in right_blocking) - child_box.width)
+            dx, dy = new_x - child_box.x, top - child_box.y
+            if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                _shift_subtree(child, dx, dy)
+                child_box = child.__dict__["_layout_box"]
+            edge = child_box.x + child_box.width if side == "left" else child_box.x
+            active_floats.append({"side": side, "edge": edge, "top": child_box.y,
+                                  "bottom": child_box.y + child_box.height + mb})
+
+
 def _fix_flex_baseline_alignment(node_map: dict) -> None:
     """CSS Flexbox 8.3: an author `display: flex` row whose items align on
     `baseline` (`align-items`, or an item's own `align-self`). Taffy only
@@ -10808,6 +11133,7 @@ def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_hei
     _apply_root_margin_offset(root_element, node_map)
     if features["flex_row_members"]:
         _fix_flex_row_baseline_alignment(node_map)
+    _fix_inline_float_position(node_map)
     _fix_flex_baseline_alignment(node_map)
     _fix_flex_safe_alignment(node_map)
     _fix_flex_rtl_mirroring(node_map)

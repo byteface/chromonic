@@ -15,7 +15,6 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 
-_DEFAULT_URL = "https://google.com/"
 _LOCAL_SUFFIXES = {".html", ".htm", ".xhtml", ".xht"}
 
 
@@ -65,8 +64,11 @@ def _local_path(value: str) -> Path | None:
     """Return a local path when *value* clearly names one."""
     parsed = urllib.parse.urlparse(value)
 
-    # Explicit web URLs are never local paths.
-    if parsed.scheme.lower() in ("http", "https"):
+    # Explicit web URLs, and chromonic's own internal `chromonic://` pages,
+    # are never local paths -- without this, `"/" in value` below (true for
+    # any `scheme://...`) would send `chromonic://home` through `Path()`
+    # and fail as a missing local file.
+    if parsed.scheme.lower() in ("http", "https", "chromonic"):
         return None
 
     if parsed.scheme.lower() == "file":
@@ -274,8 +276,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "target",
         nargs="?",
-        default=_DEFAULT_URL,
-        help="URL, hostname, HTML file, or directory containing index.html",
+        default=None,
+        help="URL, hostname, HTML file, or directory containing index.html "
+             "(default: chromonic's own start page, or your configured homepage)",
     )
     parser.add_argument(
         "--width",
@@ -340,7 +343,12 @@ def main(argv: list[str] | None = None) -> int:
         width, height = args.size or (args.width, args.height)
         frames = args.frames if args.frames is not None else (2 if args.smoke else None)
 
-        with _target_url(args.target) as url:
+        target = args.target
+        if target is None:
+            from .homepage import start_url
+            target = start_url()
+
+        with _target_url(target) as url:
             # Keep heavyweight GL/Skia imports out of help/version/dev dispatch.
             from .native_browser import run
 

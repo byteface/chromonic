@@ -35,10 +35,15 @@ _MAX_UNICODE_RANGE_CODEPOINTS = 20_000
 
 def read_resource(url):
     """Return bytes and final URL, preserving redirects for relative CSS URLs."""
+    from . import netlog
+
     if not urllib.parse.urlsplit(url).scheme:
         url = Path(url).resolve().as_uri()
+    netlog.log("font", f"GET {url}")
     with urllib.request.urlopen(url, timeout=10) as response:
-        return response.read(), response.url
+        data = response.read()
+        netlog.log("font", f"200 {response.url} ({len(data)} bytes)")
+        return data, response.url
 
 
 _URL_RE = re.compile(r"""url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s][^)]*?))\s*\)""", re.I)

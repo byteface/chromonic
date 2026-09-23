@@ -19,12 +19,13 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use taffy::prelude::*;
 use taffy::geometry::Point;
-use taffy::style::{Contain, Overflow};
+use taffy::style::{CheapCloneStr, Contain, Overflow};
 use taffy::{compute_leaf_layout, AlignContent, AlignItems, TaffyError};
 
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontStyle as ParleyFontStyle,
-    FontWeight as ParleyFontWeight, LayoutContext, LineHeight as ParleyLineHeight, StyleProperty,
+    FontWeight as ParleyFontWeight, LayoutContext, LineHeight as ParleyLineHeight,
+    OverflowWrap as ParleyOverflowWrap, StyleProperty, WordBreak as ParleyWordBreak,
 };
 use std::cell::RefCell;
 
@@ -90,13 +91,124 @@ fn length_percentage_auto(value: &Bound<PyAny>) -> PyResult<LengthPercentageAuto
     })
 }
 
+/// `style_bridge._tracks()`'s vocabulary for one grid track: the plain
+/// `read_raw_len` shapes (px/`("pct", f)`/`("fr", f)`/`"auto"`), plus
+/// `"min-content"`/`"max-content"`, `("fit-content", <length>)`, and
+/// `("minmax", <min>, <max>)` (whose own `<min>`/`<max>` are each one of
+/// the same shapes, minus `fr` on the min side and `fit-content` on
+/// either -- CSS Grid 1 7.2.3/7.2.4).
+fn min_track_sizing_function(value: &Bound<PyAny>) -> PyResult<MinTrackSizingFunction> {
+    if let Ok(text) = value.extract::<String>() {
+        return Ok(match text.as_str() {
+            "auto" => auto(),
+            "min-content" => min_content(),
+            "max-content" => max_content(),
+            other => return Err(PyValueError::new_err(format!("unrecognised min track keyword: {other:?}"))),
+        });
+    }
+    if let Ok(px) = value.extract::<f32>() {
+        return Ok(length(px));
+    }
+    if let Ok(tuple) = value.cast::<PyTuple>() {
+        if tuple.len() == 2 {
+            if let Ok(tag) = tuple.get_item(0)?.extract::<String>() {
+                if tag == "pct" {
+                    return Ok(percent(tuple.get_item(1)?.extract::<f32>()?));
+                }
+            }
+        }
+    }
+    Err(PyValueError::new_err("expected a min track sizing value"))
+}
+
+fn max_track_sizing_function(value: &Bound<PyAny>) -> PyResult<MaxTrackSizingFunction> {
+    if let Ok(text) = value.extract::<String>() {
+        return Ok(match text.as_str() {
+            "auto" => auto(),
+            "min-content" => min_content(),
+            "max-content" => max_content(),
+            other => return Err(PyValueError::new_err(format!("unrecognised max track keyword: {other:?}"))),
+        });
+    }
+    if let Ok(px) = value.extract::<f32>() {
+        return Ok(length(px));
+    }
+    if let Ok(tuple) = value.cast::<PyTuple>() {
+        if tuple.len() == 2 {
+            let tag: String = tuple.get_item(0)?.extract()?;
+            match tag.as_str() {
+                "pct" => return Ok(percent(tuple.get_item(1)?.extract::<f32>()?)),
+                "fr" => return Ok(fr(tuple.get_item(1)?.extract::<f32>()?)),
+                "fit-content" => return Ok(fit_content(length_percentage(&tuple.get_item(1)?)?)),
+                _ => {}
+            }
+        }
+    }
+    Err(PyValueError::new_err("expected a max track sizing value"))
+}
+
 fn track_sizing_function(value: &Bound<PyAny>) -> PyResult<TrackSizingFunction> {
-    Ok(match read_raw_len(value)? {
-        RawLen::Px(px) => length(px),
-        RawLen::Pct(frac) => percent(frac),
-        RawLen::Fr(n) => fr(n),
-        RawLen::Auto => auto(),
-    })
+    if let Ok(text) = value.extract::<String>() {
+        return Ok(match text.as_str() {
+            "auto" => auto(),
+            "min-content" => min_content(),
+            "max-content" => max_content(),
+            other => return Err(PyValueError::new_err(format!("unrecognised track keyword: {other:?}"))),
+        });
+    }
+    if let Ok(px) = value.extract::<f32>() {
+        return Ok(length(px));
+    }
+    if let Ok(tuple) = value.cast::<PyTuple>() {
+        let tag: String = tuple.get_item(0)?.extract()?;
+        match (tag.as_str(), tuple.len()) {
+            ("pct", 2) => return Ok(percent(tuple.get_item(1)?.extract::<f32>()?)),
+            ("fr", 2) => return Ok(fr(tuple.get_item(1)?.extract::<f32>()?)),
+            ("fit-content", 2) => return Ok(fit_content(length_percentage(&tuple.get_item(1)?)?)),
+            ("minmax", 3) => {
+                let min = min_track_sizing_function(&tuple.get_item(1)?)?;
+                let max = max_track_sizing_function(&tuple.get_item(2)?)?;
+                return Ok(minmax(min, max));
+            }
+            _ => {}
+        }
+    }
+    Err(PyValueError::new_err("expected a track sizing value"))
+}
+
+/// One `grid-template-columns`/`-rows` component: an ordinary track (any
+/// `track_sizing_function` shape), or `("repeat", count, [track, ...])`
+/// for a `repeat()` -- `count` is either an integer or `"auto-fill"`/
+/// `"auto-fit"` (CSS Grid 1 7.2.3.1), left to Taffy's own explicit-grid
+/// sizing to expand (an auto-repeat's real count depends on the
+/// container's available space, unknowable in `style_bridge.py`).
+fn grid_template_component<S: CheapCloneStr>(value: &Bound<PyAny>) -> PyResult<GridTemplateComponent<S>> {
+    if let Ok(tuple) = value.cast::<PyTuple>() {
+        if tuple.len() == 3 {
+            if let Ok(tag) = tuple.get_item(0)?.extract::<String>() {
+                if tag == "repeat" {
+                    let tracks_list = tuple.get_item(2)?;
+                    let tracks: Vec<TrackSizingFunction> = tracks_list
+                        .cast::<PyList>()?
+                        .iter()
+                        .map(|item| track_sizing_function(&item))
+                        .collect::<PyResult<Vec<_>>>()?;
+                    let count_item = tuple.get_item(1)?;
+                    return Ok(if let Ok(count_str) = count_item.extract::<String>() {
+                        if count_str != "auto-fill" && count_str != "auto-fit" {
+                            return Err(PyValueError::new_err(format!(
+                                "unrecognised repeat() count: {count_str:?}"
+                            )));
+                        }
+                        repeat(count_str.as_str(), tracks)
+                    } else {
+                        repeat(count_item.extract::<u16>()?, tracks)
+                    });
+                }
+            }
+        }
+    }
+    Ok(track_sizing_function(value)?.into())
 }
 
 fn get<'py>(dict: &Bound<'py, PyDict>, key: &str) -> Option<Bound<'py, PyAny>> {
@@ -309,11 +421,25 @@ fn parse_style(dict: &Bound<PyDict>) -> PyResult<Style> {
 
     let grid_template_columns = match get(dict, "grid_template_columns") {
         None => vec![],
-        Some(v) => v.cast::<PyList>()?.iter().map(|item| track_sizing_function(&item).map(Into::into)).collect::<PyResult<Vec<_>>>()?,
+        Some(v) => v.cast::<PyList>()?.iter().map(|item| grid_template_component(&item)).collect::<PyResult<Vec<_>>>()?,
     };
     let grid_template_rows = match get(dict, "grid_template_rows") {
         None => vec![],
-        Some(v) => v.cast::<PyList>()?.iter().map(|item| track_sizing_function(&item).map(Into::into)).collect::<PyResult<Vec<_>>>()?,
+        Some(v) => v.cast::<PyList>()?.iter().map(|item| grid_template_component(&item)).collect::<PyResult<Vec<_>>>()?,
+    };
+    // CSS Grid 1 7.5: an implicit track (one the grid creates on demand
+    // for placement that overflows the explicit `grid-template-*`) sizes
+    // from `grid-auto-rows`/`-columns`, not the explicit tracks' default
+    // -- absent, Taffy's own default is a single implicit `auto` track,
+    // repeated as needed, which is already correct for the common case
+    // this leaves unset.
+    let grid_auto_rows = match get(dict, "grid_auto_rows") {
+        None => vec![],
+        Some(v) => v.cast::<PyList>()?.iter().map(|item| track_sizing_function(&item)).collect::<PyResult<Vec<_>>>()?,
+    };
+    let grid_auto_columns = match get(dict, "grid_auto_columns") {
+        None => vec![],
+        Some(v) => v.cast::<PyList>()?.iter().map(|item| track_sizing_function(&item)).collect::<PyResult<Vec<_>>>()?,
     };
 
     Ok(Style {
@@ -339,9 +465,16 @@ fn parse_style(dict: &Bound<PyDict>) -> PyResult<Style> {
         align_self: parse_align_items(&get_str(dict, "align_self", "")?)?,
         justify_content: parse_align_content(&get_str(dict, "justify_content", "")?)?,
         align_content: parse_align_content(&get_str(dict, "align_content", "")?)?,
+        // CSS Box Alignment 3: grid's *inline*-axis counterpart to
+        // `align-items`/`align-self` -- flexbox has no such axis (its
+        // single cross axis is `align-items`), so this is grid-only.
+        justify_items: parse_align_items(&get_str(dict, "justify_items", "")?)?,
+        justify_self: parse_align_items(&get_str(dict, "justify_self", "")?)?,
         grid_auto_flow,
         grid_template_columns,
         grid_template_rows,
+        grid_auto_rows,
+        grid_auto_columns,
         grid_column: parse_grid_placement(get(dict, "grid_column"))?,
         grid_row: parse_grid_placement(get(dict, "grid_row"))?,
         aspect_ratio: get_opt_f32(dict, "aspect_ratio")?,
@@ -620,7 +753,8 @@ thread_local! {
 #[pyfunction]
 #[pyo3(signature = (
     text, font_family, font_size, font_weight=400.0, italic=false, max_width=None,
-    letter_spacing=0.0, word_spacing=0.0, line_height=None
+    letter_spacing=0.0, word_spacing=0.0, line_height=None,
+    word_break="normal", overflow_wrap="normal"
 ))]
 #[allow(clippy::too_many_arguments)]
 fn layout_text(
@@ -633,7 +767,28 @@ fn layout_text(
     letter_spacing: f32,
     word_spacing: f32,
     line_height: Option<f32>,
+    word_break: &str,
+    overflow_wrap: &str,
 ) -> PyResult<(f32, f32, Vec<(String, f32, f32)>)> {
+    // CSS Text 3 `word-break`/`overflow-wrap` (the latter's legacy alias
+    // `word-wrap` resolves to the same values before reaching here --
+    // `style_bridge.py`'s job, not this binding's) map directly onto
+    // Parley's own `WordBreak`/`OverflowWrap` style properties, which
+    // already implement the real semantics (line_break.rs's own
+    // Unicode-aware break-opportunity walk, not reimplemented here).
+    // An unrecognized value (a typo, or a keyword this CSS level doesn't
+    // define) falls back to `Normal`, matching how an invalid CSS
+    // declaration is simply never applied at all.
+    let word_break = match word_break {
+        "break-all" => ParleyWordBreak::BreakAll,
+        "keep-all" => ParleyWordBreak::KeepAll,
+        _ => ParleyWordBreak::Normal,
+    };
+    let overflow_wrap = match overflow_wrap {
+        "anywhere" => ParleyOverflowWrap::Anywhere,
+        "break-word" => ParleyOverflowWrap::BreakWord,
+        _ => ParleyOverflowWrap::Normal,
+    };
     TEXT_FONT_CX.with(|font_cx_cell| {
         TEXT_LAYOUT_CX.with(|layout_cx_cell| {
             let mut font_cx = font_cx_cell.borrow_mut();
@@ -654,6 +809,8 @@ fn layout_text(
             if let Some(lh) = line_height {
                 builder.push_default(StyleProperty::LineHeight(ParleyLineHeight::Absolute(lh)));
             }
+            builder.push_default(StyleProperty::WordBreak(word_break));
+            builder.push_default(StyleProperty::OverflowWrap(overflow_wrap));
             let mut layout: parley::Layout<()> = builder.build(text);
             layout.break_all_lines(max_width);
             layout.align(Alignment::Start, AlignmentOptions::default());

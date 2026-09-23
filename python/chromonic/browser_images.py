@@ -219,6 +219,9 @@ def _decode_data_uri(uri: str) -> bytes:
 
 def _fetch_bytes(url: str) -> bytes:
     """Fetch one encoded image with a hard upper bound on response size."""
+    from . import netlog
+
+    netlog.log("img", f"GET {url}")
     request = urllib.request.Request(
         url,
         headers={
@@ -246,7 +249,9 @@ def _fetch_bytes(url: str) -> bytes:
             if total > _MAX_IMAGE_BYTES:
                 raise ValueError(f"image exceeds {_MAX_IMAGE_BYTES} byte limit")
             chunks.append(chunk)
-        return b"".join(chunks)
+        data = b"".join(chunks)
+        netlog.log("img", f"200 {url} ({len(data)} bytes)")
+        return data
 
 
 _SVG_ROOT_TAG_RE = re.compile(rb"<svg\b[^>]*>", re.IGNORECASE | re.DOTALL)

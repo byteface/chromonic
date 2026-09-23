@@ -3,11 +3,13 @@ understands.
 
 See `../PLAN.md` ("The Rust<->Python boundary") for the vocabulary: a length
 is a `float` (px), `("pct", fraction)`, `("fr", n)` (track sizes only), or
-the string `"auto"`. This is a deliberately *narrow* translator -- it covers
+the string `"auto"`; a grid track can also be `"min-content"`/
+`"max-content"`, `("fit-content", length)`, `("minmax", min, max)`, or
+`("repeat", count, [track, ...])` (`count` an int or `"auto-fill"`/
+`"auto-fit"`). This is a deliberately *narrow* translator -- it covers
 exactly what the examples need, not the full `LayoutStyle` surface (named
-grid lines/areas, `repeat()`/`minmax()`/`fit-content()` tracks,
-`aspect-ratio`, `box-sizing` are all left for a real second pass -- see
-PLAN.md's "Explicitly out of scope"). Absolute positioning's `inset`
+grid lines/areas, `aspect-ratio`, `box-sizing` are all left for a real
+second pass -- see PLAN.md's "Explicitly out of scope"). Absolute positioning's `inset`
 (`top`/`right`/`bottom`/`left`) *is* modelled, added for phase 6's particle
 demo -- `style.inset` is already the same `Edges` shape `margin` is, so it's
 the same `_edges()` translation.
@@ -19,7 +21,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import re
 
-from domonic.layout import AUTO, Edges, Fr, GridLine, GridSpan, Keyword, Length, LayoutStyle, Percent
+from domonic.layout import AUTO, Edges, Fr, GridLine, GridSpan, Keyword, Length, LayoutStyle, Percent, Ratio
 
 
 _VIEWPORT = ContextVar("chromonic_style_viewport", default=(None, None))
@@ -113,41 +115,138 @@ def _padding_edges(edges: Edges) -> list:
     return [_non_negative(value) for value in _edges(edges)]
 
 
-_REPEAT_TRACK = re.compile(r"^repeat\(\s*(\d+)\s*,\s*([^(),]+)\s*\)$", re.I)
+_TRACK_FUNCTION_RE = re.compile(r"^([a-z-]+)\((.*)\)$", re.I | re.S)
+_NAMED_LINE_RE = re.compile(r"^\[.*\]$")
 
 
-def _keyword_track(value: str):
-    value = value.strip().lower()
-    if value.endswith("fr"):
+def _split_top_level(text: str, sep: str) -> list:
+    """`text` split on `sep`, ignoring an occurrence nested inside `(...)`
+    (`minmax(10px, 1fr)`'s own internal comma must not split `repeat(2,
+    minmax(10px, 1fr))`'s outer count-from-tracks comma)."""
+    parts, depth, current = [], 0, []
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == sep and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def _split_track_tokens(text: str) -> list:
+    """The same whitespace-outside-parens splitting domonic's own
+    `_split_track_list` does, applied to a `repeat()`'s own (already-
+    extracted, still function-call-bearing) inner track list."""
+    tokens, depth, current = [], 0, []
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char.isspace() and depth == 0:
+            if current:
+                tokens.append("".join(current))
+                current = []
+            continue
+        current.append(char)
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _track_value(text: str):
+    """One already-tokenized `grid-template-*`/`grid-auto-*` track (domonic
+    hands a `repeat()`/`minmax()`/`fit-content()` call over as a single
+    opaque `Keyword` -- CSS Grid 1 §7.2's whole function-call vocabulary is
+    therefore parsed here, from the raw text, not through domonic's cascade
+    at all) -> the shape `src/lib.rs`'s track parser accepts: a plain
+    length, `("fr", n)`, `"auto"`/`"min-content"`/`"max-content"`,
+    `("fit-content", length)`, or `("minmax", min, max)`. `None` for
+    anything unrecognised (a named line `[foo]`, an unresolved custom
+    property, a track function nesting deeper than CSS itself allows, ...)."""
+    text = text.strip()
+    low = text.lower()
+    if low in ("auto", "min-content", "max-content"):
+        return low
+    if low.endswith("fr"):
         try:
-            return ("fr", float(value[:-2]))
+            return ("fr", float(text[:-2]))
         except ValueError:
             return None
-    if value.endswith("px"):
+    if low.endswith("px"):
         try:
-            return float(value[:-2])
+            return float(text[:-2])
         except ValueError:
             return None
-    if value.endswith("%"):
+    if low.endswith("%"):
         try:
-            return ("pct", float(value[:-1]) / 100.0)
+            return ("pct", float(text[:-1]) / 100.0)
         except ValueError:
             return None
-    return "auto" if value == "auto" else None
+    match = _TRACK_FUNCTION_RE.match(text)
+    if not match:
+        return None
+    name, inner = match.group(1).lower(), match.group(2)
+    if name == "fit-content":
+        # The argument is always a plain length/percentage (CSS Sizing 3
+        # never lets `fit-content()` nest a keyword or another function).
+        value = _track_value(inner)
+        if isinstance(value, (int, float)) or (isinstance(value, tuple) and value[0] == "pct"):
+            return ("fit-content", value)
+        return None
+    if name == "minmax":
+        parts = _split_top_level(inner, ",")
+        if len(parts) == 2:
+            min_value, max_value = _track_value(parts[0]), _track_value(parts[1])
+            if min_value is not None and max_value is not None:
+                return ("minmax", min_value, max_value)
+    return None
+
+
+def _repeat_track_list(inner: str) -> "list | None":
+    """`repeat()`'s own body, already split from its count argument --
+    the (possibly multi-track, per CSS Grid 1 §7.2.3.1) space-separated
+    list repeated each time; a bare `[line-name]` token is dropped
+    (named lines aren't modelled -- see PLAN.md)."""
+    tracks = []
+    for token in _split_track_tokens(inner):
+        if _NAMED_LINE_RE.match(token):
+            continue
+        value = _track_value(token)
+        tracks.append(value if value is not None else ("fr", 1.0))
+    return tracks or None
 
 
 def _tracks(tracks: list) -> list:
     result = []
     for track in tracks:
         if isinstance(track, Keyword):
-            repeated = _REPEAT_TRACK.match(track.value)
-            if repeated:
-                parsed = _keyword_track(repeated.group(2))
-                if parsed is not None:
-                    result.extend([parsed] * int(repeated.group(1)))
-                    continue
-            parsed = _keyword_track(track.value)
-            result.append(parsed if parsed is not None else ("fr", 1.0))
+            text = track.value.strip()
+            if _NAMED_LINE_RE.match(text):
+                continue  # a bare `[line-name]` line-list entry, not a track itself
+            match = _TRACK_FUNCTION_RE.match(text)
+            if match and match.group(1).lower() == "repeat":
+                parts = _split_top_level(match.group(2), ",")
+                if len(parts) >= 2:
+                    count_text = parts[0].strip().lower()
+                    inner_tracks = _repeat_track_list(",".join(parts[1:]))
+                    if inner_tracks is not None:
+                        if count_text in ("auto-fill", "auto-fit"):
+                            count = count_text
+                        else:
+                            try:
+                                count = int(count_text)
+                            except ValueError:
+                                count = 1
+                        result.append(("repeat", count, inner_tracks))
+                        continue
+            value = _track_value(text)
+            result.append(value if value is not None else ("fr", 1.0))
         else:
             result.append(_len(track, default=("fr", 1.0)))
     return result
@@ -255,6 +354,35 @@ def _flex_direction(kw: Keyword) -> str:
     return value if value in ("row", "row-reverse", "column", "column-reverse") else "row"
 
 
+def _aspect_ratio(value) -> "float | None":
+    """CSS Sizing 4 `aspect-ratio` -> the plain `width/height` float
+    `Style.aspect_ratio` (`src/lib.rs`) wants, or `None` for `auto` (no
+    declared ratio -- a replaced element's own *intrinsic* ratio, set
+    separately in `tree.py`'s `_apply_image_intrinsic_size`/etc., still
+    applies as before). domonic's own parser already collapses the
+    `auto <ratio>` / `<ratio> auto` combined syntax down to just the
+    ratio half (dropping which form was written) -- CSS's own "prefer the
+    replaced element's natural ratio when `auto` was *also* given"
+    nuance isn't distinguishable from a bare `<ratio>` here, so a
+    replaced element with both an intrinsic size and an `auto <ratio>`
+    declaration incorrectly prefers the declared ratio outright. Not
+    patched upstream; narrower than it looks in practice (a real page
+    combining `aspect-ratio: auto <ratio>` with a sized image is rare)."""
+    # CSS Sizing 4 `<ratio> = <number [0,inf]> [ / <number [0,inf]> ]?`,
+    # but a *zero* value on either side makes the ratio invalid (the
+    # underlying `<number>` production requires it to round-trip through
+    # a real division), and domonic doesn't reject it -- read literally,
+    # a `0/1` ratio divides down to `0.0`, and `1/0` would divide up to
+    # `inf`, both of which crash something downstream expecting a finite
+    # float (confirmed on `css-sizing/aspect-ratio/zero-or-infinity-
+    # 001.html`: `OverflowError: cannot convert float infinity to
+    # integer`). Treated as `auto` (no declared ratio) instead, same as
+    # `AUTO` itself.
+    if isinstance(value, Ratio) and value.width > 0 and value.height > 0:
+        return value.width / value.height
+    return None
+
+
 def _grid_line(value):
     """A `grid-column`/`grid-row` longhand value, in whatever shape
     `src/lib.rs`'s `parse_grid_placement` accepts: an explicit line number
@@ -319,9 +447,27 @@ def to_dict(style: LayoutStyle) -> dict:
         "justify_content": _align_keyword(
             style.justifyContent, content=True,
             inline_axis=not _flex_direction(style.flexDirection).startswith("column")),
+        # CSS Box Alignment 3: grid's own inline-axis item alignment --
+        # `justify-self` (`justify-items` has no `LayoutStyle` field at
+        # all; domonic doesn't recognise it as a property, so it's read
+        # straight off the raw cascade in `tree.build()` instead, the
+        # same workaround `justify-self`'s own field already relies on).
+        "justify_self": _align_keyword(style.justifySelf, content=False),
         "grid_auto_flow": _keyword(style.gridAutoFlow),
         "grid_template_columns": _tracks(style.gridTemplateColumns),
         "grid_template_rows": _tracks(style.gridTemplateRows),
+        # CSS Grid 1 §7.5: the size of a track the grid creates on demand
+        # (an item placed/auto-placed past the explicit `grid-template-*`
+        # tracks) -- absent, Taffy's own default (a single implicit
+        # `auto` track, repeated as needed) already matches the CSS
+        # initial value, so an empty list here is the correct default.
+        "grid_auto_rows": _tracks(style.gridAutoRows),
+        "grid_auto_columns": _tracks(style.gridAutoColumns),
         "grid_column": (_grid_line(style.gridColumnStart), _grid_line(style.gridColumnEnd)),
         "grid_row": (_grid_line(style.gridRowStart), _grid_line(style.gridRowEnd)),
+        # CSS Sizing 4 `aspect-ratio` -- `None` (the common case, no
+        # author declaration) leaves `tree.py`'s own replaced-element
+        # intrinsic-ratio handling as the only source, exactly as before
+        # this field existed at all.
+        "aspect_ratio": _aspect_ratio(style.aspectRatio),
     }

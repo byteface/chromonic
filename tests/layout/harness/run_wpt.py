@@ -171,8 +171,26 @@ def auto_tag(source):
                 "#log { display: none !important; }</style>")
         source, count = re.subn(r"(<head\b[^>]*>)", lambda m: m.group(1) + rule, source, count=1, flags=re.I)
         if not count:
-            source = re.sub(r"(<html\b[^>]*>)", lambda m: m.group(1) + "<head>" + rule + "</head>",
-                            source, count=1, flags=re.I)
+            source, count = re.subn(r"(<html\b[^>]*>)", lambda m: m.group(1) + "<head>" + rule + "</head>",
+                                    source, count=1, flags=re.I)
+        if not count:
+            # Neither an explicit `<head>` nor `<html>` tag exists -- common,
+            # valid HTML5 in these fixtures (`<!DOCTYPE html><title>...
+            # <style>...</style><body>...`, no wrapper tags at all). A
+            # `<style>` this early in the source is still real head content
+            # once the parser supplies the implicit `<head>`, so it's
+            # inserted right after any `<!DOCTYPE>` (or at the very top if
+            # even that's missing) rather than depending on either tag
+            # existing. Found on `css-grid/grid-definition/grid-auto-fill-
+            # columns-001.html`: with neither fallback firing, `#log` (`ing
+            # the testharness.js resulting from `checkLayout()`'s own many
+            # per-line pass/fail assertions here specifically) stayed
+            # visible in the Chrome capture and pushed 6000+px of real
+            # content down the page under its own multi-thousand-line
+            # results table.
+            doctype = re.match(r"\s*<!DOCTYPE[^>]*>", source, re.I)
+            insert_at = doctype.end() if doctype else 0
+            source = source[:insert_at] + rule + source[insert_at:]
 
     tagger = LayoutTagger(source)
     tagger.feed(source)
