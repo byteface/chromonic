@@ -15,11 +15,10 @@ _GRID_AREA_LINE_RE = re.compile(r"^[+-]?\d+$")
 
 
 def _parse_grid_area_token(token: str):
-    """One `/`-separated `grid-area` component -> the same (line-number,
-    `("span", n)`, or `None`-for-auto) shape `src/lib.rs`'s
-    `parse_grid_placement` accepts. A named line/area (`<custom-ident>`,
-    real but not modelled -- see PLAN.md) falls back to `None`/auto
-    rather than guessing a line number."""
+    """One /-separated grid-area component -> the same (line-number,
+    ("span", n), or None-for-auto) shape src/lib.rs's parse_grid_placement
+    accepts. A named line/area (real but not modelled -- see PLAN.md)
+    falls back to None/auto rather than guessing a line number."""
     token = token.strip()
     if not token or token.lower() == "auto":
         return None
@@ -33,14 +32,9 @@ def _parse_grid_area_token(token: str):
 
 
 def _parse_grid_area(area: str):
-    """CSS Grid 1 §8.3.1 `grid-area: <row-start> [/ <column-start> [/
-    <row-end> [/ <column-end>]]]` -- omitted trailing components are
-    `auto` (the named-line "inherit the previous component's ident"
-    special case doesn't apply here: every component this function
-    resolves to a real line number/span is already a plain integer/`span
-    N`, never a `<custom-ident>`). Returns `((row_start, row_end),
-    (col_start, col_end))`, each component already in `_grid_line()`'s
-    output shape."""
+    """CSS Grid 1 8.3.1 grid-area: <row-start> [/ <column-start> [/
+    <row-end> [/ <column-end>]]] -- omitted trailing components are auto.
+    Returns ((row_start, row_end), (col_start, col_end))."""
     parts = [p.strip() for p in area.split("/")]
     parts += ["auto"] * (4 - len(parts))
     row_start, col_start, row_end, col_end = (_parse_grid_area_token(p) for p in parts[:4])
@@ -49,7 +43,7 @@ def _parse_grid_area(area: str):
 
 
 def _css_order(computed) -> int:
-    """The computed `order` (CSS Flexbox 5.4) as an int; 0 when unset,
+    """The computed order (CSS Flexbox 5.4) as an int; 0 when unset,
     unparsable, or for an anonymous item with no computed style."""
     try:
         return int(float(getattr(computed, "order", 0) or 0))
@@ -59,13 +53,10 @@ def _css_order(computed) -> int:
 
 
 def _is_flex_or_grid_item(element) -> bool:
-    """Whether `element`'s parent box is a real author flex or grid
-    container -- then `width: auto` on this block is a flex/grid item's
+    """Whether element's parent box is a real author flex or grid
+    container -- then width:auto on this block is a flex/grid item's
     content-sized (then flexed/stretched by Taffy) width, never CSS 2.1
-    10.3.3's fill-the-containing-block (`align-items-baseline-row-horz.
-    html`: `<div>line1<br>line2</div>` items were handed to Taffy as
-    `width: 100%` and shrank proportionally instead of sitting at their
-    max-content widths)."""
+    10.3.3's fill-the-containing-block -- align-items-baseline-row-horz.html."""
     parent = dom._layout_parent(element)
     if parent is None or not hasattr(parent, "__dict__"):
         return False
@@ -82,24 +73,23 @@ _FLEX_DISPLAYS = ("flex", "inline-flex", "-webkit-flex", "-webkit-inline-flex", 
 
 
 def _fix_flex_row_baseline_alignment(node_map: dict) -> None:
-    """Correct `display:flex; align-items:baseline` rows built by the
-    `elif inline_items:` mixed-text-and-elements flex-row approximation
-    (`build()`) -- Taffy's own baseline alignment silently falls back to
-    each item's own bottom edge whenever that item isn't a measured text
-    leaf itself (see `box_model._element_own_baseline`'s docstring), which is wrong
-    for exactly the case this approximation exists to handle: real text
-    sharing a row with a nested element (e.g. an `inline-block`) whose own
-    text lives several Taffy levels down. Gated on `_chromonic_flex_row_
-    members`, set only by that one approximation -- never a real author
-    flexbox, whose own explicit `align-items:baseline` must keep Taffy's
-    own (here, correct-by-definition) behavior untouched."""
+    """Correct display:flex; align-items:baseline rows built by the `elif
+    inline_items:` mixed-text-and-elements flex-row approximation (build())
+    -- Taffy's baseline alignment falls back to each item's bottom edge
+    whenever that item isn't a measured text leaf itself (see
+    `box_model._element_own_baseline`'s docstring), wrong for exactly the case
+    this approximation exists to handle: real text sharing a row with a
+    nested element whose text lives several Taffy levels down. Gated on
+    _chromonic_flex_row_members, set only by that approximation -- never a
+    real author flexbox, whose explicit align-items:baseline must keep
+    Taffy's own correct-by-definition behavior untouched."""
     for element in node_map.values():
-        # Not gated on `dom._is_element`: `_group_inline_element_runs`' own
-        # anonymous-block wrapper (`_AnonymousInlineRun`, a pseudo-node
-        # with `nodeType` 3, not a real `Element`) sets this attribute too,
-        # for a run of consecutive real inline-level element siblings --
-        # excluding it here silently skipped that whole case (confirmed on
-        # `wpt/css/CSS2/visudet/content-height-001.html`).
+        # Not gated on dom._is_element: `_group_inline_element_runs`'s
+        # anonymous-block wrapper (_AnonymousInlineRun, a pseudo-node, not
+        # a real Element) sets this attribute too, for a run of
+        # consecutive real inline-level element siblings -- excluding it
+        # here silently skipped that case --
+        # wpt/css/CSS2/visudet/content-height-001.html.
         members = element.__dict__.get("_chromonic_flex_row_members") if hasattr(element, "__dict__") else None
         if not members or len(members) < 2:
             continue
@@ -110,24 +100,23 @@ def _fix_flex_row_baseline_alignment(node_map: dict) -> None:
         current: list = []
         prev_x = None
         # An absolutely-positioned member sits where its insets put it,
-        # never on the line's baseline (table-vertical-align-baseline-
-        # 009.xht: `position: absolute; bottom: 0`).
+        # never on the line's baseline --
+        # table-vertical-align-baseline-009.xht.
         in_flow = [member for member in members
                    if member.__dict__.get("_layout_box") is not None
                    and (member.__dict__.get("_chromonic_native_style") or {}).get("position")
                    not in ("absolute", "fixed")]
         prev_bottom = None
-        # An rtl line (`row-reverse`, see `build()`'s `elif inline_items:`)
-        # advances leftwards, so "x turns back" means x *increasing*.
+        # An rtl line (row-reverse) advances leftwards, so "x turns back"
+        # means x increasing.
         reversed_row = (element.__dict__.get("_chromonic_native_style") or {}).get("flex_direction") == "row-reverse"
         for member in in_flow:
             member_box = member.__dict__["_layout_box"]
             # A new wrapped row starts where x turns back -- or, for a
-            # member alone on its row (`align-content-wrap-004.html`: four
-            # inline-blocks each wider than the 100px column item, all at
-            # x=8), where x fails to advance and the member sits below
-            # the previous one; the old strict "x decreased" test folded
-            # those four rows onto one baseline.
+            # member alone on its row, where x fails to advance and the
+            # member sits below the previous one; the old strict "x
+            # decreased" test folded those rows onto one baseline --
+            # align-content-wrap-004.html.
             turned = prev_x is not None and (
                 (member_box.x > prev_x + 0.01) if reversed_row else (member_box.x < prev_x - 0.01))
             if prev_x is not None and (
@@ -142,13 +131,12 @@ def _fix_flex_row_baseline_alignment(node_map: dict) -> None:
         if len(current) > 1:
             rows.append(current)
         for row in rows:
-            # Taffy's own cross-axis sizing for a custom `MeasureFunc` leaf
-            # inside an `align-items:baseline` row doesn't reliably keep
-            # that leaf's own correctly-measured `height:auto` result (see
-            # `_make_measure`'s own `_chromonic_measured_height` stash, and
-            # `_InlineFormattingPlan.height` for a leaf with its own inline
-            # plan) -- re-assert it here, before any baseline math below
-            # reads a (possibly still-wrong) `member_box.height`.
+            # Taffy's cross-axis sizing for a custom MeasureFunc leaf
+            # inside an align-items:baseline row doesn't reliably keep that
+            # leaf's correctly-measured height:auto result (see
+            # `_make_measure`'s _chromonic_measured_height stash, and
+            # `_InlineFormattingPlan.height`) -- re-assert it before any
+            # baseline math below reads a possibly-wrong member_box.height.
             for member in row:
                 member_native = member.__dict__.get("_chromonic_native_style")
                 if member_native is None or member_native.get("height") != "auto":
@@ -168,14 +156,13 @@ def _fix_flex_row_baseline_alignment(node_map: dict) -> None:
                     member_box, height=member_box.height + delta,
                     client_height=member_box.client_height + delta,
                 )
-            # Taffy already applied its *own* (here, sometimes wrong)
-            # cross-axis baseline offset to every member's current `y` --
-            # using that directly as a baseline reference would double-
-            # count it. Every flex item starts flush with the row's own
-            # cross-start edge before any such offset is added, so the
-            # member Taffy already trusted most (the one it moved least,
-            # i.e. the smallest current `y`) recovers that shared,
-            # un-offset row top.
+            # Taffy already applied its own (here, sometimes wrong)
+            # cross-axis baseline offset to every member's current y --
+            # using that directly as a baseline reference would
+            # double-count it. Every flex item starts flush with the row's
+            # cross-start edge before any offset is added, so the member
+            # Taffy moved least (the smallest current y) recovers that
+            # shared, un-offset row top.
             entries = [(member, member.__dict__.get("_layout_box")) for member in row]
             row_top = min(member_box.y for _m, member_box in entries)
             baselines = []
@@ -193,13 +180,11 @@ def _fix_flex_row_baseline_alignment(node_map: dict) -> None:
                     geometry._shift_subtree(member, 0.0, delta)
                 else:
                     geometry._shift_box(member, 0.0, delta)
-        # Taffy sized this `height:auto` container from its own (wrong)
-        # baseline offsets too -- a member it dropped 100px to meet a
-        # sibling's baseline made the line 100px taller than the members
-        # now need. With a single line of members, the container's
-        # content ends where its lowest member's margin edge now does
-        # (table-vertical-align-baseline-008.xht: a 200px float around a
-        # 100px inline-block and a 100px inline-table).
+        # Taffy sized this height:auto container from its own (wrong)
+        # baseline offsets too -- a member it dropped to meet a sibling's
+        # baseline made the line taller than the members now need. With a
+        # single line, the container's content ends where its lowest
+        # member's margin edge now does -- table-vertical-align-baseline-008.xht.
         native = element.__dict__.get("_chromonic_native_style") or {}
         if len(rows) == 1 and native.get("height") == "auto" and len(rows[0]) == len(in_flow):
             padding = element.__dict__.get("_chromonic_padding", (0.0,) * 4)
@@ -220,15 +205,15 @@ def _fix_flex_row_baseline_alignment(node_map: dict) -> None:
 
 
 def _fix_flex_baseline_alignment(node_map: dict) -> None:
-    """CSS Flexbox 8.3: an author `display: flex` row whose items align on
-    `baseline` (`align-items`, or an item's own `align-self`). Taffy only
-    knows a baseline for a measured text leaf; an item whose text lives
-    further down (a `<div>` holding an `<a>`, `align-self-006.html`) gets
-    its bottom edge synthesized instead, so every such item was bottom-
-    aligned. Each flex line is re-aligned here on the items' real first
-    (or last) baselines, and when that makes the line taller than Taffy
-    made it, stretched/centred/end-aligned items in the line, later lines
-    and a `height: auto` container follow."""
+    """CSS Flexbox 8.3: an author display:flex row whose items align on
+    baseline (align-items, or an item's align-self). Taffy only knows a
+    baseline for a measured text leaf; an item whose text lives further
+    down (a <div> holding an <a>, align-self-006.html) gets its bottom
+    edge synthesized instead, so every such item was bottom-aligned. Each
+    flex line is re-aligned here on the items' real first (or last)
+    baselines, and when that makes the line taller than Taffy made it,
+    stretched/centred/end-aligned items in the line, later lines and a
+    height:auto container follow."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -348,14 +333,14 @@ def _fix_flex_baseline_alignment(node_map: dict) -> None:
 
 
 def _fix_flex_safe_alignment(node_map: dict) -> None:
-    """CSS Box Alignment 3 `safe`: an alignment that would make content
-    overflow its container falls back to `start` instead. Taffy has no
-    overflow-position notion (`style_bridge._align_keyword` drops the
-    `safe` prefix), so here, after layout, an in-flow flex item whose
-    `safe`-aligned cross size exceeds its single-line container's content
-    box is moved to the cross start, and a `safe` `justify-content` whose
-    items overflow the main axis packs them from the main start
-    (`flexbox-safe-overflow-position-001.html`)."""
+    """CSS Box Alignment 3 safe: an alignment that would make content
+    overflow its container falls back to start instead. Taffy has no
+    overflow-position notion (style_bridge._align_keyword drops the safe
+    prefix), so here, after layout, an in-flow flex item whose safe-aligned
+    cross size exceeds its single-line container's content box is moved
+    to the cross start, and a safe justify-content whose items overflow
+    the main axis packs them from the main start --
+    flexbox-safe-overflow-position-001.html."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -408,9 +393,9 @@ def _fix_flex_safe_alignment(node_map: dict) -> None:
                 if child_box.width + ml + mr > content_w + 0.01:
                     geometry._shift_subtree(child, content_x + ml - child_box.x, 0.0)
         # Main axis, whole line (single-line containers only). In a
-        # `-reverse` direction `flex-start` is the physical end, so `safe
-        # flex-start` overflowing also packs from the physical start
-        # (flexbox-safe-overflow-position-003.html).
+        # -reverse direction flex-start is the physical end, so safe
+        # flex-start overflowing also packs from the physical start --
+        # flexbox-safe-overflow-position-003.html.
         reverse = (getattr(computed, "flexDirection", "row") or "row").strip().lower().endswith("-reverse")
         overflow_keywords = ("center", "end", "flex-end", "right", "space-around", "space-evenly") + (
             ("flex-start", "space-between", "normal") if reverse else ())
@@ -433,16 +418,14 @@ def _fix_flex_safe_alignment(node_map: dict) -> None:
 
 
 def _fix_flex_rtl_mirroring(node_map: dict) -> None:
-    """CSS Flexbox 5.1/8: in a `direction: rtl` flex container the main
-    axis of a row runs right-to-left, and the cross axis of a column
-    starts at the right -- both are the container's horizontal axis
-    mirrored. Taffy has no writing direction, so every in-flow item's
-    margin box is reflected here across the container's content box
-    (flexbox-mbp-horiz-001-rtl.xhtml: the first item is flush right;
-    flexbox-align-self-vert-rtl-001.xhtml: `align-self: flex-start`
-    columns hug the right edge). Runs after the other flex passes so it
-    mirrors their final positions; absolutely positioned children keep
-    their own (already direction-aware) static position."""
+    """CSS Flexbox 5.1/8: in a direction:rtl flex container the main axis
+    of a row runs right-to-left, and the cross axis of a column starts at
+    the right -- both are the container's horizontal axis mirrored. Taffy
+    has no writing direction, so every in-flow item's margin box is
+    reflected here across the container's content box --
+    flexbox-mbp-horiz-001-rtl.xhtml, flexbox-align-self-vert-rtl-001.xhtml.
+    Runs after the other flex passes so it mirrors their final positions;
+    absolutely positioned children keep their own direction-aware static position."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
