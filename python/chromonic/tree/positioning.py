@@ -11,14 +11,11 @@ from . import box_model, dom, flex_grid, geometry, inline_finalize
 
 def _fix_absolute_shrink_to_fit_extent(node_map: dict) -> None:
     """CSS 2.1 10.3.7 rule 3/5: an absolutely positioned box with
-    `width: auto` and `left` or `right` auto is shrink-to-fit -- as wide
-    as its content's preferred width, which for a child capped by its own
-    `max-width` is that cap. Taffy sizes the box (the inline-content
-    approximation's flex container) from the children's raw max-content
-    instead (absolute-non-replaced-width-017..020.xht: a `max-width:
-    4em` inline-block or float of 8em text made a 240px box, not 120).
-    After layout the items' real extent is known: the box is narrowed to
-    it when they ended up narrower than the box."""
+    width:auto and left or right auto is shrink-to-fit, as wide as its
+    content's preferred width. Taffy sizes the flex-container
+    approximation from the children's raw max-content instead --
+    absolute-non-replaced-width-017..020.xht. After layout the items'
+    real extent is known, so the box narrows to it when narrower."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -66,12 +63,10 @@ def _fix_absolute_shrink_to_fit_extent(node_map: dict) -> None:
 
 
 def _fix_relative_rtl_insets(node_map: dict) -> None:
-    """CSS 2.1 9.4.3: a `position: relative` box with both `left` and
-    `right` set is over-constrained -- `left` wins in an ltr containing
-    block, `right` in an rtl one. Taffy always takes `left`; an rtl box
-    is moved from `left` to `-right` here (position-relative-010.xht:
-    `left: 1in; right: 1in` in an rtl div stays put; relpos-calcs-
-    006.xht: `left: -50%; right: -50%` moves right by 50%)."""
+    """CSS 2.1 9.4.3: a position:relative box with both left and right set
+    is over-constrained -- left wins in an ltr containing block, right in
+    an rtl one. Taffy always takes left; an rtl box is moved from left to
+    -right here -- position-relative-010.xht, relpos-calcs-006.xht."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -90,11 +85,10 @@ def _fix_relative_rtl_insets(node_map: dict) -> None:
             continue
         if dom._element_direction(parent, getattr(parent, "_chromonic_computed_style", None)) != "rtl":
             continue
-        # `_fix_rtl_block_positioning` leaves relative boxes alone, so
-        # this one is still at Taffy's left-aligned spot plus Taffy's
-        # `left`; CSS 2.1 10.3.3 puts an rtl block against the containing
-        # block's right edge (its `margin-left` is the one recomputed)
-        # before the relative offset applies.
+        # `_fix_rtl_block_positioning` leaves relative boxes alone, so this
+        # one is still at Taffy's left-aligned spot plus Taffy's left; CSS
+        # 2.1 10.3.3 puts an rtl block against the containing block's right
+        # edge before the relative offset applies.
         parent_padding = parent.__dict__.get("_chromonic_padding", (0.0,) * 4)
         content_x = parent_box.x + parent_box.border_left + parent_padding[3]
         content_width = parent_box.client_width - parent_padding[1] - parent_padding[3]
@@ -128,22 +122,16 @@ def _find_containing_block_ancestor(element):
     """The nearest ancestor establishing a real containing block for
     `element`'s absolute/fixed positioning, or `None` if none exists.
 
-    CSS 2.1 10.1 rule 4: a `position:fixed` box's containing block is
-    *always* the viewport (`None` here, so the caller falls back to the
-    root/viewport-anchored fix-up) -- unlike `position:absolute`'s rule 3,
-    no ancestor's own `position` can ever substitute for it, not even
-    another positioned one. Confirmed directly on `position-absolute-
-    005.xht`: a `position:fixed` box nested inside a `position:absolute`
-    ancestor was walking up and anchoring to that ancestor instead,
-    landing at its offset (296px, 418px) instead of the viewport's own
-    top-left corner (0, 0) real Chrome puts it at."""
-    # `element._chromonic_native_style["position"]` can't distinguish this
-    # -- `style_bridge._position()` maps CSS `fixed` to the same Taffy-level
-    # `"absolute"` string as CSS `absolute` (Taffy has no native `fixed`
-    # concept). `_chromonic_resolved_style`'s `LayoutStyle.position` is the
-    # pre-Taffy-mapping value straight from domonic's cascade, which still
-    # keeps `fixed` distinct -- the same source `box_model._is_absolutely_positioned`
-    # already reads for exactly this reason.
+    CSS 2.1 10.1 rule 4: a position:fixed box's containing block is always
+    the viewport (`None` here) -- unlike position:absolute's rule 3, no
+    ancestor's own position can ever substitute for it. Confirmed on
+    position-absolute-005.xht: a fixed box nested inside an absolute
+    ancestor anchored to that ancestor instead of the viewport."""
+    # `element._chromonic_native_style["position"]` can't distinguish this --
+    # style_bridge._position() maps CSS fixed to the same Taffy-level
+    # "absolute" string (Taffy has no native fixed concept).
+    # `_chromonic_resolved_style`'s LayoutStyle.position is the pre-mapping
+    # value that still keeps fixed distinct.
     own_resolved = getattr(element, "_chromonic_resolved_style", None)
     if own_resolved is not None:
         own_position = own_resolved[1].position
@@ -190,24 +178,19 @@ def _resolve_viewport_anchored_box(style: dict, box, viewport_height: float):
             return viewport_height - bottom_v - mb - new_height, new_height
         return None, new_height
     if bottom_v is None:
-        # `top` alone (or neither) determines this element's position --
-        # independent of the containing block's height. A root-anchored
-        # *absolute* box Taffy already has at `top`; a `position: fixed`
-        # box it attached to a positioned ancestor is at that ancestor's
-        # offset instead (position-absolute-005.xht: `top: 0` fixed inside
-        # an absolute inside a relative div sat at y 418), so `top` is
-        # re-asserted against the viewport.
+        # top alone (or neither) determines position, independent of the
+        # containing block's height. A fixed box attached to a positioned
+        # ancestor is at that ancestor's offset instead of the viewport's
+        # -- position-absolute-005.xht -- so top is re-asserted here.
         return (top_v + mt if top_v is not None else None), None
     if top_v is None:
-        # bottom-anchored, top:auto -- box.height is already right (an
-        # explicit or intrinsic height never depends on the containing
-        # block's own height), only the box's *position* needs correcting.
+        # Bottom-anchored, top:auto -- box.height is already right, only
+        # position needs correcting.
         return viewport_height - bottom_v - mb - box.height, None
-    # Both top and bottom are definite. If height is also definite, this is
-    # over-constrained -- top (+height) alone already fully determine the
-    # box, same as the top-only case above, so leave it alone. If height is
-    # auto, the box stretches to fill the gap between top and bottom, which
-    # *does* depend on the containing block's height.
+    # Both top and bottom definite. If height is also definite, this is
+    # over-constrained -- top (+height) alone determine the box, leave it
+    # alone. If height is auto, the box stretches to fill the gap, which
+    # does depend on the containing block's height.
     if height != "auto":
         return None, None
     return top_v + mt, viewport_height - top_v - mt - bottom_v - mb
@@ -228,8 +211,8 @@ def _resolve_viewport_anchored_box_x(style: dict, box, viewport_width: float, el
     width = style["width"]
     if isinstance(width, tuple) and width[0] == "pct":
         # Same opposite-inset-independent resolution as the height branch
-        # above -- also catches the synthetic `("pct", 1.0)` `build()`
-        # assigns a width:auto block with inline content, which for a
+        # above -- also catches the synthetic ("pct", 1.0) build() assigns
+        # a width:auto block with inline content, which for a
         # root-anchored box must resolve against the true viewport width.
         new_width = width[1] * viewport_width
         if left_v is not None:
@@ -238,23 +221,21 @@ def _resolve_viewport_anchored_box_x(style: dict, box, viewport_width: float, el
             return viewport_width - right_v - (mr or 0.0) - new_width, new_width
         return None, new_width
     if right_v is None:
-        # `left` alone determines position. Unlike the vertical
-        # counterpart, this can't just be left as Taffy computed it --
-        # `left_v` may be a percentage Taffy resolved against its own
-        # (margin-shrunk) root box instead of the true viewport width.
+        # left alone determines position. Unlike the vertical counterpart,
+        # this can't be left as Taffy computed it -- left_v may be a
+        # percentage Taffy resolved against its own margin-shrunk root box
+        # instead of the true viewport width.
         return (None if left_v is None else left_v + (ml or 0.0)), None
     if left_v is None:
         return viewport_width - right_v - (mr or 0.0) - box.width, None
     if width != "auto":
         return None, None
-    # CSS 2.1 10.3.7 rule 5 (`left`/`right` definite, `width` auto): any
-    # auto margin is 0 while solving for width. 10.4 then clamps that
-    # solved width to `min-width`/`max-width`; once clamped, width is back
-    # to being definite too, so an auto margin gets to re-absorb the slack
-    # the clamp freed up (equal split, or the same zero-one-side exception
-    # `_fix_absolute_horizontal_auto_margins` applies when that split would
-    # go negative) -- same reasoning as `_fix_absolute_width_against_
-    # containing_block`'s real-containing-block-ancestor case beside it.
+    # CSS 2.1 10.3.7 rule 5 (left/right definite, width auto): any auto
+    # margin is 0 while solving for width, then 10.4 clamps that solved
+    # width to min/max-width; once clamped, an auto margin re-absorbs the
+    # slack the clamp freed (equal split, or the zero-one-side exception
+    # `_fix_absolute_horizontal_auto_margins` applies) -- same reasoning as
+    # `_fix_absolute_width_against_containing_block`'s ancestor case.
     new_width = viewport_width - left_v - (ml or 0.0) - right_v - (mr or 0.0)
     max_width_v = _resolve_inset(style.get("max_width"), viewport_width)
     min_width_v = _resolve_inset(style.get("min_width"), viewport_width)
@@ -283,30 +264,23 @@ def _resolve_viewport_anchored_box_x(style: dict, box, viewport_width: float, el
 
 
 def _fix_absolute_horizontal_auto_margins(node_map: dict) -> None:
-    """CSS 2.1 10.3.7: for a `position:absolute` box whose `left`/`width`/
-    `right` are all definite, any `auto` margin absorbs the remaining
-    slack of `left + margin-left + width + margin-right + right ==
-    containing block width` -- split evenly if both are auto. Taffy's own
-    absolute-positioning doesn't solve this, so this corrects the box's
-    `x` (and everything inside it) after the fact.
+    """CSS 2.1 10.3.7: for a position:absolute box whose left/width/right
+    are all definite, any auto margin absorbs the remaining slack of
+    `left + margin-left + width + margin-right + right == containing block
+    width`, split evenly if both are auto. Taffy's own absolute
+    positioning doesn't solve this, so this corrects the box's x after the fact.
 
-    Only handled when a real containing-block ancestor exists -- a
-    root-anchored box is corrected separately by `_fix_viewport_anchored_
-    positioning`.
+    Only handled with a real containing-block ancestor -- a root-anchored
+    box is corrected separately by `_fix_viewport_anchored_positioning`.
 
-    Also handles exactly one of `left`/`right` being `auto` (CSS 2.1
-    10.3.7 case 3/5): any auto margin resolves to `0`, and the missing
-    inset is solved from the constraint equation -- auto margins only
-    center the box in the fully-constrained case above.
+    Also handles exactly one of left/right being auto (case 3/5): any auto
+    margin resolves to 0, and the missing inset is solved from the
+    constraint equation.
 
-    And handles the fully over-constrained case too (CSS 2.1 10.3.7 rule
-    1 / 10.3.8): `left`/`width`/`right`/both margins *all* definite at
-    once -- includes every replaced element whose intrinsic size makes
-    `width` definite, not just an explicit non-auto `width`. Real Chrome
-    drops the specified `right` (in `ltr`; `left` in `rtl`) and re-solves
-    it, so `x` simply follows `left` + `margin-left` (mirrored for `rtl`)
-    -- Taffy has no such rule and, confirmed directly on `absolute-
-    replaced-width-071.xht`, instead positioned the box from `right`."""
+    And the fully over-constrained case (rule 1/10.3.8): left/width/right/
+    both margins all definite -- Chrome drops the specified right (left in
+    rtl) and re-solves from left + margin-left; Taffy instead positions
+    from right -- absolute-replaced-width-071.xht."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -352,11 +326,10 @@ def _fix_absolute_horizontal_auto_margins(node_map: dict) -> None:
             mr = None if margin_right == "auto" else (_resolve_inset(margin_right, cb_width) or 0.0)
             if ml is None and mr is None:
                 if remaining < 0:
-                    # CSS 2.1 10.3.7: splitting the negative slack evenly
-                    # would give both margins a negative value -- instead
-                    # the containing block's leading-edge margin (left in
-                    # ltr, right in rtl) is pinned to 0 and the *other*
-                    # margin absorbs all of it.
+                    # CSS 2.1 10.3.7: an equal split of negative slack would
+                    # give both margins a negative value -- the leading-edge
+                    # margin (left in ltr, right in rtl) is pinned to 0 and
+                    # the other absorbs all of it.
                     if dom._element_direction(containing) == "rtl":
                         mr, ml = 0.0, remaining
                     else:
@@ -381,33 +354,22 @@ def _fix_absolute_horizontal_auto_margins(node_map: dict) -> None:
 
 
 def _fix_absolute_vertical_auto_margins(node_map: dict) -> None:
-    """CSS 2.1 10.6.4: the vertical counterpart to `_fix_absolute_
-    horizontal_auto_margins` -- for a `position:absolute` box whose
-    `top`/`height`/`bottom` are all definite, any `auto` `margin-top`/
-    `margin-bottom` absorbs the remaining slack of `top + margin-top +
+    """CSS 2.1 10.6.4: the vertical counterpart to
+    `_fix_absolute_horizontal_auto_margins` -- for a position:absolute box
+    whose top/height/bottom are all definite, any auto margin-top/
+    margin-bottom absorbs the remaining slack of `top + margin-top +
     height + margin-bottom + bottom == containing block height`, split
     evenly if both are auto. Unlike the horizontal rule, 10.6.4 has no
-    `direction`-based "pin one side to zero" exception for a negative
-    split -- CSS 2.1 only ever attaches that exception to the *horizontal*
-    margins (10.3.7), so an equal split here is applied unconditionally,
-    even when it comes out negative. Taffy's own absolute positioning
-    doesn't solve this equation, so this corrects the box's `y` (and
-    everything inside it) after the fact.
+    direction-based "pin one side to zero" exception -- an equal split
+    applies unconditionally, even negative. Taffy doesn't solve this, so
+    this corrects the box's y after the fact.
 
-    Only handled when a real containing-block ancestor exists -- a
-    root-anchored box is corrected separately by `_fix_viewport_anchored_
-    positioning`.
+    Only handled with a real containing-block ancestor -- root-anchored is
+    `_fix_viewport_anchored_positioning`.
 
-    Also handles exactly one of `top`/`bottom` being `auto` (CSS 2.1
-    10.6.4 case 3/5): any auto margin resolves to `0`, and the missing
-    inset is solved from the constraint equation -- auto margins only
-    center the box in the fully-constrained case above. Confirmed
-    directly on `absolute-non-replaced-height-003.xht` (`top: 0.5in;
-    bottom: 0.5in; height: 1in; margin-top/margin-bottom: auto` inside a
-    3in-tall `position:relative` containing block): unfixed, both auto
-    margins stayed `0` (Taffy's own default) instead of splitting the
-    96px of remaining slack 48px/48px, leaving the box flush against
-    `top` instead of vertically centered."""
+    Also handles exactly one of top/bottom auto (case 3/5): any auto
+    margin resolves to 0, missing inset solved from the constraint
+    equation. absolute-non-replaced-height-003.xht."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -460,43 +422,27 @@ def _fix_absolute_vertical_auto_margins(node_map: dict) -> None:
 
 
 def _fix_absolute_width_against_containing_block(node_map: dict) -> None:
-    """CSS 2.1 10.3.7: a `position:absolute` box with `width:auto` and both
-    `left`/`right` definite has its width *solved* from the constraint
-    equation (`left + margin-left + width + margin-right + right ==
-    containing block width`) -- the same equation `_resolve_viewport_
-    anchored_box_x` already solves for a *root*-anchored box (no real
-    containing-block ancestor, so it resolves against the viewport
-    instead), generalized here for the ordinary case of a real containing-
-    block ancestor, which that function doesn't cover at all. Taffy's own
-    absolute positioning doesn't solve this equation either way, leaving
-    `width:auto` at whatever the element's own content happened to
-    measure (typically far too small, or `0` for an otherwise-empty box)
-    instead. Confirmed directly on position-absolute-percentage-inherit-
-    001.xht: a nested absolutely-positioned box with all four insets given
-    and no explicit `width` measured `0` instead of the ~169px CSS 2.1
-    10.3.7 actually solves for.
+    """CSS 2.1 10.3.7: a position:absolute box with width:auto and both
+    left/right definite has its width solved from the constraint equation
+    (`left + margin-left + width + margin-right + right == containing
+    block width`) -- the real-containing-block-ancestor counterpart to
+    `_resolve_viewport_anchored_box_x`. Taffy leaves width:auto at whatever
+    the content happened to measure instead --
+    position-absolute-percentage-inherit-001.xht: measured 0 instead of
+    the ~169px CSS 2.1 10.3.7 solves for.
 
     Also applies CSS 2.1 10.4's min/max-width clamp to that solved width:
-    unclamped, an auto margin is treated as `0` while solving the width
-    equation (rule 5 above) -- but once clamping replaces the solved width
-    with a fixed `min-width`/`max-width`, the box is back to the ordinary
-    "all three of left/width/right are definite" case, so any auto margin
-    gets to re-absorb the slack the clamp just freed up via the same
-    equal-split (or, if that split would go negative, `_fix_absolute_
-    horizontal_auto_margins`'s zero-one-side exception) rule -- otherwise
-    a `max-width`-clamped, centered (`margin: auto`) absolutely positioned
-    box would keep sitting flush against `left` instead of centering.
-    Confirmed directly on `position-absolute-width-025.xht`
-    (`left/right: 8px; width: auto; max-width: 100px; margin: 0 auto`):
-    unclamped this solved `width: 784px` (the full containing block minus
-    the two 8px insets) instead of the expected `100px`, centered box.
+    once clamping replaces it with a fixed min/max-width, the box is back
+    to the ordinary all-three-definite case, so an auto margin re-absorbs
+    the slack the clamp freed (same equal-split/zero-one-side rule as
+    `_fix_absolute_horizontal_auto_margins`) -- otherwise a max-width-clamped,
+    centered box would sit flush against left instead --
+    position-absolute-width-025.xht.
 
     Deliberately as narrow as `_fix_absolute_horizontal_auto_margins`
-    beside it: only overwrites this box's own width/x (and its content-box
-    accordingly) -- its children are shifted, like that function's box is,
-    but not relaid-out to the new width, the same simplification
-    `_fix_viewport_anchored_positioning` already accepts for the root-
-    anchored case."""
+    beside it: only overwrites width/x, children shifted but not relaid
+    out to the new width, same simplification
+    `_fix_viewport_anchored_positioning` accepts for the root-anchored case."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -549,11 +495,10 @@ def _fix_absolute_width_against_containing_block(node_map: dict) -> None:
             new_width, clamped = max_width_v, True
         elif min_width_v is not None and new_width < min_width_v:
             new_width, clamped = min_width_v, True
-        # CSS 2.1 10.3.7 rule 5: with `left`/`right` both set and the
-        # width solved, an `auto` margin is 0 and the box sits at `left`
-        # -- whether or not Taffy already happened to solve the width
-        # (absolute-non-replaced-width-015.xht: 100px wide already, but
-        # placed from `right` at x 214 instead of `left`'s 111).
+        # CSS 2.1 10.3.7 rule 5: with left/right both set and width solved,
+        # an auto margin is 0 and the box sits at left -- regardless of
+        # whether Taffy already solved the width --
+        # absolute-non-replaced-width-015.xht.
         new_x = cb_content_x + left_v + (ml or 0.0)
         if clamped:
             remaining = cb_width - left_v - new_width - right_v
@@ -574,10 +519,9 @@ def _fix_absolute_width_against_containing_block(node_map: dict) -> None:
         if abs(new_width - box.width) <= 1e-6 and abs(new_x - box.x) <= 1e-6:
             continue
         border_and_padding = box.width - box.client_width
-        # Resize first, at the box's *current* x -- `geometry._shift_subtree` below
-        # (not a second, redundant x assignment here) is what carries this
-        # box and its descendants over to `new_x`, reading whatever x this
-        # box has at the moment it runs.
+        # Resize first, at the box's current x -- `geometry._shift_subtree` below
+        # (not a second x assignment here) carries this box and its
+        # descendants over to new_x.
         element.__dict__["_layout_box"] = LayoutBox(
             x=box.x, y=box.y, width=new_width, height=box.height,
             client_width=max(0.0, new_width - border_and_padding), client_height=box.client_height,
@@ -590,24 +534,18 @@ def _fix_absolute_width_against_containing_block(node_map: dict) -> None:
 
 
 def _fix_absolute_height_against_containing_block(node_map: dict) -> None:
-    """CSS 2.1 10.6.4: the vertical counterpart to `_fix_absolute_width_
-    against_containing_block` -- a `position:absolute` box with
-    `height:auto` and both `top`/`bottom` definite has its height *solved*
-    from the constraint equation (`top + margin-top + height + margin-
-    bottom + bottom == containing block height`), then clamped by CSS
-    2.1 10.7's `min-height`/`max-height`, with any auto margin re-
-    absorbing the slack that clamp frees up. Unlike the width version,
-    the vertical margin split has no `direction`-based zero-one-side
-    exception for a negative remainder (CSS 2.1 10.6.4, unlike 10.3.7,
-    doesn't carve one out) -- always an equal split, matching `_fix_
-    absolute_vertical_auto_margins` beside it. Taffy's own absolute
-    positioning doesn't solve this equation, leaving `height:auto` at
-    whatever the box's own content happened to measure instead.
+    """CSS 2.1 10.6.4: the vertical counterpart to
+    `_fix_absolute_width_against_containing_block` -- a position:absolute box
+    with height:auto and both top/bottom definite has its height solved
+    from the constraint equation, then clamped by 10.7's min/max-height,
+    with any auto margin re-absorbing the freed slack. Unlike the width
+    version, 10.6.4 carves out no direction-based zero-one-side exception
+    for a negative remainder -- always an equal split, matching
+    `_fix_absolute_vertical_auto_margins`. Taffy doesn't solve this, leaving
+    height:auto at whatever content measured.
 
-    Deliberately as narrow as `_fix_absolute_width_against_containing_
-    block`: only overwrites this box's own height/y (and its content-box
-    accordingly) -- children are shifted, not relaid-out to the new
-    height."""
+    Deliberately as narrow as `_fix_absolute_width_against_containing_block`:
+    only overwrites height/y, children shifted but not relaid out."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -638,17 +576,11 @@ def _fix_absolute_height_against_containing_block(node_map: dict) -> None:
         top_v = _resolve_inset(top, cb_height) or 0.0
         bottom_v = _resolve_inset(bottom, cb_height) or 0.0
         # CSS Position 3 abspos-auto-size + CSS Sizing 4 aspect-ratio: when
-        # both width and height are auto and every inset is definite (this
-        # function's own left/right-auto guard would otherwise leave this
-        # to the ordinary equation below -- narrowed here to exactly that
-        # "all four insets given" case, since that's the only one where the
-        # spec unambiguously names the block axis (height) as ratio-
-        # dependent; the mirrored case -- only one inset auto, on the
-        # *inline* axis -- makes width the ratio-dependent axis instead,
-        # left to the existing insets-equation height below, which is
-        # already correct for it). `_fix_absolute_width_against_containing_
-        # block` runs first in the pipeline, so `box.width` here is already
-        # the inset-stretched value to derive the ratio height from.
+        # both width and height are auto and every inset is definite, height
+        # is the ratio-dependent axis (the mirrored one-inset-auto case
+        # makes width ratio-dependent instead, already correct via the
+        # insets equation below). `_fix_absolute_width_against_containing_block`
+        # runs first, so box.width here is already the inset-stretched value.
         ratio = style.get("aspect_ratio")
         ratio_derived = (isinstance(ratio, (int, float)) and ratio > 0
                          and inset[3] != "auto" and inset[1] != "auto")
@@ -689,16 +621,16 @@ def _fix_absolute_height_against_containing_block(node_map: dict) -> None:
 
 
 def _publish_used_horizontal_margins(node_map: dict) -> None:
-    """CSS 2.1 10.3.3: an in-flow block's `auto` `margin-left`/`margin-
-    right` resolves during layout, but Taffy never hands that resolved
-    value back to Python (`LayoutBox` defaults both to `0`) -- domonic's
-    own `getComputedStyle()` reads `_layout_box.margin_left`/`_right` for
-    a declared `auto`, so this derives them from the box's own position
-    relative to its parent's content-box edges.
+    """CSS 2.1 10.3.3: an in-flow block's auto margin-left/margin-right
+    resolves during layout, but Taffy never hands that value back to
+    Python (LayoutBox defaults both to 0) -- domonic's getComputedStyle()
+    reads _layout_box.margin_left/_right for a declared auto, so this
+    derives them from the box's position relative to its parent's
+    content-box edges.
 
-    Narrow, matching CSS 2.1 10.3.3's scope: only ordinary in-flow block
-    boxes, excluded when floated/out-of-flow or the parent is flex/grid
-    (siblings share the row there). Pure reporting -- never moves a box."""
+    Narrow, matching 10.3.3's scope: only ordinary in-flow block boxes,
+    excluded when floated/out-of-flow or the parent is flex/grid. Pure
+    reporting -- never moves a box."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -736,20 +668,16 @@ def _publish_used_horizontal_margins(node_map: dict) -> None:
 
 
 def _fix_absolute_static_position_fallback(node_map: dict) -> None:
-    """CSS 2.1 10.3.7/10.6.4: an absolutely-positioned box with all-`auto`
-    insets falls back to its static position -- where it would have
-    landed as `position:static`. Taffy has no concept of this (an
-    all-auto inset just resolves to `0`, landing the box at its
-    containing block's origin).
+    """CSS 2.1 10.3.7/10.6.4: an absolutely-positioned box with all-auto
+    insets falls back to its static position -- where it would land as
+    position:static. Taffy has no concept of this (an all-auto inset just
+    resolves to 0, landing the box at its containing block's origin).
 
-    Only a reasonably common approximation, not full normal-flow layout:
-    the static position is the literal DOM parent's content-box origin
-    when there's no earlier in-flow sibling, or (approximating ordinary
-    block stacking) directly
-    below the last earlier in-flow sibling's own margin box otherwise. Real
-    static-position resolution needs a full shadow layout pass computing
-    where the box would land as if it were never taken out of flow at all
-    -- a substantially bigger feature, not attempted here."""
+    A common-case approximation, not full normal-flow layout: the static
+    position is the literal DOM parent's content-box origin with no
+    earlier in-flow sibling, or directly below the last earlier sibling's
+    margin box otherwise. Real static-position resolution needs a full
+    shadow layout pass, not attempted here."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
@@ -760,19 +688,16 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
         inset = style.get("inset")
         if not inset:
             continue
-        # CSS 2.1 10.3.7/10.6.4 resolve each axis independently -- `top:
-        # 82px; left/right: auto` still needs the *horizontal* static-
-        # position fallback even though the vertical position is already
-        # correctly pinned by the explicit `top`.
+        # CSS 2.1 10.3.7/10.6.4 resolve each axis independently -- top:82px
+        # with left/right:auto still needs the horizontal static-position
+        # fallback even though top already pins the vertical position.
         inset_top, inset_right, inset_bottom, inset_left = inset
         needs_x = inset_left == "auto" and inset_right == "auto"
         needs_y = inset_top == "auto" and inset_bottom == "auto"
-        # CSS 2.1 10.1: a containing block formed by an *inline* ancestor
-        # (a `position: relative` span flattened into its paragraph's
-        # plan, with no Taffy box of its own) is that ancestor's first
-        # inline box -- Taffy anchored the element to some outer box
-        # instead (abspos-inline-003.xht: `top: 0; left: 0` inside a
-        # relative span lands at the span's own corner, 602px in).
+        # CSS 2.1 10.1: a containing block formed by an inline ancestor
+        # (a relative span flattened into its paragraph's plan, no Taffy
+        # box of its own) is that ancestor's first inline box -- Taffy
+        # anchored the element elsewhere instead -- abspos-inline-003.xht.
         inline_cb = None
         ancestor = getattr(element, "parentElement", None)
         while ancestor is not None and dom._is_element(ancestor):
@@ -797,20 +722,14 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
                 box = element.__dict__["_layout_box"]
         if not needs_x and not needs_y:
             continue
-        # CSS 2.1 9.2.1.1/10.3.7: mixed into inline content (`_build_text_
-        # runs_from_nodes`'s "escapee" runs, e.g. `wpt/css/CSS2/
-        # positioning/abspos-007.xht`'s `<div class="test">` sitting
-        # between plain text and a following in-flow block, all inside a
-        # `display:inline` wrapper), `element`'s real static position is
-        # wherever the surrounding text's own layout placed it -- not
-        # simply "its literal DOM parent's content-box origin" (the
-        # fallback below), which is also usually unusable here anyway: the
-        # literal parent is commonly an inline wrapper never built as a
-        # Taffy node at all (no `_layout_box`), unlike an ordinary block
-        # parent this function already handles. `_InlineFormattingPlan.
-        # measure()`/`.publish()` compute this directly (the only place
-        # that actually knows the inline formatting context's own cursor
-        # position) and stash it here.
+        # CSS 2.1 9.2.1.1/10.3.7: mixed into inline content
+        # (`_build_text_runs_from_nodes`'s "escapee" runs), `element`'s real
+        # static position is wherever the surrounding text's layout placed
+        # it, not the literal DOM parent's content-box origin (the fallback
+        # below) -- the literal parent is commonly an inline wrapper never
+        # built as a Taffy node at all. `_InlineFormattingPlan.measure()`/
+        # `.publish()` compute this directly and stash it here --
+        # wpt/css/CSS2/positioning/abspos-007.xht.
         inline_static_position = getattr(element, "_chromonic_static_position", None)
         if inline_static_position is not None:
             static_x, static_y = inline_static_position
@@ -827,9 +746,8 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
                     geometry._shift_subtree(element, dx, dy)
                 continue
             # The static position is where `element` would sit as an
-            # ordinary `position:static` box -- pushed down by its own
-            # margin-top (collapsing with a preceding sibling handled
-            # separately below).
+            # ordinary position:static box -- pushed down by its own
+            # margin-top (collapsing with a preceding sibling below).
             own_margin = style.get("margin") or (0.0,) * 4
             own_margin_top = box_model._numeric_edge(own_margin[0])
             own_margin_right = box_model._numeric_edge(own_margin[1])
@@ -838,21 +756,15 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
             # its border box.
             parent_pad_top, parent_pad_right, _parent_pad_bottom, parent_pad_left = (
                 parent.__dict__.get("_chromonic_padding", (0.0,) * 4))
-            # CSS 2.1 10.1: a block-level box's hypothetical static
-            # position still stacks top-to-bottom the same regardless of
-            # `direction` -- but *where* it would land horizontally, as
-            # an ordinary in-flow block, follows the same `direction:rtl`
-            # flush-right rule `_fix_rtl_block_positioning` already
-            # applies to a real (non-absolute) sibling: flush against the
-            # containing block's *right* content edge, not its left. Either
-            # way this is still an ordinary block box's own margin box, so
-            # its own margin-left/-right (mirroring `static_y`'s own
-            # margin-top below) has to push it in from that edge same as
-            # any other block -- previously omitted here, unlike the
-            # vertical axis, so a `position:absolute` element with `left/
-            # right:auto` (falling back to its static position) landed
-            # flush against the containing block's padding edge with its
-            # own declared margin silently dropped.
+            # CSS 2.1 10.1: a block's hypothetical static position stacks
+            # top-to-bottom regardless of direction, but horizontally
+            # follows the same direction:rtl flush-right rule
+            # `_fix_rtl_block_positioning` applies to a real sibling --
+            # flush against the containing block's right content edge.
+            # Its own margin-left/-right still pushes it in from that edge,
+            # previously omitted here (unlike the vertical axis), so a
+            # left/right:auto element's static position landed flush
+            # against the padding edge with its own margin silently dropped.
             if dom._element_direction(parent) == "rtl":
                 static_x = (parent_box.x + parent_box.border_left
                             + parent_box.client_width - parent_pad_left - parent_pad_right
@@ -873,21 +785,18 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
                     continue  # out of flow -- doesn't move the static-position cursor
                 sibling_resolved = getattr(sibling, "_chromonic_resolved_style", None)
                 if sibling_resolved is not None and box_model._is_floated(sibling_resolved[0]):
-                    # A float doesn't move the block-flow position either
-                    # (abspos-028.xht: an abs box after a 4em float has its
-                    # static position at the container's top, `clear`
-                    # notwithstanding -- it doesn't apply to abs boxes).
+                    # A float doesn't move the block-flow position either --
+                    # clear doesn't apply to abs boxes -- abspos-028.xht.
                     continue
-                # `sibling_box` never includes margin, so the sibling's
-                # trailing margin has to be added back explicitly, as the
-                # larger of its own margin-bottom and this element's
-                # margin-top (ordinary collapsing), not just added alone.
+                # sibling_box never includes margin, so the sibling's
+                # trailing margin is added back explicitly, as the larger
+                # of its own margin-bottom and this element's margin-top
+                # (ordinary collapsing).
                 #
-                # A CSS-empty sibling is the one exception: Taffy already
-                # resolves its own margin collapsing internally, so
-                # `sibling_box.y` is already the fully-collapsed resting
-                # position -- adding its raw margin-bottom on top would
-                # double-count a margin Taffy already folded in.
+                # A CSS-empty sibling is the exception: Taffy already
+                # resolves its margin collapsing internally, so
+                # sibling_box.y is already the fully-collapsed resting
+                # position -- adding raw margin-bottom would double-count.
                 sibling_empty = sibling_box.height == 0 and not any(
                     value not in (0.0, "auto") for name in ("padding", "border")
                     for value in sibling_style.get(name, ())
@@ -906,16 +815,14 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
 
 def _flex_container_static_position(parent, parent_box, element, box, style):
     """CSS Flexbox 4.1: the static position of an absolutely-positioned
-    child of a flex container is where it would land as the *sole* flex
-    item -- so the container's `justify-content` (main axis) and the
-    child's `align-self` (cross axis, defaulting to the container's
-    `align-items`) apply to it, using the child's own margin box against
-    the container's content box (`css-flexbox/abspos/flex-abspos-staticpos-
-    *.html`: `justify-content: center` centres the box, `align-self: safe
-    end` bottom-aligns it unless it overflows, when it falls back to the
-    start). Returns None for a parent that isn't a real CSS flex container
-    (table rows and float wrappers are Taffy flex rows too, but their
-    static position is ordinary block stacking)."""
+    child of a flex container is where it would land as the sole flex item
+    -- the container's justify-content (main axis) and the child's
+    align-self (cross axis, defaulting to align-items) apply to it, using
+    the child's margin box against the container's content box --
+    css-flexbox/abspos/flex-abspos-staticpos-*.html. Returns None for a
+    parent that isn't a real CSS flex container (table rows and float
+    wrappers are Taffy flex rows too, but static-position as ordinary
+    block stacking)."""
     parent_resolved = getattr(parent, "_chromonic_resolved_style", None)
     if parent_resolved is None:
         return None
@@ -941,12 +848,11 @@ def _flex_container_static_position(parent, parent_box, element, box, style):
     child_rtl = dom._element_direction(element, child_computed) == "rtl"
 
     def place(keyword, safe, size, item, *, flex_flipped, start_flipped, self_flipped=None):
-        # `flex_flipped`: `flex-start` is the axis's physical end (a
-        # `-reverse` direction, or `wrap-reverse` on the cross axis);
-        # `start_flipped`: writing-mode `start` is the physical end (rtl);
-        # `self_flipped`: the same for `self-start`/`self-end`, judged by
-        # the *item's* own direction (flex-abspos-staticpos-align-self-
-        # rtl-004.html: an ltr child in an rtl column).
+        # flex_flipped: flex-start is the axis's physical end (a -reverse
+        # direction, or wrap-reverse on the cross axis); start_flipped:
+        # writing-mode start is the physical end (rtl); self_flipped: same
+        # for self-start/self-end, judged by the item's own direction --
+        # flex-abspos-staticpos-align-self-rtl-004.html.
         if self_flipped is None:
             self_flipped = start_flipped
         if keyword in ("center", "space-around", "space-evenly"):
@@ -970,10 +876,9 @@ def _flex_container_static_position(parent, parent_box, element, box, style):
         elif keyword == "self-start":
             at_end = self_flipped
         elif keyword in ("baseline", "first-baseline", "last-baseline"):
-            # Baseline alignment's fallback is writing-mode `start`/`end`,
-            # untouched by `wrap-reverse` (flex-abspos-staticpos-align-
-            # self-002.html: `baseline` stays at the top, `last baseline`
-            # at the bottom, while `stretch`/`flex-start` flip).
+            # Baseline alignment's fallback is writing-mode start/end,
+            # untouched by wrap-reverse (unlike stretch/flex-start) --
+            # flex-abspos-staticpos-align-self-002.html.
             at_end = (keyword == "last-baseline") != start_flipped
         else:  # flex-start, normal, stretch, space-between, auto...
             at_end = flex_flipped
@@ -1007,17 +912,15 @@ def _flex_container_static_position(parent, parent_box, element, box, style):
 def _fix_viewport_anchored_positioning(node_map: dict, viewport_height: float,
                                         viewport_width: "float | None" = None) -> None:
     """Correct the vertical position (and, when stretched, height) Taffy
-    computed for any `position:absolute`/`fixed` element whose containing
+    computed for any position:absolute/fixed element whose containing
     block is the document root itself.
 
-    Taffy resolves such an element's `top`/`bottom`/`height` insets against
-    the root's own Taffy box -- the full document height for a scrollable
-    page, not the viewport. CSS's real rule is that such an element
-    resolves against the initial containing block, which has the
-    viewport's dimensions, not the document's.
+    Taffy resolves such an element's top/bottom/height insets against the
+    root's own Taffy box -- full document height for a scrollable page,
+    not the viewport. CSS's real rule resolves against the initial
+    containing block, which has the viewport's dimensions.
 
-    Only called when a caller supplies a real `viewport_height` -- every
-    caller that doesn't keeps today's behaviour at zero extra cost.
+    Only called when a caller supplies a real viewport_height.
     `viewport_width`, when given, applies the same correction horizontally."""
     seen = set()
     for element in list(node_map.values()):
@@ -1062,16 +965,13 @@ def _fix_rtl_block_positioning(node_map: dict) -> None:
     `margin-left` instead in `rtl`, honoring the real, specified
     `margin-right` and solving for `margin-left` -- which can come out
     smaller, larger, or even negative than whatever was actually written,
-    not just `0`. Taffy has no `direction` concept at all, so it always
-    positions such a block from a literal, un-recalculated `margin-left`
-    regardless; this recomputes that one edge, in both directions,
-    exactly as the spec's own formula would.
+    not just 0. Taffy has no direction concept, so it always positions
+    such a block from a literal, un-recalculated margin-left; this
+    recomputes that one edge in both directions, per the spec's formula.
 
-    Applies both to CSS 2.1 9.2.1.1's split interruption blocks (their
-    real containing block is `_chromonic_split_container`, tracked
-    separately from the DOM parent a non-replaced inline never
-    establishes one of) and to an ordinary, un-split block child (its
-    containing block is simply its own `parentElement`)."""
+    Applies both to CSS 2.1 9.2.1.1's split interruption blocks (real
+    containing block is `_chromonic_split_container`) and to an ordinary,
+    un-split block child (containing block is its own parentElement)."""
     for element in node_map.values():
         if not dom._is_element(element):
             continue
@@ -1082,23 +982,14 @@ def _fix_rtl_block_positioning(node_map: dict) -> None:
                 continue
             if native_self.get("display") != "block":
                 continue
-            # `native_self["position"]` can't tell a genuine CSS
-            # `position:relative` apart from plain `static` here --
-            # `style_bridge._position()` maps both to the same Taffy-level
-            # `"relative"` string (Taffy has no `static` of its own; an
-            # un-positioned box is just "relative" with `inset` forced to
-            # auto, see `to_dict()`). A *real* `position:relative` box
-            # already gets its own correct horizontal offset from Taffy's
-            # native relative-position handling (its `right`/`left` inset
-            # included) -- this function's margin-based recalculation is
-            # CSS 2.1 10.3.3's rule for an ordinary, non-positioned block's
-            # margin box, a wholly different mechanism, and applying it on
-            # top would silently discard Taffy's already-correct offset.
-            # Confirmed directly on `right-offset-002.xht`/`right-007.xht`:
-            # a `position:relative` block with `right` (not `left`) set,
-            # inside a `direction:rtl` container, had its correct Taffy-
-            # computed offset overwritten by this function's margin-only
-            # recalculation, which has no notion of `right` at all.
+            # native_self["position"] can't tell a genuine position:relative
+            # apart from plain static -- style_bridge._position() maps both
+            # to the same Taffy-level "relative" string. A real
+            # position:relative box already gets its correct horizontal
+            # offset from Taffy's native relative-position handling; this
+            # function's margin-based recalculation (CSS 2.1 10.3.3's rule
+            # for a non-positioned block) would silently discard that --
+            # right-offset-002.xht, right-007.xht.
             own_resolved = element.__dict__.get("_chromonic_resolved_style")
             if own_resolved is not None:
                 own_position = own_resolved[1].position
@@ -1107,21 +998,17 @@ def _fix_rtl_block_positioning(node_map: dict) -> None:
             container = getattr(element, "parentElement", None)
             if container is None:
                 continue
-        # CSS 2.1 10.3.3's ltr/rtl branch is decided by the *containing
-        # block's* own `direction` -- the actual block formatting context
-        # this block is positioned within -- not a wrapping non-replaced
-        # inline's own (it never establishes one itself). A `<span
-        # style="direction:ltr">` wrapping a split block inside an outer
-        # `direction:rtl` container still positions the block by the
-        # outer container's `rtl`, confirmed directly against Chrome.
+        # CSS 2.1 10.3.3's ltr/rtl branch is decided by the containing
+        # block's own direction, not a wrapping non-replaced inline's (it
+        # never establishes one). A direction:ltr span wrapping a split
+        # block inside an outer rtl container still positions the block by
+        # the outer container's rtl, confirmed against Chrome.
         if dom._element_direction(container) != "rtl":
             continue
-        # CSS 2.1 10.3.3 is the rule for a block in *block flow*. A flex
-        # (or grid) item -- a table cell inside its flex-row `<tr>`, or a
-        # real flex item -- is positioned by its container's own
-        # algorithm; right-aligning each one independently here stacked
-        # every cell of an `rtl` table row on top of each other at the
-        # row's right edge (border-conflict-element-002.xht).
+        # CSS 2.1 10.3.3 is the rule for a block in block flow. A flex/grid
+        # item is positioned by its container's own algorithm --
+        # right-aligning each independently here stacked every cell of an
+        # rtl table row on top of each other -- border-conflict-element-002.xht.
         container_native = container.__dict__.get("_chromonic_native_style") or {}
         if container_native.get("display") in ("flex", "grid"):
             continue
