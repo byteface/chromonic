@@ -74,17 +74,14 @@ class _SyntheticComputed:
 
 
 class _AnonymousTableBox:
-    """A CSS 2.1 17.2.1 "missing" table box -- an anonymous `table`/
-    `inline-table`, `table-row` or `table-cell` generated around
-    misparented table content (a `display:table-cell` outside any row, a
-    row outside any table, loose text or a plain block inside a row...).
-    Not a DOM node: never in anyone's `childNodes` (a wrapped node's real
-    `parentElement` is untouched -- `_layout_parent` follows
-    `_chromonic_anonymous_parent` instead), reached only through
-    `_normalized_child_nodes`. Carries the same `tagName` a real table
-    part would so every tag-based check in `build()`/`_table_rows`/
-    `_row_cells` treats it as one, and a synthetic style
-    (`_chromonic_synthetic_style`, see `dom._describe`) instead of a cascade."""
+    """A CSS 2.1 17.2.1 "missing" table box -- an anonymous table/
+    inline-table, table-row or table-cell generated around misparented
+    table content. Not a DOM node: never in anyone's childNodes (a
+    wrapped node's real parentElement is untouched -- `_layout_parent`
+    follows _chromonic_anonymous_parent instead), reached only through
+    `_normalized_child_nodes`. Carries the same tagName a real table part
+    would so every tag-based check treats it as one, and a synthetic
+    style (_chromonic_synthetic_style, see dom._describe) instead of a cascade."""
 
     nodeType = dom.ELEMENT_NODE
     _TAGS = {"table": "TABLE", "inline-table": "TABLE", "row": "TR", "cell": "TD", "block": "DIV"}
@@ -170,11 +167,10 @@ _TABLE_INTERNAL_KINDS = frozenset({"row-group", "row", "cell", "caption", "colum
 
 
 def _table_part_kind(node, computed_cache) -> "str | None":
-    """Which CSS 2.1 17.2.1 table box `node` generates, if any: `"table"`,
-    `"row-group"`, `"row"`, `"cell"`, `"caption"`, `"column"`,
-    `"column-group"` -- or `None` for a text node or any other box. An
-    absolutely/fixed positioned element blockifies (CSS 2.1 9.7) and is
-    never a table part."""
+    """Which CSS 2.1 17.2.1 table box `node` generates, if any: "table",
+    "row-group", "row", "cell", "caption", "column", "column-group" -- or
+    None for a text node or any other box. An absolutely/fixed positioned
+    element blockifies (CSS 2.1 9.7) and is never a table part."""
     if not dom._is_element(node):
         return None
     if isinstance(node, _AnonymousTableBox):
@@ -186,9 +182,9 @@ def _table_part_kind(node, computed_cache) -> "str | None":
     display = (getattr(computed, "display", "") or "").strip().lower()
     kind = _TABLE_PART_DISPLAYS.get(display) or _TABLE_PART_TAGS.get(tag)
     if box_model._is_absolutely_positioned(style_obj):
-        # CSS 2.1 9.7 blockifies `display`: `table`/`inline-table` stay a
-        # table (top-applies-to-013.xht: an absolutely positioned table
-        # keeps its rows); every internal part becomes a plain block.
+        # CSS 2.1 9.7 blockifies display: table/inline-table stay a table
+        # (an absolutely positioned table keeps its rows --
+        # top-applies-to-013.xht); every internal part becomes a plain block.
         return "table" if kind == "table" else None
     return kind
 
@@ -226,9 +222,9 @@ def _synthesize_anonymous_style(box: "_AnonymousTableBox", parent, computed_cach
 
 
 def _wrap_missing_table_boxes(element, computed_cache) -> list:
-    """`element.childNodes`, with CSS 2.1 17.2.1's missing anonymous table
-    boxes generated (`_AnonymousTableBox`, cached on `element` by kind and
-    first wrapped node, so a retained `LayoutProjection` sees the same box
+    """element.childNodes, with CSS 2.1 17.2.1's missing anonymous table
+    boxes generated (_AnonymousTableBox, cached on element by kind and
+    first wrapped node, so a retained LayoutProjection sees the same box
     -- and Taffy node -- across passes):
 
     - inside a table: any child that isn't a row group, row, caption or
@@ -284,18 +280,14 @@ def _wrap_missing_table_boxes(element, computed_cache) -> list:
         return kind in _TABLE_INTERNAL_KINDS
 
     # A column or column group generates no box, but a misparented one
-    # (inside a row, a row group, a cell, an ordinary block) still takes
-    # the anonymous boxes CSS 2.1 17.2.1 gives any proper table child
-    # there -- a `display: table-column` div inside a row becomes an
-    # anonymous cell holding an anonymous table with that one column
-    # (empty-cells-applies-to-012.xht: the row's text cell sits in
-    # column 1, and the column reports a 16px-wide box).
+    # still takes the anonymous boxes CSS 2.1 17.2.1 gives any proper
+    # table child there -- a display:table-column div inside a row
+    # becomes an anonymous cell holding an anonymous table with that one
+    # column -- empty-cells-applies-to-012.xht.
     def out_of_flow(node) -> bool:
         # CSS 2.1 9.7: an absolutely positioned child of a table part
-        # blockifies and leaves the table's flow -- never a table part,
-        # never wrapped in an anonymous cell (top-applies-to-001.xht: a
-        # `position: absolute; top: 0` row group is a block at the page
-        # top, its own row becoming an anonymous table inside it).
+        # blockifies and leaves the table's flow -- never wrapped in an
+        # anonymous cell -- top-applies-to-001.xht.
         return (dom._is_element(node) and not isinstance(node, _AnonymousTableBox)
                 and box_model._is_absolutely_positioned(dom._describe(node, computed_cache)[1]))
 
@@ -336,10 +328,10 @@ def _wrap_missing_table_boxes(element, computed_cache) -> list:
         run.clear()
 
     for node in nodes:
-        # A column/column group generates no box of its own (`dom._renders`
-        # says no) but still belongs *inside* the table its columns
-        # describe -- it has to travel into the anonymous table with the
-        # rows it sits among, or that table has no columns at all.
+        # A column/column group generates no box of its own (dom._renders
+        # says no) but still belongs inside the table its columns describe
+        # -- it must travel into the anonymous table with the rows it sits
+        # among, or that table has no columns at all.
         if out_of_flow(node) or (
                 not renders(node) and _table_part_kind(node, computed_cache) not in ("column", "column-group")):
             result.append(node)
@@ -347,10 +339,9 @@ def _wrap_missing_table_boxes(element, computed_cache) -> list:
         if is_blank_text(node):
             # Whitespace that is a direct child of a table, row group or
             # row is dropped outright (CSS 2.1 17.2.1) -- even between two
-            # inline spans that end up sharing one anonymous cell, Chrome
-            # renders them with no space at all (table-anonymous-objects-
-            # 085.xht). Inside an ordinary container it just stays part of
-            # whatever run it sits in.
+            # inline spans sharing one anonymous cell, Chrome renders no
+            # space at all -- table-anonymous-objects-085.xht. Inside an
+            # ordinary container it stays part of whatever run it sits in.
             if parent_kind is not None:
                 continue
             if run:
@@ -373,17 +364,16 @@ def _wrap_inline_runs(element, nodes, computed_cache) -> list:
     both block-level children and inline content (loose text, inline
     elements), each maximal run of that inline content is wrapped in an
     anonymous block box so it gets its own line boxes between the real
-    blocks -- `<div>Hello <p>para</p> world</div>` is three stacked
-    blocks. Previously the loose text was silently dropped (confirmed
-    directly: that `Hello`/`world` never got a box at all), which is also
-    why `wpt/css/CSS2/tables/table-anonymous-objects-093.xht`'s leading
-    body text pushed nothing down. Out-of-flow children (floats,
-    absolutely positioned boxes, `<br>`) stay inside the run they sit in.
+    blocks -- `<div>Hello <p>para</p> world</div>` is three stacked blocks.
+    Previously the loose text was silently dropped, which is also why
+    wpt/css/CSS2/tables/table-anonymous-objects-093.xht's leading body
+    text pushed nothing down. Out-of-flow children (floats, absolutely
+    positioned boxes, <br>) stay inside the run they sit in.
 
-    A flex/grid container wraps only runs of *text* (CSS Flexbox 4:
-    each element child is already its own item; a text run becomes an
-    anonymous item). An inline element is left alone entirely -- an
-    in-flow block inside an inline is CSS 2.1 9.2.1.1's *other* rule,
+    A flex/grid container wraps only runs of text (each element child is
+    already its own item; a text run becomes an anonymous item, CSS
+    Flexbox 4). An inline element is left alone entirely -- an in-flow
+    block inside an inline is 9.2.1.1's other rule,
     `_split_inline_flow_around_blocks`'s job."""
     if not nodes or isinstance(element, _AnonymousTableBox) and element.kind != "cell":
         return nodes
@@ -399,14 +389,13 @@ def _wrap_inline_runs(element, nodes, computed_cache) -> list:
         if not dom._is_element(node):
             if getattr(node, "nodeType", None) != dom.TEXT_NODE:
                 return "skip"
-            # Only CSS white space is "blank": Python's `strip()` also eats
-            # U+00A0, but a `&nbsp;` text node between flex items is a real
-            # anonymous item (css-box-justify-content.html: four 4px items
-            # Chrome lays out between the `DIV1..5` boxes).
+            # Only CSS white space is "blank": Python's strip() also eats
+            # U+00A0, but a &nbsp; text node between flex items is a real
+            # anonymous item -- css-box-justify-content.html.
             if flex_or_grid:
-                # CSS Flexbox 4: a text run that is *purely* white space
-                # never becomes an anonymous flex item, even under
-                # `white-space: pre` (flexbox-whitespace-handling-001a.xhtml).
+                # CSS Flexbox 4: a text run that's purely white space never
+                # becomes an anonymous flex item, even under white-space:pre
+                # -- flexbox-whitespace-handling-001a.xhtml.
                 raw = getattr(node, "textContent", None) or getattr(node, "data", "") or ""
                 return "text" if raw.strip(inline_formatting._CSS_WHITESPACE_STRIP_CHARS) else "blank"
             return "text" if dom._collapsed_text_node(node).strip(inline_formatting._CSS_WHITESPACE_STRIP_CHARS) else "blank"
@@ -470,16 +459,15 @@ def _wrap_inline_runs(element, nodes, computed_cache) -> list:
 
 
 def _normalized_child_nodes(element, computed_cache, *, reuse_styles=False) -> list:
-    """`element.childNodes` as the layout tree actually sees them: CSS 2.1
+    """element.childNodes as the layout tree actually sees them: CSS 2.1
     17.2.1's anonymous table boxes (`_wrap_missing_table_boxes`) and then
     9.2.1.1's anonymous block boxes (`_wrap_inline_runs`) generated around
     the nodes that need them. Remembered on the element for
     `_inline_mixed_content`, which walks the same list."""
-    # `reuse_styles=True` is reserved for passes where neither DOM structure
-    # nor CSS can have changed (currently image-intrinsic relayouts). The
-    # anonymous table/block projection is therefore identical too. Reusing
-    # the prior list avoids reclassifying every child and resolving each
-    # child's display several times on an otherwise unchanged large DOM.
+    # reuse_styles=True is reserved for passes where neither DOM structure
+    # nor CSS can have changed (currently image-intrinsic relayouts), so
+    # the anonymous table/block projection is identical too -- reusing the
+    # prior list avoids reclassifying every child on an unchanged DOM.
     if reuse_styles and hasattr(element, "__dict__"):
         cached = element.__dict__.get("_chromonic_normalized_children")
         if cached is not None:
