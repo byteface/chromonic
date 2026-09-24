@@ -11,17 +11,14 @@ from . import box_model, dom, geometry, inline_formatting
 
 
 def _cleared_y(computed, active_floats, current_y: float) -> float:
-    """The minimum y `computed`'s own `clear` property requires, given
-    `active_floats` (`_fix_float_flow_after_block_sibling`'s own running
-    list of `{side, edge, top, bottom}` for every float already packed in
-    this same container) -- CSS 2.1 9.5.2: a cleared box's top border edge
-    must be at or below the bottom outer edge of every earlier float, on
-    the cleared side(s), still in this block formatting context. Applies
-    to a clearing float exactly as much as a clearing ordinary block (CSS
-    2.1 9.5.2 doesn't exempt one), so both of `_fix_float_flow_after_
-    block_sibling`'s packing branches call this. Returns `current_y`
-    unchanged when there's nothing to clear -- no `clear`, or no float on
-    the relevant side yet."""
+    """The minimum y `computed`'s own clear property requires, given
+    `active_floats` (`_fix_float_flow_after_block_sibling`'s running list of
+    {side, edge, top, bottom} for every float already packed in this
+    container) -- CSS 2.1 9.5.2: a cleared box's top border edge must be
+    at or below the bottom outer edge of every earlier float on the
+    cleared side(s). Applies to a clearing float exactly as much as a
+    clearing block (9.5.2 doesn't exempt one). Returns `current_y`
+    unchanged when there's nothing to clear."""
     if computed is None:
         return current_y
     clear_value = (getattr(computed, "clear", None) or "none").strip().lower()
@@ -36,21 +33,19 @@ def _cleared_y(computed, active_floats, current_y: float) -> float:
 
 
 def _fix_float_shrink_to_fit_width(tree_obj, node_map: dict) -> bool:
-    """CSS 2.1 10.3.5/10.3.6: a floated box with `width:auto` is sized by
+    """CSS 2.1 10.3.5/10.3.6: a floated box with width:auto is sized by
     shrink-to-fit, not stretched to fill its containing block -- chromonic
     has no real float implementation, so a floated element reaches this
     point laid out as an ordinary full-width block first.
 
-    Re-runs Taffy's `compute()` for just this element at `available_width=
-    None` (max-content), re-laying-out the real subtree so descendants
-    reflow into the narrower width too, then shifts the whole subtree to
-    its real page position. Only ever shrinks -- nothing to correct if the
-    intrinsic width isn't already smaller.
+    Re-runs Taffy's compute() for just this element at available_width=None
+    (max-content), re-laying-out the real subtree so descendants reflow
+    into the narrower width too, then shifts the subtree to its real page
+    position. Only ever shrinks.
 
     Returns whether any subtree was actually shifted -- the caller uses
-    this to skip a redundant `_publish_inline_formatting` republish (an
-    O(node count) pass) on the, in practice, large majority of layouts
-    that have no floats needing this correction at all."""
+    this to skip a redundant `_publish_inline_formatting` republish on the
+    large majority of layouts that have no floats needing this."""
     shifted = False
     by_id = {id(element): node_id for node_id, element in node_map.items()}
     for element in list(node_map.values()):
@@ -90,24 +85,22 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
     """CSS 2.1 9.5: a float starts at or below the current block-flow
     position, at the containing block's edge, never wherever a previous
     sibling's box happened to end horizontally. `_approximate_inline_flow`
-    stands in for real float layout with plain `flex-wrap`, which has no
+    stands in for real float layout with plain flex-wrap, which has no
     notion of this -- a row only wraps on width overflow, so a paragraph
     followed by floats packed them onto its own row instead of below it.
 
     Runs after Taffy's flex-wrap layout, using the qualifying split
-    `_approximate_inline_flow` recorded on `element`. Narrow on purpose:
-    only applies when every *qualifying* child is a real float, not merely
-    inline-level -- a group with even one qualifying-but-not-floated
-    (inline-tag) child leaves Taffy's own flex-wrap result alone entirely
-    (real inline-flow approximation, e.g. a nav bar of plain `<a>`s, relies
-    on that result's own gap/wrap handling, not this simplified packer).
-    Does *not* also require at least one ordinary (non-qualifying) block
-    sibling -- a pure all-float sibling group needs this same real
-    left/right packing just as much (confirmed directly: two floats with
-    no other sibling packed side-by-side, both flush-left, via Taffy's own
-    flex-wrap row layout, `float:right` never actually consulted for
-    positioning at all). When it applies, every child's position is
-    recomputed by simple left-to-right block/float packing."""
+    `_approximate_inline_flow` recorded on `element`. Narrow on purpose: only
+    applies when every qualifying child is a real float, not merely
+    inline-level -- a group with even one qualifying-but-not-floated child
+    leaves Taffy's own flex-wrap result alone (real inline-flow
+    approximation, e.g. a nav bar, relies on its own gap/wrap handling).
+    Does not require at least one non-qualifying block sibling -- a pure
+    all-float group needs this same left/right packing just as much
+    (confirmed: two floats with no other sibling packed side-by-side, both
+    flush-left, via Taffy's flex-wrap, float:right never consulted at
+    all). When it applies, every child's position is recomputed by simple
+    left-to-right block/float packing."""
     for element in list(node_map.values()):
         children = getattr(element, "_chromonic_float_flow_children", None)
         qualifies = getattr(element, "_chromonic_float_flow_qualifies", None)
@@ -121,9 +114,8 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 (getattr(child, "_chromonic_resolved_style", None) or (None,))[0])
                for child, is_flow in zip(children, qualifies)):
             continue  # a qualifying-but-not-floated (inline-tag) child -- leave Taffy's own result alone
-        # An absolutely positioned child is no sibling in this flow at
-        # all (position-absolute-007.xht: an abs box before a float
-        # pushed the float 96px down and lost its own `top`).
+        # An absolutely positioned child is no sibling in this flow at all
+        # -- position-absolute-007.xht.
         children, qualifies = zip(*[(child, is_flow) for child, is_flow in zip(children, qualifies)
                                     if not out_of_flow(child)]) if any(
             not out_of_flow(child) for child in children) else ((), ())
@@ -141,19 +133,17 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
         row_bottom = cursor_y
         # CSS 2.1 9.5: every still-uncleared float narrows the line box of
         # every row it overlaps, not just the one it first packed onto --
-        # tracked here so a later block's `margin:auto` resolves against
-        # the narrowed band, not the full content width.
+        # tracked here so a later block's margin:auto resolves against the
+        # narrowed band, not the full content width.
         active_floats: list = []
-        # `_adjust_body_collapsed_margins` may have already folded
-        # `element`'s own top margin together with this first child's
-        # (CSS 2.1 8.3.1 adjoining-margins collapse) -- treated as an
-        # already-resolved `0`, not `mt`, here.
+        # `_adjust_body_collapsed_margins` may have already folded element's
+        # own top margin together with this first child's (CSS 2.1 8.3.1
+        # adjoining-margins collapse) -- treated as already-resolved 0 here.
         first_margin_collapsed = getattr(element, "_chromonic_margin_collapsed", False)
         # CSS 2.1 8.3.1: adjoining margins collapse into one; a float
-        # between two blocks doesn't break the adjoining chain.
-        # `pending_margins` accumulates the current chain (an empty block
-        # joins both its own margins without resolving anything); a real
-        # block resolves the whole set via `inline_formatting._collapse_margin_set`.
+        # between two blocks doesn't break the chain. `pending_margins`
+        # accumulates it; a real block resolves the whole set via
+        # `inline_formatting._collapse_margin_set`.
         pending_margins: list = []
         block_bottom = cursor_y
         for index, (child, is_flow) in enumerate(zip(children, qualifies)):
@@ -164,16 +154,13 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 or (0.0, 0.0, 0.0, 0.0)
             mt, mr, mb, ml = (box_model._numeric_edge(v) for v in margin)
             if not is_flow and (getattr(child, "tagName", "") or "").lower() == "br":
-                # CSS 2.1 9.2.2/9.5.2: a `<br>` among floats is a forced
-                # line break, not a block -- its (empty) line box sits at
-                # the current flow position *beside* the floats, narrowed
-                # by them like any line box, and counts one line-height
-                # in flow; its own `clear` (the `br { clear: both }` idiom
-                # separating rows of floated test containers throughout
-                # `css-flexbox/abspos/`) then applies clearance to what
-                # *follows* the break, never to the break's own line.
-                # Previously handled as an ordinary cleared block below
-                # the floats, a full extra line lower than Chrome.
+                # CSS 2.1 9.2.2/9.5.2: a <br> among floats is a forced line
+                # break, not a block -- its empty line box sits at the
+                # current flow position beside the floats, narrowed by them
+                # like any line box; its own clear (the `br { clear: both
+                # }` idiom separating rows of floated test containers)
+                # applies clearance to what follows the break, never to the
+                # break's own line.
                 line_top = block_bottom + inline_formatting._collapse_margin_set(pending_margins)
                 line_height = child_box.height
                 left = content_left
@@ -184,9 +171,8 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 glyph_height = child.__dict__.get("_chromonic_br_glyph_height")
                 new_y, new_height = line_top, line_height
                 if glyph_height is not None and glyph_height < line_height:
-                    # Chrome reports the break's own inline box (the
-                    # font's content area, centred in the line), not the
-                    # whole line box.
+                    # Chrome reports the break's own inline box (the font's
+                    # content area, centred in the line), not the whole line box.
                     new_y = line_top + math.floor((line_height - glyph_height) / 2)
                     new_height = glyph_height
                 child.__dict__["_layout_box"] = LayoutBox(
@@ -196,12 +182,9 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 child_computed = (getattr(child, "_chromonic_resolved_style", None) or (None,))[0]
                 block_bottom = _cleared_y(child_computed, active_floats, block_bottom)
                 # The clearance is part of the container's flow extent
-                # (`_fix_float_flow_container_auto_height`: Chrome's
-                # `.big` wrapper ends at the cleared position, 1px past
-                # the break's own line).
-                # Stored relative to the break's own box: a later pass
-                # may shift the whole container (an earlier sibling's
-                # auto height changing), and an absolute y would go stale.
+                # (`_fix_float_flow_container_auto_height`). Stored relative to
+                # the break's own box: a later pass may shift the whole
+                # container, and an absolute y would go stale.
                 child.__dict__["_chromonic_br_flow_bottom"] = block_bottom - new_y
                 pending_margins = []
                 row_bottom = cursor_y = block_bottom
@@ -215,7 +198,7 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 if inline_formatting._block_margins_collapse_through(child, child_box):
                     # Own top/bottom margin joins the same adjoining set --
                     # nothing resolves yet, so this empty block's zero-size
-                    # position is only a best-effort placement.
+                    # position is a best-effort placement.
                     pending_margins.append(mb)
                     new_x = content_left + ml
                     new_y = block_bottom + inline_formatting._collapse_margin_set(pending_margins)
@@ -227,8 +210,8 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 # An ordinary in-flow block: own row, at the containing
                 # block's edge, below everything placed so far -- narrowed
                 # by a still-active float (CSS 2.1 9.5) only if this child
-                # establishes its own BFC (9.4.1); an ordinary block's
-                # border box may extend behind one otherwise.
+                # establishes its own BFC (9.4.1); otherwise its border box
+                # may extend behind one.
                 collapsed = inline_formatting._collapse_margin_set(pending_margins)
                 new_y = block_bottom + collapsed
                 narrowed_left = content_left
@@ -239,47 +222,26 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 child_has_explicit_width = child_native_style.get("width") != "auto"
                 if box_model._establishes_bfc(child_computed):
                     # CSS 2.1 9.5: a box establishing its own BFC must not
-                    # overlap any float still active at its top -- narrowing
-                    # alone (as before) stops there, but an *explicit*-width
-                    # box too wide for what's left between the active
-                    # floats at this `new_y` needs to drop further, past
-                    # whichever of them is blocking it, and be renarrowed
-                    # there -- repeated since dropping past one float can
-                    # still leave another (or the same one, still) in the
-                    # way. Confirmed directly on floats-wrap-top-below-bfc-
-                    # 002l.xht: a 200px-wide new-BFC box between a 150px
-                    # left float and a 300px right float (leaving negative
-                    # room) previously just sat at its unnarrowed `new_y`,
-                    # overlapping both, instead of dropping below the
-                    # lower of the two.
+                    # overlap any float still active at its top -- an
+                    # explicit-width box too wide for what's left at this
+                    # new_y drops further, past whichever float is
+                    # blocking it, renarrowed there, repeated since
+                    # dropping past one float can still leave another in
+                    # the way -- floats-wrap-top-below-bfc-002l.xht.
                     #
-                    # `width:auto` never needs this push-down check at all
-                    # -- narrowing alone already gives it the right answer,
-                    # since (unlike a fixed width) it just *fills* whatever
-                    # narrowed space is left rather than needing to fit an
-                    # already-decided size into it. Using this box's own
-                    # (still full-row, not yet narrowed) `child_box.width`
-                    # as the "does it fit" check here, as the fixed-width
-                    # case does, was wrong for auto-width boxes: confirmed
-                    # directly on floats-wrap-bfc-001-left-overflow.xht, an
-                    # `overflow:hidden` (`width:auto`) div only 150px worth
-                    # of actual content wide but still full-row (300px) at
-                    # this point in the pipeline -- checking that 300
-                    # against the 200px narrowed by an adjacent float
-                    # wrongly looked like an overflow and pushed the whole
-                    # box below the float instead of correctly narrowing
-                    # beside it.
+                    # width:auto never needs this push-down check -- it
+                    # just fills whatever narrowed space is left rather
+                    # than needing to fit an already-decided size. Using
+                    # the still-full-row child_box.width as the fit check
+                    # here (as the fixed-width case does) was wrong for
+                    # auto-width boxes -- floats-wrap-bfc-001-left-overflow.xht.
                     while True:
                         narrowed_left = content_left
                         narrowed_right = content_right
                         # A real interval overlap, not just "hasn't ended
-                        # yet" -- a float whose own top is still below this
-                        # box's `new_y` hasn't started yet either, and
-                        # mustn't narrow a box placed above it (confirmed
-                        # directly: a right float starting well below this
-                        # row's top was otherwise still treated as
-                        # "blocking" a same-row box that starts and ends
-                        # entirely above it).
+                        # yet" -- a float whose top is still below this
+                        # box's new_y hasn't started yet either, and mustn't
+                        # narrow a box placed above it.
                         blocking = [
                             a for a in active_floats
                             if a["top"] < new_y + child_box.height and a["bottom"] > new_y
@@ -305,10 +267,9 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                     else:
                         mr = remaining - ml
                 if narrowed_left > content_left + 1e-6:
-                    # CSS 2.1 9.5: a BFC box's *border* box must clear the
-                    # float; its own margin may run under the float
-                    # (flexbox_fbfc2.html: `margin-left: -200px` beside a
-                    # 200px float still starts at the float's edge).
+                    # CSS 2.1 9.5: a BFC box's border box must clear the
+                    # float; its own margin may run under it --
+                    # flexbox_fbfc2.html.
                     new_x = max(narrowed_left, content_left + ml)
                 else:
                     new_x = narrowed_left + ml
@@ -323,14 +284,11 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 continue
             if pending_margins:
                 # A float never participates in margin collapsing itself
-                # (CSS 2.1 8.3.1 only ever adjoins in-flow block boxes),
-                # but it still starts *below* whatever vertical space a
-                # still-pending collapsed margin resolves to -- resolved
-                # here, once, the first time anything (this float) is
-                # actually placed at that flow position; a later ordinary
-                # block starts its own fresh chain from `block_bottom`
-                # exactly as if this float were never there, matching the
-                # float being out of flow for collapsing purposes.
+                # (CSS 2.1 8.3.1 only adjoins in-flow block boxes), but it
+                # still starts below whatever vertical space a pending
+                # collapsed margin resolves to -- resolved here, once; a
+                # later ordinary block starts its own fresh chain from
+                # block_bottom as if this float were never there.
                 block_bottom = block_bottom + inline_formatting._collapse_margin_set(pending_margins)
                 cursor_y = row_bottom = block_bottom
                 pending_margins = []
@@ -341,35 +299,24 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 float_value = (getattr(child_computed, "float", None) or "").strip().lower()
                 if float_value == "right":
                     float_side = "right"
-            # CSS 2.1 9.5.2: `clear` applies to a floated box exactly as
-            # much as an ordinary block -- pushes its own top down (and
-            # therefore `cursor_y`/`row_bottom`, both derived from it
-            # below) past whatever it's clearing, before this float's own
-            # placement is computed.
+            # CSS 2.1 9.5.2: clear applies to a floated box exactly as much
+            # as an ordinary block -- pushes its top (and cursor_y/row_bottom,
+            # derived from it below) past whatever it's clearing, before
+            # this float's own placement is computed.
             cleared_y = _cleared_y(child_computed, active_floats, cursor_y)
             if cleared_y > cursor_y:
                 cursor_y = row_bottom = cleared_y
                 cursor_x = content_left
                 right_cursor_x = content_right
             if float_side == "right":
-                # `float:right` packs flush to the containing block's right
+                # float:right packs flush to the containing block's right
                 # content edge, not the left-to-right packing below (CSS
                 # 2.1 9.5.1).
                 start_x = right_cursor_x - mr - child_box.width
                 # CSS 2.1 9.5.1 rule 7: a float's outer top may not be
-                # higher than any earlier float's it would otherwise
-                # overlap. Triggered by the overlap itself (`start_x <
-                # cursor_x`, i.e. this position collides with whatever's
-                # already packed on the left) -- an earlier version also
-                # required `right_cursor_x < content_right` (an existing
-                # right float having already narrowed this row), which
-                # incorrectly left the *first* right float on a row
-                # unpushed even when it collided with an earlier *left*
-                # float (confirmed directly on floats-wrap-top-below-bfc-
-                # 002l.xht: a 300px right float that can't fit beside a
-                # 150px left float in a 400px container needs to drop
-                # below it, but only ever did when a second right float
-                # was involved).
+                # higher than any earlier float it would otherwise overlap.
+                # Triggered by the overlap itself (start_x < cursor_x) --
+                # floats-wrap-top-below-bfc-002l.xht.
                 if start_x < cursor_x:
                     cursor_y = row_bottom
                     right_cursor_x = content_right
@@ -385,8 +332,7 @@ def _fix_float_flow_after_block_sibling(node_map: dict) -> None:
                 continue
             start_x = cursor_x + ml
             # Symmetric with the right-float branch above -- the overlap
-            # itself is the trigger, not whether this happens to be the
-            # first item packed so far.
+            # itself is the trigger.
             if start_x + child_box.width + mr > right_cursor_x:
                 cursor_x = content_left
                 cursor_y = row_bottom
@@ -434,21 +380,15 @@ def _bfc_descendant_float_bottom(element, floor: float) -> float:
 
 
 def _has_ratio_derived_height(native: dict) -> bool:
-    """CSS Sizing 4 `aspect-ratio`: when `height` is `auto` but `width` is
-    definite and a ratio was declared, the *used* height comes from the
-    ratio (Taffy's own `aspect_ratio` field already resolves it inside
-    Taffy's layout), not from summed content -- so any pass that would
-    otherwise recompute a `height:auto` element's height from its
-    children's own extent must leave this one alone. Confirmed directly
-    on `css-sizing/aspect-ratio/block-aspect-ratio-010.html`: a
-    `width:100px; aspect-ratio:1/1; overflow:hidden` block holding a
-    500px-tall child was recomputed to `600px` (the summed children,
-    completely ignoring the ratio) instead of staying the ratio's own
-    `100px`. Narrow on purpose: only the "definite width, auto height"
-    case -- `min-height` clamping past the ratio (needing the *bigger*
-    of the two) is a real, separate CSS Sizing 4 rule this doesn't
-    attempt, and an *indefinite* width leaves the ratio unresolved,
-    where content-based sizing is still exactly right."""
+    """CSS Sizing 4 aspect-ratio: when height is auto but width is definite
+    and a ratio was declared, the used height comes from the ratio
+    (Taffy's aspect_ratio field already resolves it), not from summed
+    content -- so a recompute-from-children pass must leave this one
+    alone. css-sizing/aspect-ratio/block-aspect-ratio-010.html: recomputed
+    to 600px (summed children) instead of the ratio's own 100px. Narrow on
+    purpose: min-height clamping past the ratio is a separate rule this
+    doesn't attempt, and an indefinite width leaves content-based sizing
+    exactly right."""
     return (isinstance(native.get("aspect_ratio"), (int, float))
             and isinstance(native.get("width"), (int, float))
             and native.get("height") == "auto")
@@ -456,18 +396,16 @@ def _has_ratio_derived_height(native: dict) -> bool:
 
 
 def _fix_nested_bfc_float_auto_height(node_map: dict) -> None:
-    """The same CSS 2.1 10.6.3/10.6.7 rule `_fix_float_flow_container_
-    auto_height` applies (a `height:auto` box never counts a float unless
-    it establishes a BFC) but for the cases that heuristic doesn't reach:
-    a lone float (the only child of an ordinary wrapper div) reaches Taffy
-    as a plain in-flow block, its full height counted toward the wrapper's
-    auto-height like any other child -- Taffy has no notion it should be
-    excluded, only that its margin might collapse through.
+    """The same CSS 2.1 10.6.3/10.6.7 rule `_fix_float_flow_container_auto_height`
+    applies (a height:auto box never counts a float unless it establishes
+    a BFC) but for the cases that heuristic doesn't reach: a lone float
+    (the only child of an ordinary wrapper div) reaches Taffy as a plain
+    in-flow block, its full height counted toward the wrapper's
+    auto-height -- Taffy has no notion it should be excluded.
 
     A BFC-establishing ancestor further up needs the opposite correction,
-    recursing past that same non-BFC wrapper to find the float, since its
-    own auto-height counts every descendant float in its formatting
-    context, not just direct children."""
+    recursing past that non-BFC wrapper to find the float, since its own
+    auto-height counts every descendant float in its formatting context."""
     for element in node_map.values():
         if not dom._is_element(element):
             continue
@@ -477,10 +415,9 @@ def _fix_nested_bfc_float_auto_height(node_map: dict) -> None:
             continue  # _adjust_body_collapsed_margins owns body
         if getattr(element, "_chromonic_is_table_root", False):
             # A table box (a BFC too) is sized by the table pipeline
-            # (`_settle_table`) from its rows and captions -- often
-            # anonymous boxes with no DOM children to read here at all
-            # (caption-side-applies-to-017.xht; table-margin-004.xht's
-            # `<p style="display: table">Test</p>` came out 0px tall).
+            # (`_settle_table`) from its rows and captions -- often anonymous
+            # boxes with no DOM children to read here at all --
+            # caption-side-applies-to-017.xht, table-margin-004.xht.
             continue
         native = getattr(element, "_chromonic_native_style", None)
         if native is None or native.get("height") != "auto":
@@ -488,37 +425,25 @@ def _fix_nested_bfc_float_auto_height(node_map: dict) -> None:
         if _has_ratio_derived_height(native):
             continue
         if native.get("display") in ("flex", "grid"):
-            # `float` always computes to `none` on a flex/grid item, so
-            # such a container can never actually have a floated child --
-            # this function's whole premise never applies to one, even
-            # though `box_model._establishes_bfc` (correctly, as a separate CSS
-            # fact) says it establishes a BFC. Its block-flow-style
-            # recompute isn't equivalent to Taffy's own flex/grid sizing
-            # (cross-axis extent, not the lowest child's bottom edge), so
-            # it must never touch one -- Taffy's own number is already correct.
+            # float always computes to none on a flex/grid item, so this
+            # function's whole premise never applies to one, even though
+            # `box_model._establishes_bfc` says it establishes a BFC. Its
+            # block-flow-style recompute isn't equivalent to Taffy's own
+            # flex/grid sizing, so it must never touch one.
             continue
         if not getattr(element, "_chromonic_has_layout_children", False):
-            # A genuine leaf (no element children) was never sized by
-            # summing child contributions -- its `height:auto` is already
-            # a real, correctly-measured text/line-box result, not
-            # something to recompute from `childNodes` here.
+            # A genuine leaf was never sized by summing child
+            # contributions -- its height:auto is already a real,
+            # correctly-measured text/line-box result.
             continue
         if getattr(element, "_chromonic_inline_plan", None) is not None:
-            # `_chromonic_has_layout_children` is set `True` for one of
-            # these too (a different purpose -- see `build()`'s own
-            # comment there, stopping `paint.py` from drawing raw
-            # `textContent` a second time), but it's still a genuine,
-            # single Taffy leaf measured whole by `plan.measure()` -- its
-            # own inline children (a `<span>`, say) were flattened into the
-            # plan's runs, never built as real Taffy nodes of their own, so
-            # they have no real `_layout_box` this function's "sum child
-            # bottoms" logic could read. Recomputing its height from
-            # `childNodes` here silently discarded the plan's own already-
-            # correct measured height instead (confirmed on `wpt/css/CSS2/
-            # visudet/content-height-001.html`: a `line-height:200px`
-            # `display:inline-block` div, which also establishes a BFC,
-            # measured `200px` correctly and then got overwritten to `129px`
-            # by this exact function, right here).
+            # A genuine single Taffy leaf measured whole by plan.measure()
+            # -- its inline children were flattened into the plan's runs,
+            # never built as real Taffy nodes, so they have no _layout_box
+            # this function's "sum child bottoms" logic could read.
+            # Recomputing from childNodes silently discarded the plan's
+            # already-correct measured height -- wpt/css/CSS2/visudet/
+            # content-height-001.html: overwritten from 200px to 129px.
             continue
         box = element.__dict__.get("_layout_box")
         if box is None:
@@ -566,17 +491,17 @@ def _fix_nested_bfc_float_auto_height(node_map: dict) -> None:
 
 
 def _fix_float_flow_container_auto_height(node_map: dict) -> None:
-    """CSS 2.1 10.6.3/10.6.7: an element's own `height:auto` is the max
-    extent of its in-flow content's bottom margin edge -- a float
-    contributes too, but only if the element establishes a BFC (9.4.1).
-    Taffy's own flex-wrap row-summing (`_approximate_inline_flow`'s
-    stand-in for real float layout) instead *adds* each wrapped row's
-    height together, double-counting a float row and a later normal-flow
-    row that both start from the same content top.
+    """CSS 2.1 10.6.3/10.6.7: an element's height:auto is the max extent of
+    its in-flow content's bottom margin edge -- a float contributes too,
+    but only if the element establishes a BFC (9.4.1). Taffy's flex-wrap
+    row-summing (`_approximate_inline_flow`'s stand-in for real float
+    layout) instead adds each wrapped row's height together,
+    double-counting a float row and a later normal-flow row that both
+    start from the same content top.
 
-    Runs after `_fix_float_flow_after_block_sibling` has placed every
-    child at its real, float-aware position -- recomputes the container's
-    height from those final positions instead."""
+    Runs after `_fix_float_flow_after_block_sibling` has placed every child
+    at its real, float-aware position -- recomputes the container's
+    height from those final positions."""
     for element in node_map.values():
         children = getattr(element, "_chromonic_float_flow_children", None)
         qualifies = getattr(element, "_chromonic_float_flow_qualifies", None)
@@ -591,9 +516,8 @@ def _fix_float_flow_container_auto_height(node_map: dict) -> None:
                for child, is_flow in zip(children, qualifies)):
             continue  # a qualifying-but-not-floated (inline-tag) child -- leave Taffy's own result alone
         if getattr(element, "_chromonic_tag_name", None) == "body":
-            # `_adjust_body_collapsed_margins` already owns body's own
-            # auto-height with extra precision this generic version
-            # doesn't replicate -- recomputing it here risks regressing it.
+            # `_adjust_body_collapsed_margins` already owns body's auto-height
+            # with extra precision this generic version doesn't replicate.
             continue
         native = getattr(element, "_chromonic_native_style", None)
         if native is None or native.get("height") != "auto":
@@ -642,19 +566,13 @@ def _fix_float_flow_container_auto_height(node_map: dict) -> None:
 def _fix_inline_float_position(node_map: dict) -> None:
     """CSS 2.1 9.5: correct the position of a float found mixed into
     running text (`elif inline_items:`'s flex-row-of-text approximation
-    marks these on `element._chromonic_inline_floats`, in DOM order,
-    excluded from that row's own baseline alignment). Taffy already gave
-    each one a real, content-sized box, wrapped onto some row by the
-    row's own flex-wrap -- treated here as a reasonable stand-in for
-    "which line of text it interrupted" (its own `y`), corrected only in
-    `x`: flush to the container's left/right content edge (rule 1), and
-    dropped below any earlier same-container float it would otherwise
-    overlap (rule 7), via a per-container running list so two floats in
-    the same paragraph still stack correctly. Does not narrow the
-    surrounding text around the float's own rectangle (a real "inline
-    layout consults active floats" implementation is a substantially
-    bigger feature -- logged in PLAN.md) -- only the float's own
-    geometry is corrected."""
+    marks these on `element._chromonic_inline_floats`, excluded from that
+    row's baseline alignment). Taffy already gave each one a real,
+    content-sized box wrapped onto some row -- treated as a stand-in for
+    "which line it interrupted" (its own y), corrected only in x: flush to
+    the container's content edge (rule 1), dropped below any earlier
+    same-container float it would overlap (rule 7). Does not narrow
+    surrounding text around the float's rectangle -- logged in PLAN.md."""
     for element in list(node_map.values()):
         floats = getattr(element, "_chromonic_inline_floats", None) if hasattr(element, "__dict__") else None
         if not floats:
@@ -681,11 +599,10 @@ def _fix_inline_float_position(node_map: dict) -> None:
             mt, mr, mb, ml = (box_model._numeric_edge(v) for v in margin)
             top = child_box.y
             top = _cleared_y(child_computed, active_floats, top)
-            # Rule 7: this float's own outer top may not be higher than
-            # any earlier same-container float it would otherwise
-            # overlap -- dropped below the lowest blocking one, same
-            # collision check `_fix_float_flow_after_block_sibling` uses
-            # for block-level float siblings.
+            # Rule 7: this float's outer top may not be higher than any
+            # earlier same-container float it would overlap -- dropped
+            # below the lowest blocking one, same collision check
+            # `_fix_float_flow_after_block_sibling` uses for block-level floats.
             while True:
                 blocking = [a for a in active_floats
                             if a["top"] < top + child_box.height and a["bottom"] > top]
