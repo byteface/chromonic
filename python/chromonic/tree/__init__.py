@@ -1,0 +1,913 @@
+"""Walk a live domonic DOM, build a mirroring Taffy tree, run layout, and
+write geometry back onto the domonic elements via `element.set_layout_box(...)`.
+
+No dirty-bit tracking: `layout()` is meant to be called again, in full,
+after any mutation (see PLAN.md).
+
+Style resolution, not Taffy itself, dominates relayout cost, so `dom._describe`
+builds exactly one `ComputedStyleDeclaration` per element per pass and shares
+it across style-dict-building and `paint.py`'s paint-style extraction.
+
+Split from a single 11,260-line tree.py into this package by concern (dom
+plumbing, anonymous-box synthesis, inline formatting, table layout, floats,
+positioning, flex/grid, shared box-model/geometry primitives, and the
+recursive `builder.build()`). Cross-submodule calls go through qualified
+module access (`from . import x` then `x.name(...)`), never `from .x import
+name` -- several of these modules depend on each other in both directions
+(e.g. dom <-> anonymous_boxes <-> inline_formatting), and only the qualified
+form survives that: it only needs the *module* to exist when the import
+statement runs, not the specific attribute, so it tolerates the cycle as
+long as nothing at module or class body level (as opposed to inside a
+function) needs another module's attribute before that module has finished
+initializing. It also keeps monkeypatching (tests/test_chromonic.py patches
+a couple of private names directly, e.g. `_shift_later_siblings_for_height_delta`)
+working the same way it did when everything lived in one module: a patch to
+`geometry._shift_later_siblings_for_height_delta` is seen by every caller,
+because every caller looks it up through `geometry` at call time rather than
+holding its own bound copy from `from .geometry import ...`."""
+
+from __future__ import annotations
+
+import functools
+import logging
+
+from domonic import bs4 as domonic_bs4
+from domonic.dom import Element
+from domonic.layout import LayoutBox
+from domonic.style import ComputedStyleDeclaration
+from domonic.utils import Utils
+
+from .. import style_bridge
+from .._native import Tree, layout_text
+from . import anonymous_boxes, box_model, builder, dom, flex_grid, floats, geometry, inline_finalize, inline_formatting, positioning, replaced_elements, table_layout
+
+
+
+_log = logging.getLogger(__name__)
+
+
+
+def is_rust_panic(error: BaseException) -> bool:
+    """Whether `error` is `pyo3_runtime.PanicException` -- what a genuine
+    Rust-side panic (a real invariant violation inside Taffy/the `_native`
+    extension, e.g. "invalid SlotMap key used") surfaces as in Python.
+    Pyo3 deliberately derives it from `BaseException`, not `Exception`
+    (its own docs compare it to `SystemExit`), specifically so an ordinary
+    `except Exception:` can't accidentally swallow one -- which also means
+    every "a bad page must not crash the whole browser" handler in this
+    codebase, all written as `except Exception:`, has never actually been
+    able to catch one; confirmed directly, a real Rust panic propagated
+    straight through several of them. A caller that wants "a page tripped
+    a recoverable bug" to include a Rust panic, not just an ordinary
+    Python exception, catches `BaseException` and calls this to decide
+    whether to handle it or re-raise. Matched by class name/module rather
+    than importing `pyo3_runtime` directly, since pyo3 only creates that
+    module lazily, the first time a panic actually happens -- it isn't
+    reliably importable up front."""
+    return type(error).__module__ == "pyo3_runtime" and type(error).__name__ == "PanicException"
+
+
+# `Utils.case_kebab` backs every `ComputedStyleDeclaration` property read and
+# is a pure string transform -- memoized process-wide since it was the
+# single largest cost after `ComputedStyleDeclaration` construction itself
+# under profiling.
+Utils.case_kebab = staticmethod(functools.lru_cache(maxsize=2048)(Utils.case_kebab))
+
+
+# Selector matchers are pure but re-parse selector text on every candidate
+# element; cache them so each distinct selector is parsed once.
+Element._parse_simple_selector = staticmethod(
+    functools.lru_cache(maxsize=8192)(Element._parse_simple_selector)
+)
+
+domonic_bs4._split_simple_selector_chain = functools.lru_cache(maxsize=8192)(
+    domonic_bs4._split_simple_selector_chain
+)
+
+domonic_bs4._strip_simple_pseudo = functools.lru_cache(maxsize=8192)(
+    domonic_bs4._strip_simple_pseudo
+)
+
+domonic_bs4._parse_stripped_selector = functools.lru_cache(maxsize=8192)(
+    domonic_bs4._parse_stripped_selector
+)
+
+
+
+class LayoutProjection:
+    """A retained Taffy projection of an authoritative live Domonic tree.
+
+    Domonic remains the source of structure, styles and text. Each reconcile
+    walks that tree, reuses native nodes by element identity, and only mutates
+    native style, child or measure state whose snapshot changed.
+    """
+
+    def __init__(self):
+        self.tree = Tree()
+        self.nodes = {}
+        self.state = {}
+        self.node_map = {}
+        self._seen = set()
+
+    def begin(self):
+        self._seen.clear()
+        # Deliberately *not* `self.node_map = {}` -- `node_map` is this
+        # projection's only strong Python reference to each tracked
+        # element (`self.nodes`/`self.state` key by `id(element)`, a bare
+        # memory address). Clearing it here, before `builder.build()` walks the
+        # new tree and before `finish()` prunes the Taffy side, would drop
+        # that reference for every element that's about to turn out stale
+        # this same pass -- and since domonic's DOM elements hold
+        # parent/child back-references (a reference cycle), losing the
+        # last *strong* ref doesn't free one immediately; it just becomes
+        # eligible for Python's cyclic GC, which can run at any
+        # allocation-heavy moment, including mid-`builder.build()` while this same
+        # pass is allocating a large new tree (a full page navigation, a
+        # big DOM). If a brand-new element's address then lands on a
+        # just-collected stale element's address, `upsert()`'s `self.nodes
+        # .get(id(element))` aliases onto the stale entry, corrupting the
+        # bookkeeping until `finish()` later removes an already-invalid or
+        # misattributed Taffy node -- a real, reproduced "invalid SlotMap
+        # key used" panic. Leaving old entries in place here keeps every
+        # still-tracked element referenced (and thus its address
+        # unreusable) right up until `finish()` explicitly removes it --
+        # see `finish()`'s own `self.node_map.pop(node, None)`.
+
+    def measure_changed(self, element, measure_key):
+        previous = self.state.get(id(element))
+        return previous is None or previous[2] != measure_key
+
+    def upsert(self, element, style, children, measure, measure_key):
+        key = id(element)
+        self._seen.add(key)
+        children = tuple(children)
+        node = self.nodes.get(key)
+        previous = self.state.get(key)
+        if node is None:
+            if children:
+                node = self.tree.new_with_children(style, list(children))
+            elif measure is not None:
+                node = self.tree.new_text_leaf(style, measure)
+            else:
+                node = self.tree.new_leaf(style)
+            self.nodes[key] = node
+        else:
+            old_style, old_children, old_measure_key = previous
+            if old_style != style:
+                self.tree.set_style(node, style)
+            if old_children != children:
+                self.tree.set_children(node, list(children))
+            if old_measure_key != measure_key:
+                self.tree.set_measure(node, measure)
+        # Keep an independent value snapshot. Image intrinsic sizing
+        # mutates its cached dictionary in place; retaining that object would
+        # make the next dirty comparison miss the change.
+        self.state[key] = (_snapshot_style(style), children, measure_key)
+        self.node_map[node] = element
+        return node
+
+    def finish(self):
+        stale = set(self.nodes) - self._seen
+        for key in stale:
+            node = self.nodes.pop(key)
+            try:
+                self.tree.remove(node)
+            except BaseException as error:
+                if not is_rust_panic(error):
+                    raise
+                # Some path still not fully understood leaves `node`
+                # already invalid in the Rust tree by the time this runs
+                # (the `begin()`/`finish()` fix for the GC-timing
+                # id(element) reuse race this class is otherwise exposed
+                # to -- see `begin()` -- closes one way to reach this,
+                # evidently not the only one). Whatever the exact trigger,
+                # the *intent* of this call is just "make sure Taffy
+                # doesn't still have this node" -- an already-invalid key
+                # means that's already true, so this is safe to treat as a
+                # no-op rather than letting one stale bookkeeping entry
+                # take the entire browser process down; every Python-side
+                # structure below is still cleaned up either way. Logged
+                # so a recurrence leaves a trail toward whatever the
+                # remaining cause turns out to be.
+                _log.exception(
+                    "chromonic: LayoutProjection.finish() could not remove "
+                    "an already-stale Taffy node (id=%r, tag=%r) -- treating "
+                    "it as already gone",
+                    key, getattr(self.node_map.get(node), "_chromonic_tag_name", None),
+                )
+            self.state.pop(key, None)
+            # Drops this stale element's last strong reference -- see
+            # `begin()` for why that must not happen any earlier than
+            # this, right alongside the matching Taffy-side removal above.
+            self.node_map.pop(node, None)
+
+    def patch_style(self, element, **changes):
+        """Apply known layout-field changes after their Domonic mutation.
+
+        This is an explicit incremental bridge for callers that know exactly
+        which translated Taffy fields their authoritative DOM write changed.
+        Unknown CSS mutations must use ``layout()`` to reconcile normally.
+        """
+        key = id(element)
+        node = self.nodes.get(key)
+        previous = self.state.get(key)
+        style = getattr(element, "_chromonic_native_style", None)
+        if node is None or previous is None or style is None:
+            raise KeyError("element is not present in this layout projection")
+        style = dict(style)
+        style.update(changes)
+        element._chromonic_native_style = style
+        self.tree.set_style(node, style)
+        _old_style, children, measure_key = previous
+        self.state[key] = (_snapshot_style(style), children, measure_key)
+
+    def patch_insets(self, updates):
+        """Batch known ``(element, top, right, bottom, left)`` changes."""
+        native_updates = []
+        for element, top, right, bottom, left in updates:
+            key = id(element)
+            node = self.nodes.get(key)
+            previous = self.state.get(key)
+            style = getattr(element, "_chromonic_native_style", None)
+            if node is None or previous is None or style is None:
+                raise KeyError("element is not present in this layout projection")
+            inset = [float(top), float(right), float(bottom), float(left)]
+            native_updates.append((node, *inset))
+            # Cached native style and its retained snapshot are independent;
+            # update only the one changed field in each instead of copying a
+            # roughly 50-property dictionary per animated element.
+            style["inset"] = inset
+            snapshot, _children, _measure_key = previous
+            snapshot["inset"] = list(inset)
+        self.tree.set_insets(native_updates)
+
+    def compute(self, root_element, *, width, height=None, viewport_height=None):
+        """Compute and publish geometry after explicit projection patches.
+        `viewport_height`: see `layout()`'s own parameter of the same name."""
+        root_id = self.nodes[id(root_element)]
+        available_width = _constrain_root_to_document_element(self.tree, root_element, root_id, width)
+        compute_height = _root_compute_height(root_element, height, viewport_height)
+        boxes = self.tree.compute(root_id, available_width, compute_height)
+        geometry._write_boxes(boxes, self.node_map)
+        return _finish_layout_pass(
+            self.tree, self.node_map, root_element, width=width, viewport_height=viewport_height,
+        )
+
+    def layout(self, root_element, *, width, height=None, reuse_styles=False, viewport_height=None):
+        """See the module-level `layout()` function for what every
+        parameter here means -- this is the same operation, just against a
+        retained projection that reuses native nodes by element identity
+        instead of rebuilding the whole Taffy tree from scratch."""
+        from .. import webfonts
+        if webfonts.prepare_layout(root_element):
+            reuse_styles = False
+        self.begin()
+        with style_bridge.viewport(width, viewport_height if viewport_height is not None else height):
+            root_id = builder.build(
+                self.tree, root_element, self.node_map,
+                reuse_styles=reuse_styles, projection=self,
+            )
+        self.finish()
+        available_width = _constrain_root_to_document_element(self.tree, root_element, root_id, width)
+        compute_height = _root_compute_height(root_element, height, viewport_height)
+        boxes = self.tree.compute(root_id, available_width, compute_height)
+        geometry._write_boxes(boxes, self.node_map)
+        return _finish_layout_pass(
+            self.tree, self.node_map, root_element, width=width, viewport_height=viewport_height,
+        )
+
+
+
+def _snapshot_style(style):
+    # style_bridge emits primitives/tuples and top-level lists of those. Copy
+    # list values so later intrinsic-image mutation cannot alias the snapshot;
+    # dict equality then stays in optimized Python/C code during reconciliation.
+    return {key: list(value) if isinstance(value, list) else value
+            for key, value in style.items()}
+
+
+
+def _root_compute_height(root_element, height, viewport_height):
+    if height is not None or viewport_height is None:
+        return height
+    style = getattr(root_element, "_chromonic_native_style", {})
+    root_height = style.get("height")
+    if isinstance(root_height, tuple) and root_height == ("pct", 1.0):
+        return viewport_height
+    return height
+
+
+
+def _document_element_box_edges(root_element):
+    """`(left, right, top, bottom)` margin+border+padding from `<html>`'s
+    own computed style, or `None` if `root_element` isn't `<body>` with a
+    real `<html>` parent, or `<html>` has none of the three set at all.
+
+    `<html>` is never built into the Taffy tree -- chromonic hands Taffy
+    `<body>` as its root instead, so `<html>`'s own box-model edges were
+    never read anywhere. Summed together rather than kept separate --
+    nothing downstream needs to tell them apart."""
+    if getattr(root_element, "_chromonic_tag_name", None) != "body":
+        return None
+    # `.parentElement` is broken for `<body>` in domonic (`.parentNode`
+    # works); that object's `nodeType` is `DOCUMENT_NODE`, not
+    # `ELEMENT_NODE` (domonic's `<html>` and `Document` are the same
+    # underlying object), so `tagName` is the only reliable signal.
+    html_element = getattr(root_element, "parentNode", None)
+    if (html_element is None
+            or (getattr(html_element, "tagName", "") or "").lower() != "html"):
+        return None
+    from domonic.style import ComputedStyleDeclaration
+    computed = ComputedStyleDeclaration(html_element)
+
+    def edge_px(name: str) -> float:
+        raw = str(getattr(computed, name, "") or "0px")
+        try:
+            return float(raw[:-2]) if raw.endswith("px") else 0.0
+        except ValueError:
+            return 0.0
+
+    left = edge_px("marginLeft") + edge_px("paddingLeft") + edge_px("borderLeftWidth")
+    right = edge_px("marginRight") + edge_px("paddingRight") + edge_px("borderRightWidth")
+    top = edge_px("marginTop") + edge_px("paddingTop") + edge_px("borderTopWidth")
+    bottom = edge_px("marginBottom") + edge_px("paddingBottom") + edge_px("borderBottomWidth")
+    if left == 0.0 and right == 0.0 and top == 0.0 and bottom == 0.0:
+        return None
+    return (left, right, top, bottom)
+
+
+
+def _constrain_root_to_document_element(tree_obj, root_element, root_id, width: float) -> float:
+    """Corrects `root_element` (`<body>`)'s own Taffy style for `<html>`'s
+    box-model edges (`_document_element_box_edges`) before `compute()`
+    runs, and returns the available width `<body>` must be computed
+    against (`width` minus `<html>`'s horizontal edges).
+
+    `<body>`'s own `width:auto` is always forced to a definite content-box
+    number (`<html>`'s edges and `<body>`'s own margin subtracted from
+    `width`) rather than left for Taffy to resolve -- a root node with
+    only out-of-flow children would otherwise shrink-to-fit to `0`.
+    `box-sizing: border-box` is left alone, since there `width` already
+    means the border-box total."""
+    edges = _document_element_box_edges(root_element)
+    html_left, html_right = edges[0:2] if edges is not None else (0.0, 0.0)
+    style = root_element.__dict__.get("_chromonic_native_style")
+    body_margin = style.get("margin") if style is not None else None
+    body_margin_left = positioning._resolve_inset((body_margin or (0.0,) * 4)[3], width) or 0.0
+    body_margin_right = positioning._resolve_inset((body_margin or (0.0,) * 4)[1], width) or 0.0
+    available_width = max(0.0, width - html_left - html_right)
+    if style is not None and style.get("width") == "auto":
+        outer_width = max(0.0, available_width - body_margin_left - body_margin_right)
+        if style.get("box_sizing") != "border-box":
+            padding = style.get("padding") or (0.0,) * 4
+            border = style.get("border") or (0.0,) * 4
+            outer_width = max(0.0, outer_width
+                               - box_model._numeric_edge(padding[1]) - box_model._numeric_edge(padding[3])
+                               - box_model._numeric_edge(border[1]) - box_model._numeric_edge(border[3]))
+        style["width"] = outer_width
+        tree_obj.set_style(root_id, style)
+    return available_width
+
+
+
+def warm_text_layout() -> None:
+    """Pay Parley's one-time `FontContext` setup cost (~100ms, font
+    enumeration) now, not during the first real page's first text --
+    subsequent calls reuse the process-lifetime context and are near-free."""
+    layout_text("warm", "sans-serif", 16.0)
+
+
+
+def _adjust_body_collapsed_margins(root_element):
+    """Publish Chrome-compatible body geometry for collapsed child margins.
+
+    Taffy correctly positions block children with collapsed sibling margins,
+    but a root node has no containing block into which its first/last margin
+    struts can escape. HTML's body is special: Chrome's body rect excludes
+    those escaped margins. Restrict this correction to the simple eligible
+    body case; complex block formatting stays with Taffy.
+
+    `_chromonic_scroll_extent` (set below, only once this correction
+    applies) doubles as the signal `_apply_root_margin_offset` uses to
+    know this pass already accounted for the root's own top margin, so it
+    doesn't add that margin a second time -- cleared unconditionally up
+    front so a stale value can never survive from an earlier pass.
+    """
+    root_element.__dict__.pop("_chromonic_scroll_extent", None)
+    root_element.__dict__.pop("_chromonic_margin_collapsed", None)
+    if getattr(root_element, "_chromonic_tag_name", None) != "body":
+        return
+    style = getattr(root_element, "_chromonic_native_style", {})
+    # `_approximate_inline_flow` may have turned `body` into a `flex-wrap`
+    # row standing in for real float layout -- `_chromonic_float_flow_
+    # children` marks this as chromonic's own approximation, where margin
+    # collapsing still applies as it would to an ordinary block body. A
+    # genuine author flexbox body (no such marker) is left alone: real
+    # flex containers don't collapse margins with their children.
+    if (style.get("display") != "block"
+            and getattr(root_element, "_chromonic_float_flow_children", None) is None):
+        return
+    if any(value not in (0.0, "auto") for name in ("padding", "border")
+           for value in style.get(name, ())):
+        return
+    # CSS 2.1 8.3.1: a block's own top margin collapses with its first
+    # in-flow child's (letting the child's margin "escape" outward, which
+    # is what this whole correction exists to publish) only when the
+    # block doesn't establish a new block formatting context -- and any
+    # `overflow` other than `visible` does exactly that, same as a real
+    # border/padding already excluded above. Taffy has no such concept at
+    # all -- its own raw child position already reflects the child's own
+    # margin applied plainly (root nodes carry no margin of their own to
+    # Taffy), so simply leaving it alone here and letting `_apply_root_
+    # margin_offset` add body's own margin normally on top, unmodified,
+    # already gives the correct, uncollapsed result.
+    if False and any(value != "visible" for value in style.get("overflow", ("visible", "visible"))):
+        # Disabled: CSS 2.1 8.3.1's adjoining-margins list for a block and
+        # its first/last in-flow child doesn't actually name the block's
+        # own `overflow` as a blocking condition (only border/padding
+        # between them, or the child's own clearance) -- `overflow`
+        # establishing a BFC stops a *grandchild*'s margin from escaping
+        # past this element to things outside it, a different pairing
+        # than this element's own margin against its direct child's.
+        # Found on `css-grid/layout-algorithm/grid-as-flex-item-should-
+        # not-shrink-to-fit-001.html`: `body { overflow: hidden }`'s
+        # first-child `<p>`'s 16px margin still collapsed with body's own
+        # 8px in Chrome (`y: 16`, `max(8, 16)`), not stacked (`y: 24`).
+        return
+    boxes = []
+    visible_boxes = []
+    float_top = None
+    # The layout tree's own view of the children: a CSS 2.1 9.2.1.1
+    # anonymous block around leading loose text is the real first in-flow
+    # child here (table-anonymous-objects-093.xht: body text before a div).
+    for child in (root_element.__dict__.get("_chromonic_normalized_children")
+                  or dom._child_nodes(root_element)):
+        if not dom._is_element(child):
+            continue
+        child_style = getattr(child, "_chromonic_native_style", {})
+        if child_style.get("position") in ("absolute", "fixed"):
+            continue
+        # CSS 2.1 10.6.3: an ordinary block's auto height is the distance
+        # to its last in-flow child's bottom margin edge -- floats are out
+        # of flow for this (plain `<body>` never establishes a BFC, so
+        # 10.6.7's float-inclusive algorithm doesn't apply). Taffy has no
+        # `float` concept, so an un-flex-rowed floated child would
+        # otherwise count fully toward `bottom` like real content.
+        resolved = getattr(child, "_chromonic_resolved_style", None)
+        if resolved is not None and box_model._is_floated(resolved[0]):
+            # A leading float sits at body's content top; the first in-flow
+            # box may still be below it at this point (its `<br clear>`
+            # line is only placed beside the float later, in `_fix_float_
+            # flow_after_block_sibling`), so the float's own top bounds
+            # body's (image-as-flexitem-size-001.html: body was pushed
+            # 36px down to its first `<br>`).
+            float_box = child.__dict__.get("_layout_box")
+            if float_box is not None and not boxes:
+                float_top = float_box.y if float_top is None else min(float_top, float_box.y)
+            continue
+        # A child that dissolved into a CSS 2.1 9.2.1.1 split reports its
+        # `_chromonic_flow_extent_box` (the decoration-free flow extent,
+        # authoritative and available earlier in the correction pipeline)
+        # rather than its own `_layout_box` -- which, for such a child, is
+        # not written until `inline_finalize._publish_inline_formatting` runs, several
+        # passes after this function. Checking `_layout_box` for `None`
+        # first (the previous order) meant this function saw no box at
+        # all for a still-mid-split child on its first (pre-publish) call
+        # this pass, silently skipped it, and returned without ever
+        # setting `_chromonic_margin_collapsed` -- letting `_apply_root_
+        # margin_offset` (which runs immediately after) wrongly add the
+        # root's own margin a second time on top of Taffy's already-
+        # correct collapsed position. Taffy's raw output was never wrong;
+        # only this substitution order was. `_chromonic_flow_extent_box`
+        # is checked first and preferred for exactly this reason -- only
+        # a child with neither is skipped.
+        box = getattr(child, "_chromonic_flow_extent_box", None)
+        if box is None:
+            box = child.__dict__.get("_layout_box")
+        if box is None:
+            continue
+        boxes.append(box)
+        # A CSS-empty box (no border/padding/height, no in-flow content --
+        # an absolutely-positioned-only wrapper still counts as empty)
+        # doesn't stop a preceding margin from collapsing straight through
+        # it; counting it toward `bottom` would double-count that margin
+        # instead of letting it escape past this empty child. `box.height
+        # == 0` alone isn't enough to conclude "no in-flow content" --
+        # a negative child margin can legitimately pull a non-empty
+        # wrapper's own auto-height back to zero too.
+        has_in_flow_content = any(
+            dom._is_element(node) and getattr(node, "_chromonic_resolved_style", None) is not None
+            and not box_model._is_absolutely_positioned(node._chromonic_resolved_style[1])
+            and not box_model._is_floated(node._chromonic_resolved_style[0])
+            for node in dom._child_nodes(child)
+        )
+        if box.height == 0 and not has_in_flow_content and not any(
+            value not in (0.0, "auto") for name in ("padding", "border")
+            for value in child_style.get(name, ())
+        ):
+            continue
+        visible_boxes.append(box)
+    if not boxes:
+        return
+    if visible_boxes:
+        boxes = visible_boxes
+    # CSS 2.1 10.6.3: auto height is anchored to the *first* and *last*
+    # in-flow child's own margin edges specifically -- not the extent of
+    # whichever child happens to reach furthest. `boxes` is already in DOM
+    # order, so those are literally the first/last entries here. This only
+    # differs from a plain min/max when a negative margin makes an earlier
+    # sibling's box visually stick out past a later one -- a negative
+    # margin can pull an earlier child's own bottom edge past the real
+    # last child's, but Chrome still tracks the real last child regardless.
+    top = boxes[0].y if float_top is None else min(boxes[0].y, float_top)
+    bottom = boxes[-1].y + boxes[-1].height
+    old = root_element.__dict__.get("_chromonic_pristine_box") or root_element.__dict__.get("_layout_box")
+    # `old` (the pristine, pre-offset box) is only right for the scroll-
+    # extent baseline below -- on the second pass `_apply_root_margin_
+    # offset` has since shifted the real box horizontally, and rebuilding
+    # from the stale pristine `x` would silently discard that shift.
+    current = root_element.__dict__.get("_layout_box") or old
+    if old is not None:
+        # The escaped final margin still contributes to the document's scroll
+        # extent even though it is outside body.getBoundingClientRect() --
+        # and unlike the rendered height above, the scrollable area *does*
+        # need the true max over every child, first/last or not.
+        explicit_height = style.get("height") != "auto"
+        # Auto-height can go negative when a child's negative margin pulls
+        # `bottom` back above `top` -- a used height is never negative
+        # (CSS 2.1 8.1/10.5), so this clamps to `0` like Chrome does.
+        corrected_height = old.height if explicit_height else max(0.0, bottom - top)
+        corrected_client_height = old.client_height if explicit_height else corrected_height
+        root_element.__dict__["_chromonic_scroll_extent"] = max(
+            old.y + old.height, bottom, *(box.y + box.height for box in boxes)
+        )
+        if top > 0:
+            # top > 0 means a child margin collapsed through the root, and
+            # _adjust_body_collapsed_margins already accounts for it by
+            # anchoring body's y to boxes[0].y.  Signal this so
+            # _apply_root_margin_offset doesn't add the margin a second time.
+            root_element.__dict__["_chromonic_margin_collapsed"] = True
+        root_element.__dict__["_layout_box"] = LayoutBox(
+            x=current.x, y=top, width=old.width, height=corrected_height,
+            client_width=old.client_width, client_height=corrected_client_height,
+            border_top=old.border_top, border_left=old.border_left,
+        )
+
+
+
+def _apply_root_margin_offset(root_element, node_map: dict) -> None:
+    """Shift the whole laid-out tree by the compute root's own margin.
+
+    Taffy's root-compute has no parent context, so a root with `width`/
+    `height:auto` correctly shrinks to leave room for its own margin but
+    never offsets its own box by it -- the root always comes back at
+    `(0, 0)` regardless of margin.
+
+    `chromonic` hands Taffy `<body>` as this root, but CSS-wise `<html>`
+    is the real root, and `<body>`'s own margin genuinely offsets it
+    within `<html>`'s content box.
+
+    Root-anchored `position:absolute`/`fixed` elements are excluded:
+    their containing block is the viewport, unaffected by `<body>`'s
+    margin. The vertical axis is skipped when `_adjust_body_collapsed_
+    margins` already folded the root's top margin into its position."""
+    style = getattr(root_element, "_chromonic_native_style", None)
+    box = root_element.__dict__.get("_layout_box")
+    if style is None or box is None:
+        return
+    margin_top, _margin_right, _margin_bottom, margin_left = style["margin"]
+    # CSS: a percentage margin resolves against the containing block's
+    # *width* on every side, vertical included -- not a typo.
+    dx = positioning._resolve_inset(margin_left, box.width) or 0.0
+    already_collapsed = "_chromonic_margin_collapsed" in root_element.__dict__
+    dy = 0.0 if already_collapsed else (positioning._resolve_inset(margin_top, box.width) or 0.0)
+    # `<html>`'s own padding/border offsets `<body>` within it the same
+    # way `<body>`'s own margin does -- same root-anchored exclusion applies.
+    html_edges = _document_element_box_edges(root_element)
+    if html_edges is not None:
+        html_left, _html_right, html_top, _html_bottom = html_edges
+        dx += html_left
+        dy += html_top
+    if not dx and not dy:
+        return
+    root_anchored_ids: set = set()
+    for element in node_map.values():
+        if dom._is_element(element) and positioning._is_root_anchored(element):
+            root_anchored_ids.add(id(element))
+    seen = set()
+    for node in list(node_map.values()):
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        owner = node if dom._is_element(node) else getattr(node, "parent", None)
+        # A root-anchored element's own containing block is the viewport,
+        # unaffected by `<body>`'s margin -- and so is everything painted
+        # inside it, not just its own box, so the whole ancestor chain
+        # must be checked, not just `owner` itself.
+        while owner is not None:
+            if id(owner) in root_anchored_ids:
+                break
+            owner = getattr(owner, "parentElement", None)
+        else:
+            geometry._shift_box(node, dx, dy)
+
+
+
+def layout(root_element, *, width: float, height: "float | None" = None, reuse_styles: bool = False,
+           viewport_height: "float | None" = None) -> dict:
+    """Build a fresh Taffy tree from `root_element` down, compute layout at
+    `width` x `height` (`height=None` sizes to content), and write every
+    node's box back onto its domonic element. Returns `{node_id: element}`
+    for anyone (painting, hit-testing) who wants to walk the same tree
+    without re-discovering it.
+
+    This is the *whole* invalidation story for the POC: call `layout()`
+    again after any mutation (`element.style.width = ...`, adding/removing
+    children, ...) and every affected box is recomputed and rewritten.
+
+    `reuse_styles=False` (the default) re-resolves every element's CSS
+    from scratch. Pass `reuse_styles=True` only when nothing about any
+    element's class/inline style/stylesheets could have changed since the
+    last `layout()` call (see `_describe`'s docstring) -- currently only
+    `native_browser.py`'s image-arrival poll qualifies.
+
+    `viewport_height`, when given, corrects `position:absolute`/`fixed`
+    elements with no positioned ancestor to resolve against the real
+    viewport height rather than `root_element`'s own (possibly content-
+    grown) box. Leave `None` for callers with no separate viewport-vs-
+    document distinction."""
+    from .. import webfonts
+    if webfonts.prepare_layout(root_element):
+        reuse_styles = False
+    tree = Tree()
+    node_map: dict[int, object] = {}
+    with style_bridge.viewport(width, viewport_height if viewport_height is not None else height):
+        root_id = builder.build(tree, root_element, node_map, reuse_styles=reuse_styles)
+    available_width = _constrain_root_to_document_element(tree, root_element, root_id, width)
+    compute_height = _root_compute_height(root_element, height, viewport_height)
+    boxes = tree.compute(root_id, available_width, compute_height)
+    geometry._write_boxes(boxes, node_map)
+    return _finish_layout_pass(tree, node_map, root_element, width=width, viewport_height=viewport_height)
+
+
+
+def _scan_layout_pass_features(node_map: dict) -> dict:
+    """One combined O(node count) pre-scan, collecting a handful of cheap
+    presence flags that let `_finish_layout_pass` skip an entire
+    downstream correction pass's own O(node count) scan outright when a
+    page has none of what that pass looks for, instead of every single
+    one of its ~15 passes unconditionally re-walking the whole tree even
+    on the (common) pages that don't use floats, `position:absolute`/
+    `fixed`, or the rarer split-inline/flex-row-approximation machinery
+    at all. Each flag mirrors the *exact* marker attribute its
+    corresponding pass(es) already gate every element on internally as
+    their own first check -- so "this flag is False" and "that pass would
+    have been a no-op anyway" are guaranteed to agree by construction;
+    this changes nothing about what any pass does, only whether it's
+    given the chance to do it."""
+    has_split_wrapper = False
+    has_flex_row_members = False
+    has_float_flow = False
+    has_absolute = False
+    has_absolute_or_fixed = False
+    has_table = False
+    has_auto_horizontal_margin = False
+    has_rtl = False
+    for element in node_map.values():
+        d = getattr(element, "__dict__", None)
+        if d is None:
+            continue
+        if d.get("_chromonic_is_table_root"):
+            has_table = True
+        if d.get("_chromonic_split_wrapper_ref") is not None:
+            has_split_wrapper = True
+        members = d.get("_chromonic_flex_row_members")
+        if members and len(members) >= 2:
+            has_flex_row_members = True
+        if d.get("_chromonic_float_flow_children"):
+            has_float_flow = True
+        style = d.get("_chromonic_native_style")
+        if style is not None:
+            margin = style.get("margin") or ()
+            if len(margin) == 4 and (margin[1] == "auto" or margin[3] == "auto"):
+                has_auto_horizontal_margin = True
+            position = style.get("position")
+            if position == "absolute":
+                has_absolute = True
+                has_absolute_or_fixed = True
+            elif position == "fixed":
+                has_absolute_or_fixed = True
+        paint_style = d.get("_chromonic_paint_style") or {}
+        if (paint_style.get("direction") or "").strip().lower() == "rtl":
+            has_rtl = True
+        elif getattr(element, "getAttribute", None) is not None:
+            if (element.getAttribute("dir") or "").strip().lower() == "rtl":
+                has_rtl = True
+    return {
+        "split_wrapper": has_split_wrapper,
+        "flex_row_members": has_flex_row_members,
+        "float_flow": has_float_flow,
+        "absolute": has_absolute,
+        "absolute_or_fixed": has_absolute_or_fixed,
+        "table": has_table,
+        "auto_horizontal_margin": has_auto_horizontal_margin,
+        "rtl": has_rtl,
+    }
+
+
+
+def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_height):
+    """The post-`tree.compute()` correction pipeline, shared by every entry
+    point that computes real Taffy geometry (`layout()`, `LayoutProjection.
+    layout()`/`.compute()`) -- previously duplicated verbatim across all
+    three, which is how fixes wired into only one of them silently never
+    ran for a real, incrementally-updated page."""
+    features = _scan_layout_pass_features(node_map)
+    # `_adjust_body_collapsed_margins` runs twice in this pass -- its
+    # `_chromonic_scroll_extent` needs Taffy's real, uncorrected box as its
+    # baseline, which the second call would otherwise only see already
+    # corrected (and smaller). Stashed once, before either call.
+    root_element.__dict__["_chromonic_pristine_box"] = root_element.__dict__.get("_layout_box")
+    if features["split_wrapper"]:
+        inline_finalize._fix_nested_split_flow_extent(node_map)
+    _adjust_body_collapsed_margins(root_element)
+    _apply_root_margin_offset(root_element, node_map)
+    if features["flex_row_members"]:
+        flex_grid._fix_flex_row_baseline_alignment(node_map)
+    floats._fix_inline_float_position(node_map)
+    flex_grid._fix_flex_baseline_alignment(node_map)
+    flex_grid._fix_flex_safe_alignment(node_map)
+    flex_grid._fix_flex_rtl_mirroring(node_map)
+    if features["rtl"]:
+        positioning._fix_rtl_block_positioning(node_map)
+    positioning._fix_relative_rtl_insets(node_map)
+    # Before the absolute-positioning fixups below: an inline-context
+    # escapee's real static position is only known once `_InlineFormatting
+    # Plan.publish()` has run -- `positioning._fix_absolute_static_position_fallback`
+    # reads `element._chromonic_static_position`, which this sets.
+    inline_finalize._publish_inline_formatting(node_map)
+    inline_finalize._apply_linebox_strut_height(node_map)
+    inline_finalize._apply_empty_inline_block_min_height(node_map)
+    shrink_to_fit_shifted = floats._fix_float_shrink_to_fit_width(tree_obj, node_map)
+    if features["table"]:
+        shrink_to_fit_shifted |= table_layout._fix_table_shrink_to_fit_width(tree_obj, node_map)
+    # Both shrink-to-fit fixes above reposition their whole subtree via
+    # `geometry._write_boxes` (a fresh, isolated `tree.compute()`) + `_shift_subtree`
+    # -- but `geometry._write_boxes` only ever touches elements with a *real* Taffy
+    # node (the block-level container itself and its Taffy children), never
+    # a plain inline element whose own box instead comes from `_publish_
+    # inline_formatting`'s fragment-based tracking (`_finalize_inline_owner_
+    # boxes`). `_shift_subtree` still walks and shifts those elements too
+    # (it recurses through every DOM child, not just real Taffy nodes),
+    # double-applying the correction on top of a box that was never reset in
+    # the first place. Re-publishing here recomputes every such element's
+    # box fresh from its (now finally correct) container box instead of
+    # shifting a stale one. Confirmed directly on a one-cell auto-width
+    # `<table><tr><td><span>1.</span></td></tr></table>`: the `<span>`
+    # landed one full shrink-to-fit correction below and right of where its
+    # `<td>` actually ended up -- on a real page (an HTML `<table>`-based
+    # site with narrow, auto-width columns), enough to push every cell's
+    # inline content off past its own row entirely.
+    #
+    # Only worth its own O(node count) pass when a shift actually
+    # happened -- gated, not unconditional, since `_finish_layout_pass`
+    # also runs on every high-frequency incremental `LayoutProjection.
+    # compute()` call (e.g. `examples/particles2.py`'s per-frame position
+    # updates), where an unconditional second full-tree republish here
+    # was a measurable, needless per-frame cost on pages with no floats
+    # or auto-width tables at all.
+    if shrink_to_fit_shifted:
+        inline_finalize._publish_inline_formatting(node_map)
+        # The fresh `tree.compute()` also discarded the two line-box
+        # height corrections above inside the recomputed subtree
+        # (empty-cells-008.xht: a table cell holding only a 0x0 image is
+        # one strut tall, and so are its row and table) -- both are
+        # grow-only and idempotent, so they simply run again.
+        inline_finalize._apply_linebox_strut_height(node_map)
+        inline_finalize._apply_empty_inline_block_min_height(node_map)
+    # After the shrink-to-fit pass: that recomputes an auto-width table's
+    # whole subtree from scratch (`geometry._write_boxes`), which would discard
+    # any row heights distributed before it.
+    if features["table"]:
+        table_layout._enforce_fixed_column_boxes(node_map)
+        table_layout._settle_tables(node_map)
+        table_layout._publish_table_column_boxes(node_map)
+    replaced_elements._publish_svg_shape_boxes(node_map)
+    if features["float_flow"]:
+        floats._fix_float_flow_after_block_sibling(node_map)
+        floats._fix_float_flow_container_auto_height(node_map)
+    floats._fix_nested_bfc_float_auto_height(node_map)
+    inline_finalize._resync_interruption_marker_heights(node_map)
+    # A nested split wrapper's own `_layout_box` doesn't exist until
+    # `inline_finalize._publish_inline_formatting` (just above) unions its fragments --
+    # this pass's first run, before that, silently skipped every such
+    # wrapper, and the interruption blocks' own boxes it reads have since
+    # moved (`_apply_root_margin_offset`) -- recomputed fresh now that
+    # both are finally real and final, or `_adjust_body_collapsed_margins`
+    # below reads a stale, pre-offset `_chromonic_flow_extent_box`.
+    if features["split_wrapper"]:
+        inline_finalize._fix_nested_split_flow_extent(node_map)
+    # Re-anchor body's own auto-height now that a float-flow BFC child's
+    # height may have just shifted -- idempotent, so this re-derives it
+    # from the now-final positions instead of the stale ones above.
+    _adjust_body_collapsed_margins(root_element)
+    if features["absolute"]:
+        positioning._fix_absolute_shrink_to_fit_extent(node_map)
+        positioning._fix_absolute_horizontal_auto_margins(node_map)
+        positioning._fix_absolute_vertical_auto_margins(node_map)
+        positioning._fix_absolute_width_against_containing_block(node_map)
+        positioning._fix_absolute_height_against_containing_block(node_map)
+        positioning._fix_absolute_static_position_fallback(node_map)
+    if viewport_height is not None and features["absolute_or_fixed"]:
+        positioning._fix_viewport_anchored_positioning(node_map, viewport_height, width)
+    if features["auto_horizontal_margin"]:
+        positioning._publish_used_horizontal_margins(node_map)
+    return node_map
+from .anonymous_boxes import (
+    _ANONYMOUS_COMPUTED_DEFAULTS, _AnonymousInlineRun, _AnonymousTableBox,
+    _AnonymousTextFragment, _InlineSpacer, _RowspanPlaceholder, _SyntheticComputed,
+    _TABLE_INTERNAL_KINDS, _TABLE_PART_DISPLAYS, _TABLE_PART_TAGS, _normalized_child_nodes,
+    _synthesize_anonymous_style, _table_part_kind, _wrap_inline_runs,
+    _wrap_missing_table_boxes
+)
+from .box_model import (
+    _BASELINE_ALIGNMENTS, _REPLACED_OR_CONTROL_TAGS, _USUALLY_INLINE_TAGS, _alignment_parts,
+    _element_own_baseline, _establishes_bfc, _establishes_containing_block, _first_baseline,
+    _is_absolutely_positioned, _is_floated, _is_inline_level, _numeric_edge,
+    _trusts_computed_inline, _ua_stylesheet_applied
+)
+from .dom import (
+    ELEMENT_NODE, TEXT_NODE, _NON_RENDERING_DISPLAYS, _NON_RENDERING_TAGS,
+    _NO_GENERATED_CONTENT_TAGS, _PseudoElement, _apply_text_transform, _child_elements,
+    _child_nodes, _clear_stale_layout_geometry, _collapsed_text_node,
+    _css_generated_content_text, _describe, _element_direction, _extract_generated_content,
+    _extract_paint_style, _get_pseudo_object, _is_element, _layout_parent, _own_text,
+    _pseudo_generates_box, _rendering_text_content, _renders
+)
+from .flex_grid import (
+    _FLEX_DISPLAYS, _GRID_AREA_LINE_RE, _GRID_AREA_SPAN_RE, _css_order,
+    _fix_flex_baseline_alignment, _fix_flex_row_baseline_alignment, _fix_flex_rtl_mirroring,
+    _fix_flex_safe_alignment, _is_flex_or_grid_item, _parse_grid_area, _parse_grid_area_token
+)
+from .floats import (
+    _bfc_descendant_float_bottom, _cleared_y, _fix_float_flow_after_block_sibling,
+    _fix_float_flow_container_auto_height, _fix_float_shrink_to_fit_width,
+    _fix_inline_float_position, _fix_nested_bfc_float_auto_height, _has_ratio_derived_height
+)
+from .geometry import (
+    _grow_and_reflow, _grow_box_height, _needed_ancestor_growth, _shift_anonymous_boxes,
+    _shift_box, _shift_later_siblings_for_height_delta, _shift_recomputed_subtree,
+    _shift_subtree, _write_boxes
+)
+from .inline_finalize import (
+    _apply_empty_inline_block_min_height, _apply_linebox_strut_height,
+    _finalize_inline_owner_boxes, _fix_nested_split_flow_extent,
+    _fix_split_inline_relative_offset, _inline_relative_offset, _is_flattened_inline,
+    _merge_adjacent_same_line_rects, _publish_inline_formatting,
+    _resync_interruption_marker_heights
+)
+from .inline_formatting import (
+    _CSS_COLLAPSIBLE_WHITESPACE_RE, _CSS_WHITESPACE_STRIP_CHARS, _InlineFormattingPlan,
+    _block_margins_collapse_through, _build_text_runs_from_nodes, _collapse_margin_set,
+    _contains_in_flow_block, _empty_decoration_only_run, _empty_inline_strut_run,
+    _first_reachable_in_flow_block, _group_inline_element_runs,
+    _has_direct_in_flow_block_child, _inline_mixed_content, _inline_text_style,
+    _is_genuine_inline_wrapper, _make_collapsed_space_run, _make_inline_formatting_plan,
+    _make_measure, _needs_inline_flow_grouping, _parse_font_weight, _resolve_text_indent,
+    _resolved_line_height, _split_inline_flow_around_blocks, _split_wrapping_inline_element
+)
+from .positioning import (
+    _find_containing_block_ancestor, _fix_absolute_height_against_containing_block,
+    _fix_absolute_horizontal_auto_margins, _fix_absolute_shrink_to_fit_extent,
+    _fix_absolute_static_position_fallback, _fix_absolute_vertical_auto_margins,
+    _fix_absolute_width_against_containing_block, _fix_relative_rtl_insets,
+    _fix_rtl_block_positioning, _fix_viewport_anchored_positioning,
+    _flex_container_static_position, _is_root_anchored, _publish_used_horizontal_margins,
+    _resolve_inset, _resolve_viewport_anchored_box, _resolve_viewport_anchored_box_x
+)
+from .replaced_elements import (
+    _INTRINSIC_WIDTH_KEYWORDS, _apply_button_intrinsic_width, _apply_canvas_intrinsic_size,
+    _apply_iframe_intrinsic_size, _apply_image_intrinsic_size, _apply_svg_intrinsic_size,
+    _form_control_display_text, _measure_intrinsic_width, _measure_min_content_width,
+    _measuring_intrinsic_depth, _min_content_width, _numeric_or_zero, _publish_svg_shape_boxes,
+    _resolve_intrinsic_width_keyword, _resolve_replaced_percent_height, _select_display_text,
+    _stretched_replaced_flex_item
+)
+from .table_layout import (
+    _BORDER_ORIGIN_PRIORITY, _BORDER_SIDE_ATTR, _BORDER_STYLE_PRIORITY, _ROW_GROUP_TAG_KIND,
+    _TABLE_INTERNAL_DISPLAYS, _align_table_cell_baselines_in, _align_table_cell_content_in,
+    _border_candidate, _cell_natural_height, _cell_span, _collapse_amounts, _collapse_rows_in,
+    _column_elements, _compute_fixed_column_widths, _compute_table_column_widths,
+    _cover_spanned_rows_in, _distribute_table_extra_height_in, _enforce_fixed_column_boxes,
+    _fix_table_shrink_to_fit_width, _is_inline_table_box, _is_table_cell_display,
+    _is_table_root_display, _is_table_row_display, _layout_children,
+    _publish_table_column_boxes, _resize_table_row, _resolve_collapsed_border,
+    _resolve_collapsed_table_borders, _row_cells, _row_child_ids_with_rowspan_placeholders,
+    _row_group_kind, _settle_collapsed_cells_in, _settle_rowspan_cells_in, _settle_table,
+    _settle_tables, _spanning_cells, _table_cell_baseline, _table_cell_content_height,
+    _table_cell_has_content, _table_columns, _table_grid, _table_row_baseline, _table_rows
+)
+from .builder import (
+    _approximate_inline_flow, _measure_key, _wants_horizontal_flow, build
+)
+
