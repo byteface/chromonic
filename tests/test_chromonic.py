@@ -253,17 +253,17 @@ def test_flex_toolbar_auto_height_is_not_shortened_by_bfc_float_correction():
     root = div(toolbar_a, toolbar_b, board, _style="width:200px;")
 
     shifted = []
-    original = tree._shift_later_siblings_for_height_delta
+    original = tree.geometry._shift_later_siblings_for_height_delta
 
     def recording(element, delta):
         shifted.append(element)
         original(element, delta)
 
-    tree._shift_later_siblings_for_height_delta = recording
+    tree.geometry._shift_later_siblings_for_height_delta = recording
     try:
         tree.layout(root, width=200.0)
     finally:
-        tree._shift_later_siblings_for_height_delta = original
+        tree.geometry._shift_later_siblings_for_height_delta = original
 
     assert toolbar_a.get_layout_box().height == 40.0
     assert toolbar_b.get_layout_box().height == 30.0
@@ -292,17 +292,17 @@ def test_bfc_float_correction_still_applies_once_to_a_real_block_bfc():
     root = div(bfc, _style="width:200px;")
 
     shifted = []
-    original = tree._shift_later_siblings_for_height_delta
+    original = tree.geometry._shift_later_siblings_for_height_delta
 
     def recording(element, delta):
         shifted.append(element)
         original(element, delta)
 
-    tree._shift_later_siblings_for_height_delta = recording
+    tree.geometry._shift_later_siblings_for_height_delta = recording
     try:
         tree.layout(root, width=200.0)
     finally:
-        tree._shift_later_siblings_for_height_delta = original
+        tree.geometry._shift_later_siblings_for_height_delta = original
 
     assert bfc.get_layout_box().height == 96.0
     assert shifted.count(bfc) == 1
