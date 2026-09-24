@@ -45,47 +45,26 @@ def _select_display_text(element) -> str:
 
 
 def _apply_image_intrinsic_size(style: dict, element) -> None:
-    """`<img>` is a replaced element: an `auto` width/height is sized from
-    its own intrinsic width/height -- built here since Taffy has no concept
-    of an image's intrinsic properties (only the plain rectangle `width`/
-    `height`/`aspect_ratio` this function bakes into `style` before Taffy
-    ever sees the tree, as a block child's own width isn't `measure`'s to
-    give). An explicit CSS size on either axis is always left alone.
+    """<img> is a replaced element: an auto width/height is sized from its
+    intrinsic width/height, baked into `style` before Taffy sees the tree.
+    An explicit CSS size on either axis is always left alone.
 
-    A raster image (PNG/JPEG/GIF/...) always has a complete intrinsic size.
-    An SVG only has whichever of `width`/`height`/`viewBox` its root
-    element actually declares (`browser_images.natural_size`), each
-    independently possibly absent -- CSS 2.1 10.3.2 leaves a replaced
-    element's sizing genuinely undefined for every case *except* a
-    complete intrinsic width+height pair (this fixture's own `<meta
-    name="flags" content="should">` notes exactly that), and real browsers
-    resolve the undefined cases by falling back to the CSS default object
-    size (300x150, the same UA default `<canvas>`/`<iframe>` already use)
-    outright -- confirmed directly against Chrome on `wpt/css/CSS2/
-    visudet/replaced-elements-width-40.html`'s own seven SVGs: an
-    intrinsic ratio alone (from `viewBox`, with or without one matching
-    dimension) is *not* used to scale an explicit CSS dimension the way
-    CSS Images 3 5.2's idealised algorithm would suggest -- only a
-    complete width+height pair ever drives sizing; every partial case
-    (ratio-only, one dimension only, or nothing at all) gets the default
-    150 height/300 width regardless."""
+    A raster image always has a complete intrinsic size. An SVG only has
+    whichever of width/height/viewBox its root declares
+    (`browser_images.natural_size`), each independently possibly absent --
+    CSS 2.1 10.3.2 leaves sizing undefined except for a complete
+    width+height pair, and real browsers fall back to the CSS default
+    object size (300x150, same as canvas/iframe) otherwise -- confirmed
+    against Chrome on wpt/css/CSS2/visudet/replaced-elements-width-40.html:
+    an intrinsic ratio alone is not used to scale an explicit CSS
+    dimension; only a complete pair drives sizing."""
     from .. import browser_images
 
-    # Undo the auto-width block stretch this function itself synthesizes
-    # below for a still-loading image, if the *previous* call here (on
-    # this same element) applied one -- otherwise, once applied, it looks
-    # identical to a real, explicit `width`, and everything below keeps
-    # treating it that way even on a later call where the image actually
-    # has arrived. `style` isn't necessarily freshly built each call: a
-    # `reuse_styles=True` layout pass hands back the very same cached
-    # dict this function already mutated last time, not a fresh one from
-    # `style_bridge.to_dict()`. Confirmed directly: an `<img>` that starts
-    # still-loading (this branch fires, `width` becomes `("pct", 1.0)`)
-    # and then arrives on a later `reuse_styles=True` pass kept that
-    # loading-time override -- `width_auto` read `False` below, skipping
-    # the real intrinsic-size branch entirely and using the *stretched*
-    # 300px width with the image's aspect ratio instead of its own real
-    # (much smaller) intrinsic size.
+    # Undo the auto-width block stretch this function synthesizes below for
+    # a still-loading image, if a previous call already applied one --
+    # otherwise it looks identical to a real explicit width even once the
+    # image arrives. `style` may be the same cached dict a reuse_styles=True
+    # pass hands back, not fresh from style_bridge.to_dict().
     if getattr(element, "_chromonic_image_loading_width_stretch", False):
         style["width"] = "auto"
         element._chromonic_image_loading_width_stretch = False
@@ -93,17 +72,11 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
     src = element.getAttribute("src") or ""
     image = browser_images.load_image(src)
     if image is None:
-        # No image to size from yet -- nothing to reserve height for, but
-        # width:auto still needs its ordinary block behavior (stretch to
-        # fill the containing block), same as any other block-level box.
-        # An `<img>` is always built as a bare Taffy *leaf* (`tree.new_leaf`,
-        # just below this function's own call site), never a container with
-        # children Taffy's own block algorithm sizes the normal way -- a
-        # leaf has no measure function to fall back on while `width` is
-        # still `"auto"`, so it silently collapses to `0` instead. Confirmed
-        # directly: an otherwise-identical empty `<div>` (an ordinary
-        # container node, not a leaf) correctly stretches to its 300px
-        # parent; a still-loading `<img>` in the same spot measured `0`.
+        # No image to size from yet, but width:auto still needs ordinary
+        # block behavior (stretch to fill the containing block). An <img>
+        # is always built as a bare Taffy leaf, never a container Taffy's
+        # own block algorithm sizes -- a leaf with no measure function
+        # silently collapses to 0 instead while width stays "auto".
         if style["display"] == "block" and style["width"] == "auto":
             style["width"] = ("pct", 1.0)
             element._chromonic_image_loading_width_stretch = True
@@ -111,26 +84,19 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
     intrinsic_width, intrinsic_height, _ratio = browser_images.natural_size(src)
     has_complete_pair = intrinsic_width is not None and intrinsic_height is not None
     intrinsic_ratio = intrinsic_width / intrinsic_height if has_complete_pair and intrinsic_height else None
-    # CSS Sizing 4: a declared `aspect-ratio` (a bare `<ratio>`, not the
-    # `auto <ratio>` form -- domonic's own parser doesn't keep the two
-    # distinguishable, see `style_bridge._aspect_ratio`) always wins over
-    # the image's own natural ratio for sizing purposes, so it's swapped
-    # in for `intrinsic_ratio` here, once, and the rest of this function's
-    # existing ratio-driven sizing logic (already correct for the
-    # natural-ratio case) applies to it unchanged.
+    # CSS Sizing 4: a declared aspect-ratio always wins over the image's
+    # own natural ratio, swapped in for intrinsic_ratio here once; the rest
+    # of this function's ratio-driven sizing logic applies unchanged.
     declared_ratio = style.get("aspect_ratio")
     if isinstance(declared_ratio, (int, float)):
         intrinsic_ratio = declared_ratio
-    # CSS Images 3 5.2's own fallback when nothing intrinsic is known at
-    # all on the needed axis -- 300x150, the same UA default `<canvas>`/
-    # `<iframe>` already use elsewhere in this file.
+    # CSS Images 3 5.2's fallback when nothing intrinsic is known -- 300x150,
+    # same UA default canvas/iframe use elsewhere in this file.
     default_width, default_height = 300.0, 150.0
     if isinstance(style["height"], tuple) and style.get("position") not in ("absolute", "fixed"):
-        # CSS 2.1 10.5: a percentage `height` whose containing block has
-        # no definite height computes to `auto` -- and then, for a
-        # replaced element, comes from the width and intrinsic ratio
-        # (flex-aspect-ratio-img-column-004.html: `width: 100%; height:
-        # 100%` in a `min-height: 500px` column is 100x50, not 0 tall).
+        # CSS 2.1 10.5: a percentage height whose containing block has no
+        # definite height computes to auto, then comes from width and
+        # intrinsic ratio -- flex-aspect-ratio-img-column-004.html.
         parent = dom._layout_parent(element)
         parent_native = getattr(parent, "_chromonic_native_style", None) if parent is not None else None
         if parent_native is not None and not isinstance(parent_native.get("height"), (int, float)):
@@ -139,11 +105,10 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
     height_auto = style["height"] == "auto"
     if width_auto and height_auto and intrinsic_ratio and _stretched_replaced_flex_item(element, style):
         # CSS Flexbox 9.2.3 rule C / 9.4: a replaced flex item stretched
-        # across a row container with a definite height takes that
-        # stretched cross size, and its main size then follows its own
-        # ratio (flex-cross-size-border-box-001.html: a 1x1 image in a
-        # 180px-tall row is 180x180). Taffy resolves both from the ratio
-        # once the sizes are left `auto`.
+        # across a row with a definite height takes that stretched cross
+        # size, main size following its own ratio --
+        # flex-cross-size-border-box-001.html. Taffy resolves both from
+        # the ratio once left auto.
         style["aspect_ratio"] = intrinsic_ratio
         return
     element.__dict__.pop("_chromonic_img_measure", None)
@@ -152,23 +117,15 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
             width, height = intrinsic_width, intrinsic_height
             if False and intrinsic_ratio and style.get("flex_basis") == "auto" and flex_grid._is_flex_or_grid_item(element):
                 # Disabled: Taffy sizes a measured leaf's cross axis from
-                # its style, never from the flexed main size, so this
-                # bought nothing over the explicit sizes below and lost
-                # the min/max ratio transfer (image-as-flexitem-size-001).
-                # An auto-sized image flex item: its main size flexes
-                # (`flex: 1`, image-as-flexitem-size-005.html) and the
-                # cross size then follows the ratio from the *flexed*
-                # size -- only Taffy knows that size, so the image is
-                # built as a measured leaf (see `builder.build()`): intrinsic
-                # size unconstrained, ratio-derived once one side is known.
+                # its style, never the flexed main size, so this bought
+                # nothing over the explicit sizes below and lost the
+                # min/max ratio transfer -- image-as-flexitem-size-001.
                 iw, ih, ratio = intrinsic_width, intrinsic_height, intrinsic_ratio
 
                 def measure(_available_width, _available_height, known_width=None, known_height=None,
                             iw=iw, ih=ih, ratio=ratio):
-                    # Only a *known* size (the flexed main size, a
-                    # stretched cross size) drives the ratio -- the
-                    # available space is merely offered (a 16x16 image in
-                    # a 40px box stays 16x16).
+                    # Only a known size drives the ratio -- available space
+                    # is merely offered.
                     if known_width is not None:
                         return (known_width, known_height if known_height is not None else known_width / ratio)
                     if known_height is not None:
@@ -180,12 +137,11 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
                 return
             if (intrinsic_ratio and isinstance(style.get("flex_basis"), (int, float))
                     and flex_grid._is_flex_or_grid_item(element)):
-                # A numeric `flex-basis` is the image's main size; the
-                # cross size follows the ratio from that used size
-                # (image-as-flexitem-size-001.html: `flex-basis: 30px` on
-                # a 16x16 image is 30x30). Taffy's own `aspect_ratio` only
-                # ever reads the style width, never the flexed size, so
-                # both are resolved here (flex-grow/shrink not modelled).
+                # A numeric flex-basis is the image's main size; cross size
+                # follows the ratio -- image-as-flexitem-size-001.html.
+                # Taffy's aspect_ratio only reads the style width, never
+                # the flexed size, so both are resolved here
+                # (flex-grow/shrink not modelled).
                 parent_native = (dom._layout_parent(element).__dict__.get("_chromonic_native_style") or {})
                 if (parent_native.get("flex_direction") or "row").startswith("row"):
                     width = float(style["flex_basis"])
@@ -196,8 +152,7 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
             if intrinsic_ratio:
                 # CSS 2.1 10.4: a min/max constraint on one axis of an
                 # auto-sized replaced element transfers to the other
-                # through the intrinsic ratio (image-as-flexitem-size-
-                # 001.html: `min-width: 34px` on a 16x16 image is 34x34).
+                # through the intrinsic ratio -- image-as-flexitem-size-001.html.
                 for key, pick, axis in (("max_width", min, "w"), ("max_height", min, "h"),
                                         ("min_width", max, "w"), ("min_height", max, "h")):
                     bound = style.get(key)
@@ -214,17 +169,13 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
             style["width"], style["height"] = default_width, default_height
     elif height_auto and isinstance(style["width"], (int, float)) and _stretched_replaced_flex_item(element, style):
         # An explicit-width image stretched across a definite-height flex
-        # row keeps that width and takes the row's height (flexbox-
-        # whitespace-handling-001a.xhtml: `img { width: 40px }` items in
-        # a 100px row are 40x100) -- height left `auto` for Taffy.
+        # row keeps that width and takes the row's height --
+        # flexbox-whitespace-handling-001a.xhtml -- height left auto for Taffy.
         pass
     elif height_auto and isinstance(style["width"], (int, float)):
-        # CSS 2.1 10.4: the height comes from the width *after* its own
-        # `min-width`/`max-width` clamp (flex-aspect-ratio-img-column-
-        # 005.html: `width: 500px; max-width: 100%` in a 100px column is
-        # 100x100, not 100x500 -- Taffy's own `aspect_ratio` applies the
-        # ratio before clamping, so the clamp is resolved here, against
-        # the parent's definite width for a percentage).
+        # CSS 2.1 10.4: height comes from width after its own min/max-width
+        # clamp (Taffy's aspect_ratio applies the ratio before clamping,
+        # so the clamp is resolved here) -- flex-aspect-ratio-img-column-005.html.
         clamped = style["width"]
         parent = dom._layout_parent(element)
         parent_native = getattr(parent, "_chromonic_native_style", None) if parent is not None else None
@@ -239,19 +190,14 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
     elif width_auto and isinstance(style["height"], (int, float)):
         style["width"] = style["height"] * intrinsic_ratio if intrinsic_ratio else default_width
     elif (height_auto or width_auto) and intrinsic_ratio:
-        # `width`/`height` isn't a plain pixel length on either side (most
-        # commonly a percentage, e.g. `width:100%` on a responsive `<img>`)
-        # -- its resolved pixel value isn't known until Taffy itself lays
-        # out the box, so this function (which only ever runs once, before
-        # Taffy sees the tree at all) can't precompute the scaled auto side
-        # the way the plain-pixel branches above do. Taffy's own native
-        # `aspect_ratio` support (added to its `Style` for exactly this)
-        # picks it up after resolving whichever side has a real value, on
-        # its own. Confirmed directly on bbc.com: every `<img
-        # style="width:100%">` measured a real width and `height:auto` but
-        # a literal `0` height -- nothing here had ever handled a
-        # percentage width/height at all, so the image simply never
-        # painted (zero-height box), despite genuinely finishing loading.
+        # width/height isn't a plain pixel length on either side (most
+        # commonly a percentage) -- its resolved pixel value isn't known
+        # until Taffy lays out the box, so this function (which runs once,
+        # before Taffy sees the tree) can't precompute the scaled auto side.
+        # Taffy's native aspect_ratio support picks it up after resolving
+        # whichever side has a real value. Confirmed on bbc.com: every
+        # `<img style="width:100%">` measured a real width but a literal 0
+        # height without this -- nothing handled percentage width/height at all.
         style["aspect_ratio"] = intrinsic_ratio
     if isinstance(style["width"], (int, float)):
         # A resolved replaced-element width (intrinsic, ratio-derived, or
@@ -301,14 +247,11 @@ def _stretched_replaced_flex_item(element, style: dict) -> bool:
 
 
 def _resolve_replaced_percent_height(style: dict, element, height_attr: str) -> "float | None":
-    """CSS 2.1 10.6.2: a replaced element's own percentage intrinsic
-    height (an HTML `height="N%"` attribute, e.g. on `<svg>`/`<iframe>`)
-    resolves against its containing block's height -- but only when that
-    containing block's own height is itself definite (an explicit
-    length, not `auto`); otherwise the percentage "is treated as '0'" (no
-    intrinsic height at all, same as never having one), never resolved
-    circularly against the containing block's own (still-undetermined)
-    auto height."""
+    """CSS 2.1 10.6.2: a replaced element's percentage intrinsic height
+    (an HTML height="N%" attribute, e.g. on svg/iframe) resolves against
+    its containing block's height, but only when that's itself definite;
+    otherwise the percentage "is treated as '0'", never resolved
+    circularly against a still-undetermined auto height."""
     containing_block = positioning._find_containing_block_ancestor(element) if (
         style.get("position") in ("absolute", "fixed")) else getattr(element, "parentElement", None)
     cb_native = (getattr(containing_block, "_chromonic_native_style", None)
@@ -324,18 +267,14 @@ def _resolve_replaced_percent_height(style: dict, element, height_attr: str) -> 
 
 
 def _apply_iframe_intrinsic_size(style: dict, element) -> None:
-    """`<iframe>` is a replaced element with no intrinsic ratio -- CSS 2.1
-    10.3.2/10.6.2's fallback for that case is a UA-defined default,
-    300 x 150 in every real browser, same as `<canvas>`'s own default
-    bitmap (an explicit `width`/`height` HTML attribute, or CSS size,
-    still wins over it as always)."""
-    # `style["width"]`/`["height"]` can already be the UA stylesheet's own
-    # `300`/`150` default rather than literal `"auto"` (`ua_style.py` gives
-    # every `<iframe>` an explicit fallback size, CSS 2.1 10.3.2/10.6.2's
-    # own UA-defined default) -- an HTML `width`/`height` attribute is a
-    # real, if legacy, presentational hint that should still win over that
-    # UA default (though never over genuine author CSS, indistinguishable
-    # here from that same UA default -- accepted as a rare edge case).
+    """<iframe> is a replaced element with no intrinsic ratio -- CSS 2.1
+    10.3.2/10.6.2's fallback is a UA-defined 300x150 default, same as
+    canvas's default bitmap (an explicit width/height HTML attribute or
+    CSS size still wins)."""
+    # style["width"]/["height"] can already be the UA stylesheet's 300/150
+    # default rather than literal "auto" (`ua_style.py`) -- an HTML
+    # width/height attribute is a real presentational hint that should
+    # still win over that UA default.
     if style["width"] in ("auto", 300.0):
         width_attr = (element.getAttribute("width") or "").strip()
         if width_attr and not width_attr.endswith("%"):
@@ -352,9 +291,8 @@ def _apply_iframe_intrinsic_size(style: dict, element) -> None:
             if resolved is None and style.get("position") in ("absolute", "fixed"):
                 # CSS 2.1 10.5: an absolutely positioned box's containing
                 # block always has a resolvable height -- left as a
-                # percentage for Taffy to resolve against it (absolute-
-                # replaced-height-007.xht: `height="50%"` of a 0px-tall
-                # relative div is 0, not the 150px default).
+                # percentage for Taffy to resolve against --
+                # absolute-replaced-height-007.xht.
                 try:
                     style["height"] = ("pct", float(height_attr[:-1]) / 100.0)
                     resolved = style["height"]
@@ -379,10 +317,9 @@ def _apply_canvas_intrinsic_size(style: dict, element) -> None:
     intrinsic_height = float(element.getAttribute("height") or 150)
     if (style["width"] == "auto" and style["height"] == "auto" and intrinsic_height
             and _stretched_replaced_flex_item(element, style)):
-        # Stretched across a definite-height flex row (Flexbox 9.4 and
-        # 9.2.3 rule C; flexbox-flex-basis-content-001a.html: a 20x150
-        # canvas in a 50px row is as tall as the row and its width
-        # follows the ratio) -- both left `auto` with the ratio for Taffy.
+        # Stretched across a definite-height flex row (Flexbox 9.4/9.2.3
+        # rule C) -- flexbox-flex-basis-content-001a.html -- both left
+        # auto with the ratio for Taffy.
         style["aspect_ratio"] = intrinsic_width / intrinsic_height
         return
     if style["width"] == "auto":
@@ -420,29 +357,22 @@ def _apply_svg_intrinsic_size(style: dict, element) -> None:
             style["height"] = float(height)
         elif width is not None and ratio is not None:
             style["height"] = float(width / ratio)
-    # CSS 2.1 10.3.2/10.6.2: with no intrinsic width/height/ratio to fall
-    # back on at all (no `width`/`height` attribute, no `viewBox`), a
-    # replaced element still isn't sized like an ordinary block -- it
-    # gets the same UA-defined 300 x 150 default `<iframe>`/`<canvas>`
-    # already do, even where that means overflowing a narrower
-    # containing block (confirmed directly against Chrome: a
-    # `width:auto` SVG with only `height="50"` and no `viewBox` comes out
-    # `300px` wide inside a `288px` container, not shrunk to fit it).
+    # CSS 2.1 10.3.2/10.6.2: with no intrinsic width/height/ratio at all, a
+    # replaced element still isn't sized like an ordinary block -- it gets
+    # the same UA-defined 300x150 default iframe/canvas use, even
+    # overflowing a narrower containing block -- confirmed against Chrome:
+    # a width:auto SVG with only height="50" and no viewBox comes out
+    # 300px wide inside a 288px container.
     if style["width"] == "auto":
         style["width"] = 300.0
     if style["height"] == "auto":
         if _stretched_replaced_flex_item(element, style):
             # CSS Flexbox 9.4: a replaced flex item stretched across a row
-            # container with a definite height takes that stretched cross
-            # size -- the 150px UA default below is only a *fallback* for
-            # "no intrinsic size and no flex context to size from instead"
-            # and must not override a real stretch (display-flex-svg-
-            # overflow-default.html: a viewBox-less, attribute-less `<svg>`
-            # with `flex-grow:1` in a 100px-tall row came out 150px tall,
-            # not stretched to the container's 100px, forcing the flex
-            # container itself to grow to fit it instead of clipping via
-            # its own `overflow:hidden` UA default). Left `auto` here so
-            # Taffy's own cross-axis stretch fills it in.
+            # with a definite height takes that stretched cross size -- the
+            # 150px UA default is only a fallback for "no intrinsic size
+            # and no flex context" and must not override a real stretch --
+            # display-flex-svg-overflow-default.html. Left auto here so
+            # Taffy's cross-axis stretch fills it in.
             return
         style["height"] = 150.0
 
@@ -460,18 +390,17 @@ def _numeric_or_zero(value) -> float:
 
 
 def _resolve_intrinsic_width_keyword(element, computed, style_obj, computed_cache) -> "float | None":
-    """CSS Sizing 3: `width: min-content | max-content | fit-content` (and
-    the `-webkit-`/`-moz-` spellings) on a block-level box, resolved to
-    a Taffy-usable content-box width before the box is built -- Taffy's
-    `Dimension` has no intrinsic keywords (`style_bridge._len` dropped
-    them to `auto`, so `inline-size: min-content` on `align-items-
-    baseline-row-horz.html`'s flex container filled the whole body).
-    `max-content` (and, approximated, `fit-content`) is the scratch-tree
-    measurement `_measure_intrinsic_width` already does for table cells;
-    `min-content` is the longest unbreakable token, or for a single-line
-    flex row the sum of its items' own min-content margin boxes. `None`
-    leaves the width alone. Re-entrancy from the scratch measurement is
-    guarded so the measured copy lays out as plain `auto`."""
+    """CSS Sizing 3: width: min-content|max-content|fit-content (and
+    -webkit-/-moz- spellings) on a block-level box, resolved to a
+    Taffy-usable content-box width before the box is built -- Taffy's
+    Dimension has no intrinsic keywords (style_bridge._len dropped them to
+    auto, so inline-size:min-content on align-items-baseline-row-horz.html's
+    flex container filled the whole body). max-content (and, approximated,
+    fit-content) is the scratch-tree measurement `_measure_intrinsic_width`
+    already does for table cells; min-content is the longest unbreakable
+    token, or for a single-line flex row the sum of its items' min-content
+    margin boxes. `None` leaves the width alone. Re-entrancy from the
+    scratch measurement is guarded so the measured copy lays out as plain auto."""
     global _measuring_intrinsic_depth
     if _measuring_intrinsic_depth:
         return None
@@ -556,26 +485,21 @@ def _measure_intrinsic_width(element, computed_cache) -> "float | None":
 
 
 def _measure_min_content_width(element, computed_cache) -> "float | None":
-    """The width of `element`'s own longest unbreakable token (its longest
+    """The width of `element`'s longest unbreakable token (its longest
     whitespace-separated word, measured in its own font) -- CSS 2.1
     17.5.2.2's real "minimum content width" for auto table-layout column
-    sizing: the smallest a column can be made without literally breaking a
-    word mid-token. Deliberately *not* `_measure_intrinsic_width`'s
-    max-content (the width if the content never wrapped at all) -- that's
-    the right "requirement" for a short, rarely-wrapping label cell, but
-    wildly too wide a floor for a colspan'd cell holding a whole wrapping
-    sentence or list. Found on `en.wikipedia.org`'s Python-article infobox:
-    a colspan'd "Influenced by" cell listing dozens of comma-separated
-    language names measured over 1200px unwrapped -- using that as the
-    column's required width forced it absurdly wide instead of letting it
-    wrap across several lines the way Chrome renders it.
+    sizing: the smallest a column can be made without breaking a word
+    mid-token. Deliberately not `_measure_intrinsic_width`'s max-content --
+    a wildly too-wide floor for a colspan'd cell holding a whole wrapping
+    sentence. Found on en.wikipedia.org's Python-article infobox: a
+    colspan'd cell listing dozens of comma-separated names measured over
+    1200px unwrapped, forcing the column absurdly wide instead of
+    wrapping across lines like Chrome.
 
     A plain per-token font-metrics measurement (not a real Taffy layout
-    pass, unlike `_measure_intrinsic_width`) -- deliberately minimal, and
-    good enough for ordinary prose/lists: it doesn't account for a nested
-    element's own different font, only `element`'s own (that nested
-    element's *content* still counts, via `dom._rendering_text_content`, just
-    measured in the outer font)."""
+    pass) -- deliberately minimal: doesn't account for a nested element's
+    own different font, only `element`'s own (that nested element's
+    content still counts via `dom._rendering_text_content`, in the outer font)."""
     text = dom._rendering_text_content(element).strip()
     if not text:
         return None
@@ -590,19 +514,15 @@ def _measure_min_content_width(element, computed_cache) -> "float | None":
         italic = fonts.is_italic(paint_style["font_style"])
         return layout_text(token, family, font_size, font_weight=weight, italic=italic)[0]
 
-    # Only CSS white space separates tokens -- `str.split()` would also
-    # break at U+00A0, which never is a break opportunity (caption-side-
-    # 001.xht: a `Filler&nbsp;Text` caption is one 66.9px word, and the
-    # table under it is that wide in Chrome). Each text node is measured
-    # in its own element's font (table-margin-003.xht: a `font-size:
-    # 0.9em` span's `_PASS!__` is the cell's widest word at 56.4px, not
-    # the 62.6px it measures in the cell's own font); a word running
-    # across an element boundary is read as two, which only ever
-    # under-measures slightly.
+    # Only CSS white space separates tokens -- str.split() would also break
+    # at U+00A0, never a break opportunity -- caption-side-001.xht. Each
+    # text node is measured in its own element's font --
+    # table-margin-003.xht; a word running across an element boundary is
+    # read as two, which only ever under-measures slightly.
     # A word runs on across text-node and element boundaries (the XHTML
-    # parser hands `Filler&nbsp;Text` over as three text nodes; `<b>bo</b>ld`
-    # is one word) and only ends at CSS white space or a `<br>`: its width
-    # is the sum of its pieces, each measured in its own font.
+    # parser hands "Filler&nbsp;Text" over as three text nodes; <b>bo</b>ld
+    # is one word) and only ends at CSS white space or a <br>: its width is
+    # the sum of its pieces, each measured in its own font.
     word: list = []
 
     def flush():
@@ -671,12 +591,12 @@ def _apply_button_intrinsic_width(style: dict, element) -> None:
 
 
 def _publish_svg_shape_boxes(node_map: dict) -> None:
-    """An `<svg>`'s own content isn't laid out here (the root is one
-    replaced box), but Chrome still answers `getBoundingClientRect()` for
-    a shape inside it: a `<rect>` reports its `x`/`y`/`width`/`height`
-    offset from the svg root's box, unclipped, unscaled when the svg has
-    no `viewBox` (absolute-replaced-width-002.xht: a 200x100 rect in a
-    300x50 svg). Published purely so the element reports that rect."""
+    """An <svg>'s own content isn't laid out here (the root is one replaced
+    box), but Chrome still answers getBoundingClientRect() for a shape
+    inside it: a <rect> reports its x/y/width/height offset from the svg
+    root's box, unclipped, unscaled when the svg has no viewBox --
+    absolute-replaced-width-002.xht. Published purely so the element
+    reports that rect."""
     for element in list(node_map.values()):
         if not dom._is_element(element):
             continue
