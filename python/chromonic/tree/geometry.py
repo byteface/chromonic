@@ -24,7 +24,7 @@ def _write_boxes(boxes, node_map):
             border_top=bt, border_left=bl,
         )
         state["_chromonic_padding"] = (pt, pr, pb, pl)
-        # Fresh Taffy geometry undoes any row heights `_settle_table`
+        # Fresh Taffy geometry undoes any row heights _settle_table
         # distributed inside this table -- it must run again.
         state.pop("_chromonic_table_settled", None)
 
@@ -41,13 +41,12 @@ def _grow_box_height(element, delta: float) -> None:
 def _grow_and_reflow(element, delta: float, *, stop_at=None, grow_self: bool = True) -> None:
     """`element` just needed `delta` more height than Taffy gave it: grow
     its box, move every later in-flow sibling down, and carry the same
-    growth up through each auto-height ancestor (whose own box Taffy sized
-    from the old height) with its later siblings likewise -- stopping at
-    the first ancestor with a non-`auto` height, which doesn't grow.
+    growth up through each auto-height ancestor with its later siblings
+    likewise -- stopping at the first ancestor with a non-auto height.
     `stop_at` names an ancestor that still grows but propagates no
-    further (a table settling its own rows: `_settle_table` hands the
-    table's net growth on, exactly once). `grow_self=False` propagates a
-    growth already applied to `element`'s own box."""
+    further (`_settle_table` hands a table's net growth on, exactly once).
+    `grow_self=False` propagates a growth already applied to element's
+    own box."""
     if grow_self:
         _grow_box_height(element, delta)
     _shift_later_siblings_for_height_delta(element, delta)
@@ -61,12 +60,10 @@ def _grow_and_reflow(element, delta: float, *, stop_at=None, grow_self: bool = T
             _grow_box_height(ancestor, delta)
             break
         # An ancestor grows by what its flow now needs, not blindly by
-        # `delta`: when the grown box is the last in flow and the
-        # ancestor was already taller (sized by a taller sibling sharing
-        # the same line -- table-vertical-align-baseline-008.xht's 100px
-        # inline-block beside an inline-table Taffy first laid out 0px
-        # tall), only the part of the new bottom edge that overflows
-        # counts, which may be nothing.
+        # delta: when the grown box is last in flow and the ancestor was
+        # already taller (sized by a taller sibling sharing the same line
+        # -- table-vertical-align-baseline-008.xht), only the part of the
+        # new bottom edge that overflows counts, which may be nothing.
         growth = _needed_ancestor_growth(ancestor, child, delta)
         if growth <= 0.01:
             break
@@ -83,11 +80,11 @@ def _grow_and_reflow(element, delta: float, *, stop_at=None, grow_self: bool = T
 
 
 def _needed_ancestor_growth(ancestor, child, delta: float) -> float:
-    """How much `ancestor`'s `height:auto` box must grow now that its
-    in-flow `child` is `delta` taller (later siblings already shifted by
-    that much). `delta` when anything follows the child in flow; else the
-    part of the child's new bottom margin edge below the ancestor's
-    content edge, capped at `delta`."""
+    """How much ancestor's height:auto box must grow now that its in-flow
+    child is `delta` taller (later siblings already shifted by that much).
+    `delta` when anything follows the child in flow; else the part of the
+    child's new bottom margin edge below the ancestor's content edge,
+    capped at delta."""
     ancestor_box = ancestor.__dict__.get("_layout_box")
     child_box = child.__dict__.get("_layout_box")
     if ancestor_box is None or child_box is None:
@@ -112,24 +109,22 @@ def _needed_ancestor_growth(ancestor, child, delta: float) -> float:
 
 
 def _shift_later_siblings_for_height_delta(element, delta: float) -> None:
-    """When `element`'s own height just changed by `delta` (a post-hoc
+    """When element's own height just changed by `delta` (a post-hoc
     correction, after Taffy already stacked its siblings using the old
     value), every later DOM sibling sharing its parent's ordinary block
     flow needs the same vertical shift -- Taffy positioned each one
-    immediately after the previous sibling's own (now-stale) box.
-    Absolutely/fixed-positioned siblings are excluded: their own position
-    doesn't derive from preceding-sibling flow at all. A `display:none`
-    sibling is excluded too, by `_shift_subtree` itself -- see its
-    docstring."""
+    immediately after the previous sibling's own now-stale box.
+    Absolutely/fixed-positioned siblings are excluded: their position
+    doesn't derive from preceding-sibling flow at all. A display:none
+    sibling is excluded too, by `_shift_subtree` itself."""
     parent = getattr(element, "parentNode", None)
     if parent is None or not dom._is_element(parent):
         return
     parent_native = getattr(parent, "_chromonic_native_style", None) or {}
     if parent_native.get("display") == "flex" and parent_native.get("flex_direction") in ("row", "row-reverse"):
         # Siblings laid out side by side (a table row's cells, the
-        # inline-content approximation's items) don't follow `element`
-        # vertically -- nothing to move (table-height-algorithm-026.xht:
-        # a grown button cell pushed the neighbouring cell down 4px).
+        # inline-content approximation's items) don't follow element
+        # vertically -- nothing to move -- table-height-algorithm-026.xht.
         return
     seen_self = False
     for sibling in dom._child_nodes(parent):
@@ -156,9 +151,8 @@ def _shift_box(node, dx: float, dy: float) -> None:
             border_top=box.border_top, border_left=box.border_left,
         )
     # An inline element's per-line rects (`_publish_inline_formatting`'s
-    # `_chromonic_inline_boxes`, what it reports as its client rects) move
-    # with it (column-visibility-004.xht: a span inside a cell the column
-    # collapse shifted 2px up still reported its old x).
+    # _chromonic_inline_boxes, what it reports as its client rects) move
+    # with it -- column-visibility-004.xht.
     rects = node.__dict__.get("_chromonic_inline_boxes")
     if rects:
         node.__dict__["_chromonic_inline_boxes"] = [
@@ -167,15 +161,13 @@ def _shift_box(node, dx: float, dy: float) -> None:
 
 
 def _shift_recomputed_subtree(element, dx: float, dy: float, boxes, node_map: dict) -> None:
-    """After a shrink-to-fit recompute of `element`'s subtree
-    (`_write_boxes(boxes)`, positions relative to the subtree's own
-    origin), move exactly what that recompute produced: an absolutely
-    positioned descendant anchored to a containing block *outside* the
-    subtree kept its real page position and must stay put (top-applies-
-    to-001.xht: a `position: absolute; top: 0` row group anchored to the
-    page was dragged down to its table's y). Elements with no Taffy node
-    of their own (inline boxes published from fragments) are left to the
-    caller's re-publish."""
+    """After a shrink-to-fit recompute of element's subtree
+    (`_write_boxes(boxes)`, positions relative to the subtree's own origin),
+    move exactly what that recompute produced: an absolutely positioned
+    descendant anchored to a containing block outside the subtree kept
+    its real page position and must stay put -- top-applies-to-001.xht.
+    Elements with no Taffy node of their own (inline boxes published from
+    fragments) are left to the caller's re-publish."""
     recomputed = {id(node_map[node_id]) for node_id in boxes if node_id in node_map}
 
     def walk(node):
@@ -209,25 +201,25 @@ def _shift_recomputed_subtree(element, dx: float, dy: float, boxes, node_map: di
 
 
 def _shift_subtree(element, dx: float, dy: float) -> None:
-    """Shift `element` and everything painted inside it by `(dx, dy)` --
-    used to carry a corrected element's own position through to its
-    descendants, whose boxes Taffy computed as offsets from `element`'s
-    own (now-corrected) origin. A uniform shift preserves every internal
+    """Shift element and everything painted inside it by (dx, dy) -- used
+    to carry a corrected element's position through to its descendants,
+    whose boxes Taffy computed as offsets from element's own
+    now-corrected origin. A uniform shift preserves every internal
     relationship Taffy already got right.
 
-    Skips `element` entirely when it's currently `display:none` -- it was
-    never given a real Taffy node this pass, so its stale `_layout_box`
-    must not keep being shifted on top of whatever was last published for
-    it, or the correction compounds forever across relayouts."""
+    Skips element entirely when it's currently display:none -- it was
+    never given a real Taffy node this pass, so its stale _layout_box
+    must not keep being shifted on top of whatever was last published,
+    or the correction compounds forever across relayouts."""
     resolved = getattr(element, "_chromonic_resolved_style", None)
     if resolved is not None and not dom._renders(resolved[1]):
         return
     _shift_box(element, dx, dy)
     for fragment in getattr(element, "_chromonic_inline_fragments", None) or ():
         _shift_box(fragment, dx, dy)
-    # Anonymous table boxes generated under `element` (CSS 2.1 17.2.1) are
-    # not in `childNodes` -- their own boxes are shifted here; the real
-    # nodes they wrap are still reached once, through the DOM walk below.
+    # Anonymous table boxes generated under element (CSS 2.1 17.2.1) aren't
+    # in childNodes -- shifted here; the real nodes they wrap are still
+    # reached once, through the DOM walk below.
     _shift_anonymous_boxes(element, dx, dy)
     for child in dom._child_nodes(element):
         if dom._is_element(child):
