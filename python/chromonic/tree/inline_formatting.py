@@ -24,38 +24,27 @@ class _InlineFormattingPlan:
         self.fragments = []
         self.owner_boxes = {}
         self.height = 0.0
-        # CSS 2.1 9.10: a `direction: rtl` block's own line boxes start from
-        # its *right* edge -- glyph order within a same-direction run (plain
-        # Latin text here; full bidi reordering across mixed-direction runs
-        # is out of scope) stays untouched, only each line's *position*
-        # mirrors. `element` is the block establishing this inline
-        # formatting context (never a nested wrapper's own `direction` --
-        # that would need a real embedding, `unicode-bidi: embed/isolate`,
-        # not implemented), so its own computed `direction` governs every
-        # plan built for it, split or not.
+        # CSS 2.1 9.10: a direction:rtl block's line boxes start from its
+        # right edge (position mirrors; glyph order within a same-direction
+        # run stays untouched, no full bidi). `element` is the block
+        # establishing this formatting context, so its own computed
+        # direction governs every plan built for it, split or not.
         computed = getattr(element, "_chromonic_computed_style", None)
         self.rtl = dom._element_direction(element, computed) == "rtl"
-        # `text-align`/`text-align-last` inherit normally through domonic's
-        # own cascade -- `element` here is the block establishing this
-        # formatting context (the split wrapper, or the plan's own element
-        # for a non-split plan), so its computed value already reflects
-        # whatever an ancestor (e.g. the real containing block a split
-        # wrapper's own anonymous-block pieces belong to) declared.
+        # text-align/text-align-last inherit normally -- `element`'s
+        # computed value already reflects whatever ancestor declared it.
         self.text_align = (getattr(computed, "textAlign", "") or "start").strip().lower()
         self.text_align_last = (getattr(computed, "textAlignLast", "") or "auto").strip().lower()
-        # CSS 2.1 16.1: `text-indent` inherits normally and, same as
-        # `text-align`, applies to *this* plan's own first formatted line
-        # -- each CSS 2.1 9.2.1.1 split segment is its own anonymous block
-        # box, so its own first line gets indented independently, not just
-        # the wrapper's overall first one.
+        # CSS 2.1 16.1: text-indent applies to this plan's own first
+        # formatted line -- each 9.2.1.1 split segment is its own anonymous
+        # block, indented independently.
         self.text_indent = _resolve_text_indent(computed)
 
     def measure(self, available_width, _available_height, _known_width=None, _known_height=None):
         width = float(available_width or 0.0)
         if width < 0:
-            # `src/lib.rs`'s `MinContent` sentinel: lay out at (almost)
-            # zero width so every break opportunity is taken and the
-            # reported `content_width` is the widest unbreakable piece.
+            # src/lib.rs's MinContent sentinel: lay out at ~zero width so
+            # every break opportunity is taken.
             width = 1.0
         elif width <= 0 or width > 1_000_000:
             width = sum(run.get("intrinsic_width", 0.0) for run in self.runs)
@@ -69,20 +58,14 @@ class _InlineFormattingPlan:
         base_height = base_height or normal
         base_above = base_ascent + math.floor((base_height - base_ascent - base_descent) / 2)
         base_below = base_height - base_above
-        # CSS 2.1 16.1: `text-indent` only ever offsets the block's own
-        # first formatted line -- every later line (after a wrap or a
-        # `<br>`) resets `x` to `0.0` already, unaffected.
+        # CSS 2.1 16.1: text-indent only offsets the first formatted line --
+        # later lines reset x to 0.0.
         x = self.text_indent
-        # A `<br>`'s own reported position sits right after the preceding
-        # text's advance, never including that run's own trailing border/
-        # padding/margin-end -- confirmed directly against `left-rtl-
-        # ref.xht`'s real geometry: a `direction:rtl` first fragment's own
-        # *end*-side package (`padding-right`/`margin-right`) genuinely
-        # inflates that fragment's own box width, but a `<br>` immediately
-        # following the text is positioned before that decoration, not
-        # after it (the decoration renders past the wrap point instead).
-        # Tracked separately from `x` since `x` itself must still carry the
-        # trailing/margin-end forward for whatever follows on the same line.
+        # A <br>'s reported position sits right after the preceding text's
+        # advance, never including that run's own trailing border/padding/
+        # margin-end (the decoration renders past the wrap point instead)
+        # -- left-rtl-ref.xht. Tracked separately from `x`, which must still
+        # carry the trailing/margin-end forward for whatever follows.
         x_pre_trailing = x
         y = 0.0
         line_margin_start = 0.0  # how much of the current line's `x` is `margin_start`, not content
@@ -94,28 +77,23 @@ class _InlineFormattingPlan:
         line_has_content = False
         # run index -> (x, y, line height, line's own margin_start, line's own leading edge)
         self._break_positions = {}
-        # For a `direction:rtl` plan, a `<br>` mirrors to the *start* (post-
-        # mirror box `x`, not the un-mirrored text-end point) of whichever
-        # real run immediately preceded it -- tracked here so it can be
-        # resolved once `placed` itself has been mirrored, below.
+        # For an rtl plan, a <br> mirrors to the start (post-mirror box x)
+        # of whichever real run immediately preceded it -- resolved once
+        # `placed` itself has been mirrored, below.
         break_precedes_run: dict = {}
         last_real_run = None
-        # id(escapee element) -> (x, y): an out-of-flow `top/left:auto`
-        # absolutely-positioned element mixed into inline content still has
-        # a real CSS 2.1 10.3.7/10.6.4 "static position" wherever it falls
-        # in the surrounding text; `publish()` turns this into a page position.
+        # id(escapee element) -> (x, y): an out-of-flow element mixed into
+        # inline content still has a real CSS 2.1 10.3.7/10.6.4 static
+        # position wherever it falls; `publish()` turns this into a page position.
         self._escapee_positions = {}
         placed = []
         for run_index, run in enumerate(self.runs):
             if run.get("escapee"):
                 # Doesn't occupy space -- record where the cursor already
-                # was and move on, unlike a forced line-break above. A
-                # block-level escapee (CSS 2.1 10.3.7: its static position
-                # is where a block would have started -- on the line
-                # after the current one, at the line's start) goes below
-                # the line in progress (abspos-007.xht: `<div class="test">`
-                # between text and a block, at x 8 / y 26, not at the text's
-                # end); an inline-level one sits where the text is.
+                # was. A block-level escapee's CSS 2.1 10.3.7 static
+                # position is where a block would start (the line after
+                # this one) -- abspos-007.xht; an inline-level one sits
+                # where the text is.
                 tag = (getattr(run["element"], "tagName", "") or "").lower()
                 if tag in box_model._USUALLY_INLINE_TAGS:
                     self._escapee_positions[id(run["element"])] = (x, y)
@@ -182,12 +160,10 @@ class _InlineFormattingPlan:
                 token_height = run["box_height"]
                 above = max(above, run["above"])
                 below = max(below, run["below"])
-                # A CSS 2.1 9.2.1.1 split segment's own decoration-only
-                # marker (`_empty_decoration_only_run`) never counts as
-                # real content by itself -- only an actual text/strut run
-                # sharing its line does, which is what `publish()` uses to
-                # decide whether the marker should inherit that line's real
-                # geometry instead of staying an isolated 0x0.
+                # A 9.2.1.1 split segment's decoration-only marker
+                # (`_empty_decoration_only_run`) never counts as real content
+                # by itself -- `publish()` uses this to decide whether it
+                # should inherit its line's real geometry instead of 0x0.
                 if not (run.get("empty_strut") and run["ascent"] == 0.0
                         and run["above"] == 0.0 and run["below"] == 0.0):
                     line_has_content = True
@@ -197,11 +173,10 @@ class _InlineFormattingPlan:
                 last_real_run = run
                 x += total
                 if index == len(tokens) - 1:
-                    # A non-replaced inline's horizontal margins are real,
-                    # non-collapsing spacing (CSS 2.1 10.3.1/10.3.3) --
-                    # `margin_start` already shifted the cursor before this
-                    # run's first token; this is margin-end, added once
-                    # after the last, kept out of the run's own width.
+                    # CSS 2.1 10.3.1/10.3.3: non-collapsing margin-end,
+                    # added once after the last token, kept out of the run's
+                    # own width (margin_start already shifted the cursor
+                    # before the first token).
                     x += run.get("margin_end", 0.0)
         self._line_baselines[y] = above
         self._line_belows[y] = below
@@ -215,49 +190,36 @@ class _InlineFormattingPlan:
             for run in self.runs if not run.get("break") and not run.get("escapee")
         )
         if last_real_run is None and any(run.get("break") for run in self.runs):
-            # Nothing placed after the final forced break: the line it
-            # opened holds no content and collapses (CSS 2.1 9.4.2) --
-            # `a<br>` is one line, `a<br><br>` two, and a `<br>` alone
-            # still one (the break sits on the line it ends). Chrome on
-            # table-height-algorithm-004.xht: ten `X<br />` lines make a
-            # 200px cell, not 220.
+            # Nothing placed after the final forced break: that line holds
+            # no content and collapses (CSS 2.1 9.4.2) -- `a<br>` is one
+            # line, `a<br><br>` two -- table-height-algorithm-004.xht.
             self.height = y
         else:
             self.height = 0.0 if is_all_zero_edge_empty else (y + above + below if placed else 0.0)
         if is_all_zero_edge_empty:
-            # Each such strut's own fragment reports zero height too, not
-            # its font-metrics `box_height` -- the line it sits on doesn't exist.
+            # Each such strut reports zero height too, not its font-metrics
+            # box_height -- the line it sits on doesn't exist.
             placed = [
                 (run, text, x, y, token_width, 0.0, leading, trailing, advance_width)
                 for run, text, x, y, token_width, _token_height, leading, trailing, advance_width in placed
             ]
         content_width = min(width, max(
             (px + advance for _r, _t, px, _y, _pw, _h, _l, _tr, advance in placed), default=0.0))
-        # An explicit physical `text-align:left` overrides `direction:rtl`'s
-        # own default right-mirroring below -- CSS 2.1 9.10's own initial
-        # `start` value is what resolves to "right" for rtl, not `left`.
+        # An explicit physical text-align:left overrides direction:rtl's
+        # default right-mirroring -- CSS 2.1 9.10's initial `start` value
+        # resolves to "right" for rtl, not `left`.
         rtl_mirror_suppressed = self.text_align == "left"
         if self.rtl and not rtl_mirror_suppressed and placed:
-            # `direction:rtl` mirrors each line, as a rigid group, against
-            # the same `width` it was placed within. Each fragment's own
-            # `margin_end` (physical-right margin, already attached to
-            # whichever fragment actually owns it -- see the direct-child
+            # direction:rtl mirrors each line, as a rigid group, against the
+            # width it was placed within. Each fragment's own margin_end
+            # (already attached to whichever fragment owns it, see the
             # bidi-box-model edge-swap in `_make_inline_formatting_plan`)
-            # shifts its mirrored box left by that amount, same as it would
-            # shift a plain LTR box's cursor rightward before mirroring --
-            # confirmed directly against `right-rtl-ref.xht`'s real
-            # geometry: only subtracting on the whole line's last placed
-            # entry (the pre-mixed-direction-support original here) is
-            # wrong whenever that entry isn't the one actually carrying the
-            # margin (e.g. a bidi-box-model split's first, not last,
-            # fragment owns the trailing package for `direction:rtl`).
-            # A CSS 2.1 9.2.1.1 block-in-inline split (`_split_wrapping_
-            # inline_element`) never threads its own trailing margin through
-            # a run's `margin_end` field at all (only `margin_start`, on its
-            # first segment) -- so for that case, the wrapper's own overall
-            # last placed fragment still needs its raw CSS margin-right
-            # applied directly here, same as before mixed-direction support
-            # existed. Skipped whenever `margin_end` is already nonzero
+            # shifts its mirrored box left by that amount --
+            # right-rtl-ref.xht. A 9.2.1.1 block-in-inline split
+            # (`_split_wrapping_inline_element`) never threads its trailing
+            # margin through margin_end at all, so that case still needs
+            # its raw CSS margin-right applied directly here. Skipped
+            # whenever margin_end is already nonzero
             # (this plan's own bidi-box-model build already threaded it
             # correctly there -- see `_make_inline_formatting_plan`), to
             # avoid double-counting it.
@@ -293,31 +255,22 @@ class _InlineFormattingPlan:
                     old = self._break_positions[run_index]
                     self._break_positions[run_index] = (run_text_x[id(preceding_run)],) + old[1:]
         elif not self.rtl and placed:
-            # This plan's own base direction is `ltr` (no plan-wide mirror
-            # applies). A *nested* `direction:rtl` element's own start/end
-            # edge assignment was already resolved at build time (see
-            # `_build_text_runs_from_nodes`'s nested-element branch, which
-            # attaches the nested element's border/padding/margin package to
-            # the physically-correct side per its own direction) -- each
-            # fragment's build position is therefore already correct, and no
-            # position-mirroring step is needed here at all for a nested
-            # override; only ordinary physical `text-align` applies.
+            # This plan's base direction is ltr (no plan-wide mirror
+            # applies). A nested direction:rtl element's start/end edge
+            # assignment was already resolved at build time
+            # (`_build_text_runs_from_nodes`'s nested-element branch), so no
+            # mirroring is needed here; only physical text-align applies.
             placed = self._apply_text_align(placed, width)
         self._placed = placed
         return (content_width, self.height)
 
     def _apply_text_align(self, placed, width):
-        """CSS Text 3 `text-align`/`text-align-last`: shift each line's
-        placed tokens to reflect the block's own alignment, physical
-        `left`/`right`/`center` only (no `direction`-aware `start`/`end`
-        remapping -- not needed for LTR, and `direction:rtl` is handled
-        separately above, via the mirror). `justify` distributes leftover
-        space as extra spacing at each token boundary that ends in real
-        whitespace, on every line but the last -- CSS's own line box is
-        never justified unless `text-align-last:justify` says otherwise;
-        each split segment is its own anonymous block box (CSS 2.1
-        9.2.1.1), so its own last physical line gets this treatment
-        independently of any other segment's."""
+        """CSS Text 3 text-align/text-align-last: shift each line's placed
+        tokens for the block's alignment, physical left/right/center only
+        (direction:rtl is handled separately, via the mirror). `justify`
+        distributes leftover space at each whitespace-ending token
+        boundary, every line but the last -- each 9.2.1.1 split segment is
+        its own anonymous block, so its own last line is independent."""
         self._justified_lines = set()
         if not placed:
             return placed
@@ -325,9 +278,9 @@ class _InlineFormattingPlan:
             "right" if self.text_align == "end" else self.text_align)
         text_align_last = self.text_align_last
         if text_align_last in ("auto", ""):
-            # CSS Text 3: `auto` means "ordinary `text-align`", except a
-            # `justify` block's own last line is never force-justified by
-            # this default -- it aligns `start` (left) instead.
+            # CSS Text 3: auto means ordinary text-align, except a justify
+            # block's own last line is never force-justified by this
+            # default -- it aligns start (left) instead.
             text_align_last = "left" if text_align == "justify" else text_align
         text_align_last = "left" if text_align_last in ("start", "") else (
             "right" if text_align_last == "end" else text_align_last)
@@ -362,12 +315,9 @@ class _InlineFormattingPlan:
                 extra_per_gap = slack / len(gap_after)
                 gap_set = set(gap_after)
                 cumulative = 0.0
-                # `publish()`'s own trailing-whitespace collapse (correct
-                # for an ordinary, un-justified line) would otherwise trim
-                # this same slack right back off the last token's reported
-                # width -- indistinguishable there from a line's ordinary
-                # trailing space once distributed. This line's own real,
-                # filled extent needs recording so `publish()` can skip it.
+                # `publish()`'s trailing-whitespace collapse would otherwise
+                # trim this same slack back off the last token -- recorded
+                # here so `publish()` can skip it for a justified line.
                 self._justified_lines.add(line_entries[0][3])
                 for index, (run, text, px, y, token_width, token_height, leading, trailing, advance) in enumerate(line_entries):
                     result.append((run, text, px + cumulative, y, token_width, token_height, leading, trailing, advance))
@@ -387,7 +337,7 @@ class _InlineFormattingPlan:
         escapee_positions = getattr(self, "_escapee_positions", None)
         if escapee_positions:
             # A later pass applies each escapee's real page-coordinate
-            # static position once every element's box has been written.
+            # static position once every box has been written.
             for run in self.runs:
                 if run.get("escapee"):
                     position = escapee_positions.get(id(run["element"]))
@@ -400,10 +350,9 @@ class _InlineFormattingPlan:
         placed = getattr(self, "_placed", ())
         for placed_index, (run, text, x, y, width, token_height, leading, trailing, advance) in enumerate(placed):
             ends_line = placed_index + 1 == len(placed) or placed[placed_index + 1][3] != y
-            # A `text-align:justify` line's own trailing space was already
-            # redistributed into real, visible inter-word gaps -- nothing
-            # natural is left over there to collapse (see `_apply_text_
-            # align`'s own `_justified_lines`).
+            # A justified line's trailing space was already redistributed
+            # into real inter-word gaps -- nothing left to collapse
+            # (see `_apply_text_align`'s `_justified_lines`).
             collapsed_space = (run["space_width"]
                                if text[-1:].isspace() and ends_line
                                and y not in getattr(self, "_justified_lines", ()) else 0.0)
@@ -414,14 +363,11 @@ class _InlineFormattingPlan:
             glyph_y = y + self._line_baselines[y] - run["ascent"]
             key = (id(run["source"]), y)
             entry = grouped.get(key)
-            # A genuinely empty inline's own strut run (`_empty_inline_
-            # strut_run`, one `("", 0.0)` token) places a real element
-            # rect (via `owner_rects` below) but is never a text-range
-            # fragment -- there's no source text node at all, and real
-            # Chrome's own `getClientRects()` for such an element reports
-            # zero *text* fragments (only the element/box ones). Grouping
-            # it here anyway would synthesize a spurious empty-string
-            # entry in `_chromonic_owned_fragments`.
+            # A genuinely empty inline's strut run (`_empty_inline_strut_run`,
+            # one ("", 0.0) token) places a real element rect via
+            # `owner_rects` below but is never a text-range fragment --
+            # there's no source text node, and Chrome's getClientRects()
+            # reports zero text fragments for it.
             if entry is None and text == "":
                 pass
             elif entry is None:
@@ -431,10 +377,9 @@ class _InlineFormattingPlan:
                 fragment._chromonic_text_lines = [text]
                 fragment._chromonic_text_line_widths = [visual_width]
                 fragment._chromonic_line_height = glyph_height
-                # CSS 2.1 9.4.3: a `position: relative` inline (or inline
-                # ancestor) moves its fragments by its offsets, layout
-                # otherwise untouched (position-relative-002.xht: a
-                # `top: 25px` span's text sits 25px below its line).
+                # CSS 2.1 9.4.3: a position:relative inline moves its
+                # fragments by its offsets, layout otherwise untouched --
+                # position-relative-002.xht.
                 rel_dx, rel_dy = inline_finalize._inline_relative_offset(run["owner"], self.element, box)
                 fragment._layout_box = LayoutBox(
                     x=origin_x + x + rel_dx, y=origin_y + glyph_y + rel_dy,
@@ -454,25 +399,18 @@ class _InlineFormattingPlan:
                     client_width=combined_width, client_height=old.client_height,
                 )
             owner = run["owner"]
-            # A CSS 2.1 9.2.1.1 split segment's own decoration-only marker
-            # run (`_empty_decoration_only_run`: no font/line-height
-            # contribution of its own -- see its docstring) normally sits
-            # alone on its own dedicated zero-height line. But when real
-            # sibling content (e.g. the text pending before a leading
-            # segment) shares that same line, the marker doesn't get a
-            # second, independent line of its own -- it's simply nowhere
-            # (no ascent/above/below of its own to place a baseline
-            # against), and belongs at the *top* of the real line, sized to
-            # that line's own real height, not its own zero one.
+            # A 9.2.1.1 split segment's decoration-only marker run
+            # (`_empty_decoration_only_run`, no font/line-height of its own)
+            # normally sits alone on its own zero-height line, but when real
+            # sibling content shares that line it belongs at the top of the
+            # real line instead, sized to that line's real height.
             is_decoration_only_marker = (
                 run.get("empty_strut") and run["ascent"] == 0.0
                 and run["above"] == 0.0 and run["below"] == 0.0
             )
             if is_decoration_only_marker:
-                # No ascent of its own to place a baseline against --
-                # always the top of whatever line it's on, whether that's
-                # a real shared line (sized to that line's own height) or
-                # its own isolated, genuinely-empty one (0x0, unchanged).
+                # No ascent of its own to place a baseline against -- always
+                # the top of whatever line it's on.
                 owner_y = origin_y + y
                 marker_height = (self._line_baselines[y] + self._line_belows[y]
                                   if self._line_has_content.get(y) else token_height)
@@ -482,19 +420,18 @@ class _InlineFormattingPlan:
             rel_dx, rel_dy = inline_finalize._inline_relative_offset(owner, self.element, box)
             rect = (origin_x + x - leading + rel_dx, owner_y + rel_dy,
                     visual_advance + leading + trailing, marker_height)
-            # Split/document-order segment index (`None` for a non-split
+            # Split/document-order segment index (None for a non-split
             # owner), so `_finalize_inline_owner_boxes` can place
             # interruption-marker rects logically, not via a geometric sort.
             owner_rects.setdefault(owner, []).append((rect, run.get("split_group")))
-        # `inline-block`/block owners keep their atomic Taffy box; a real
-        # `display:inline` owner's rects come from `owner_rects[self.element]`
+        # inline-block/block owners keep their atomic Taffy box; a real
+        # display:inline owner's rects come from owner_rects[self.element]
         # instead, merged per-line then unioned for getBoundingClientRect().
         #
-        # Accumulated into `owner_accum`, not finalized here: a split owner
+        # Accumulated into owner_accum, not finalized here: a split owner
         # (CSS 2.1 9.2.1.1) publishes from multiple independent plans, one
-        # per segment -- `_finalize_inline_owner_boxes` unions them all once,
-        # after every plan sharing `owner_accum` has run, instead of the
-        # last plan to publish overwriting the earlier ones.
+        # per segment -- `_finalize_inline_owner_boxes` unions them all once
+        # every plan sharing owner_accum has run.
         owner_is_inline = self.owner_display == "inline"
         for owner, rect_group_pairs in owner_rects.items():
             if owner is self.element and not owner_is_inline:
@@ -534,8 +471,8 @@ class _InlineFormattingPlan:
                     client_width=0.0, client_height=br_height,
                 )
                 run["element"]._chromonic_has_layout_children = False
-        # Same accumulate-not-overwrite reasoning as `owner_accum` above,
-        # for `self.element`'s own painted fragments.
+        # Same accumulate-not-overwrite reasoning as owner_accum above, for
+        # self.element's own painted fragments.
         elem_entry = element_fragments_accum.get(id(self.element))
         if elem_entry is None:
             elem_entry = element_fragments_accum[id(self.element)] = (self.element, [])
@@ -544,12 +481,9 @@ class _InlineFormattingPlan:
 
 
 def _resolve_text_indent(computed) -> float:
-    """`text-indent` in real px -- `ComputedStyleDeclaration.getPropertyValue`
-    has no used-length conversion for it (unlike `width`), so a `ch`/`em`
-    value would otherwise reach here as the literal, unresolved CSS text.
-    `domonic.layout`'s own length parser (already relied on for `width`
-    etc. via `LayoutStyle`) resolves it the same way real `width:10ch`
-    layout already does elsewhere in this file -- percentages aren't
+    """text-indent in real px -- ComputedStyleDeclaration.getPropertyValue
+    has no used-length conversion for it, so a ch/em value would otherwise
+    reach here as literal unresolved CSS text. Percentages aren't
     supported (need the containing block, layout's job, not this early)."""
     if computed is None:
         return 0.0
@@ -575,16 +509,14 @@ def _inline_mixed_content(element, children, element_is_inline=False):
     when all children are inline-level elements (spans, links, etc.).
 
     Block children opt out, except when `element` is itself a genuine
-    `display:inline` element -- CSS 2.1 9.2.1.1: an in-flow block child of
-    an inline forces that inline to split around it, which needs the block
-    to reach `_split_inline_flow_around_blocks`/`_contains_in_flow_block`
-    as an ordinary item here rather than being rejected up front. An
-    ordinary (non-inline) block `element` still opts a block child out
+    display:inline element -- CSS 2.1 9.2.1.1: an in-flow block child of an
+    inline forces that inline to split around it, so the block must reach
+    `_split_inline_flow_around_blocks`/`_contains_in_flow_block` as an
+    ordinary item here. An ordinary block `element` opts a block child out
     entirely -- no anonymous-block implementation for that case."""
-    # The normalized view (`anonymous_boxes._normalized_child_nodes`): text a CSS 2.1
-    # 9.2.1.1 anonymous block took over is no longer this element's own,
-    # and an anonymous inline-table (17.2.1) generated around loose cells
-    # stands in for them as one inline-level item.
+    # The normalized view (`anonymous_boxes._normalized_child_nodes`): text a 9.2.1.1
+    # anonymous block took over is no longer this element's own, and an
+    # anonymous inline-table (17.2.1) stands in for loose cells.
     child_nodes = (element.__dict__.get("_chromonic_normalized_children")
                    if hasattr(element, "__dict__") else None)
     if child_nodes is None:
@@ -616,44 +548,29 @@ def _inline_mixed_content(element, children, element_is_inline=False):
     if not has_direct_text and not has_inline_only_children and before_info is None and after_info is None:
         return None
     by_id = {id(child): (child, computed, style_obj) for child, computed, style_obj in children}
-    # Out-of-flow positioned children do not break an inline formatting run.
-    # Keep them in the retained projection so Taffy can anchor them, while the
-    # surrounding direct text still gets its own measurable fragment.
-    # <br> elements are handled as forced line-breaks and are always permitted.
-    # CSS 2.1 9.5: a float doesn't break an inline formatting run either --
-    # like an absolutely positioned child, it's out of flow -- but *only*
-    # once real direct text already earned this container a plan above
-    # (`box_model._is_floated`, unlike the other `_child_qualifies` cases, is never
-    # consulted for `has_inline_only_children`: a *pure*-float sibling
-    # group with no text at all must keep going through the older,
-    # more capable `elif children:` -> `_approximate_inline_flow` ->
-    # `_fix_float_flow_after_block_sibling` block-packing path exactly as
-    # before -- confirmed directly on `zero-available-space-float-
-    # positioning.html`, two floats and no text, regressed by this
-    # exact function accepting them here too). With real text present,
-    # though, rejecting the container outright loses every text sibling
-    # to that same fallback, which has no notion of direct text at all --
-    # found on any `<p>text <img style="float:left"> more text</p>`-
-    # shaped fixture throughout `CSS2/floats`: the *entire paragraph's*
-    # text silently vanished, not just the float's own position.
+    # Out-of-flow positioned children and <br> don't break an inline
+    # formatting run, and stay in the retained projection so Taffy can
+    # anchor them. CSS 2.1 9.5: a float doesn't break one either, but only
+    # once real direct text already earned this container a plan -- a
+    # pure-float sibling group with no text must keep going through the
+    # older `elif children:` -> `_approximate_inline_flow` ->
+    # `_fix_float_flow_after_block_sibling` path instead --
+    # zero-available-space-float-positioning.html. With real text present,
+    # rejecting the container loses every text sibling to that fallback,
+    # which has no notion of direct text -- any `CSS2/floats` fixture
+    # shaped like `<p>text <img style="float:left"> more text</p>`.
     if any(not (_child_qualifies(child, style_obj) or (has_direct_text and box_model._is_floated(computed)))
            for child, computed, style_obj in children):
         return None
     items = []
     pending_space = False
     previous_was_element = False
-    # CSS 2.1 16.6.1: whitespace at the very *start* of a block's content
-    # collapses to nothing, same as at a line's start -- only *interior*
-    # whitespace (between two real pieces of content) collapses to a
-    # single space. `pending_space` must therefore never fire until real
-    # content has actually been emitted (`has_content`); otherwise a
-    # purely-formatting leading newline/indentation before this
-    # container's first child (`<div>\n  <span>...`, extremely common in
-    # any hand-formatted or templated HTML) would wrongly manufacture a
-    # visible leading space on that first child. Confirmed directly on
-    # `position-relative-003.xht`: `<div>\n<span>Filler Text</span>\n
-    # </div>` measured the span 4px too wide, a spurious leading space
-    # baked into its own first (and only) run.
+    # CSS 2.1 16.6.1: whitespace at the very start of a block's content
+    # collapses to nothing, like at a line's start -- only interior
+    # whitespace collapses to a single space. `pending_space` must never
+    # fire until real content has been emitted (`has_content`), or a
+    # purely-formatting leading newline before the first child would
+    # manufacture a spurious visible space -- position-relative-003.xht.
     has_content = False
     for node in child_nodes:
         if getattr(node, "nodeType", None) == dom.TEXT_NODE:
@@ -663,11 +580,10 @@ def _inline_mixed_content(element, children, element_is_inline=False):
                 if fragment is None:
                     fragment = anonymous_boxes._AnonymousTextFragment(node, element)
                     node._chromonic_fragment = fragment
-                # Only a real (collapsed-away) whitespace node earns the
-                # leading space -- a text node butted right up against
-                # the preceding inline element has none (CSS 2.1 16.6.1;
-                # column-visibility-004.xht's `<span>F</span>P` is "FP",
-                # 200px in Ahem, not "F P").
+                # Only a real collapsed-away whitespace node earns the
+                # leading space -- text butted right against the preceding
+                # inline element has none (CSS 2.1 16.6.1) --
+                # column-visibility-004.xht.
                 fragment._chromonic_leading_collapsed_space = has_content and pending_space
                 items.append(("text", fragment, text, None, None))
                 pending_space = False
@@ -682,26 +598,18 @@ def _inline_mixed_content(element, children, element_is_inline=False):
                 pending_space = False
                 previous_was_element = False
                 # A forced line break starts a fresh line -- whitespace
-                # right after it collapses to nothing too, not a real
-                # space, the same as at this container's own start.
+                # right after it collapses too, same as at this
+                # container's own start.
                 has_content = False
             else:
-                # Mirrors the text-fragment case just above: a whitespace-
-                # only text node collapses to nothing of its own (no run
-                # ever represents it), so the fact a space belongs *before*
-                # this element has to be carried forward the same way, or
-                # it's lost entirely once this element flattens its own
-                # content into runs below. Confirmed directly: `<a>Blue
-                # stein</a> <a>1 hour ago</a>` (a plain space between two
-                # adjacent elements) rendered as "Bluestein1 hour ago",
-                # the space silently dropped.
+                # Mirrors the text-fragment case above: a whitespace-only
+                # text node collapses to nothing of its own, so the pending
+                # space before this element must be carried forward the
+                # same way or it's lost -- `<a>Bluestein</a> <a>1 hour
+                # ago</a>` rendered as "Bluestein1 hour ago" without this.
                 if box_model._is_absolutely_positioned(style_obj):
                     # Out of flow: invisible to whitespace collapsing --
-                    # neither content that makes a following space real
-                    # nor something a pending space attaches to (height-
-                    # width-inline-table-001.xht: an inline-table after an
-                    # absolutely positioned div and a newline starts at
-                    # the line's start, no 4px space).
+                    # height-width-inline-table-001.xht.
                     child._chromonic_leading_collapsed_space = False
                     items.append(("element", child, None, computed, style_obj))
                     continue
@@ -717,8 +625,8 @@ def _inline_mixed_content(element, children, element_is_inline=False):
         pseudo.text = text
         pseudo_style_obj = LayoutStyle.from_computed(pseudo_computed)
         # A synthetic pseudo never goes through `dom._describe()` (no real DOM
-        # node to resolve a `ComputedStyleDeclaration` for), so its paint
-        # style must be set explicitly here, `@font-face` substitution included.
+        # node for a ComputedStyleDeclaration), so its paint style must be
+        # set explicitly here, @font-face substitution included.
         pseudo._chromonic_paint_style = dom._extract_paint_style(pseudo_computed)
         pseudo._chromonic_computed_style = pseudo_computed
         from .. import webfonts
@@ -741,10 +649,9 @@ def _inline_text_style(parent_style):
         "min_width": "auto", "min_height": "auto", "max_width": "auto", "max_height": "auto",
         "margin": [0.0, 0.0, 0.0, 0.0], "padding": [0.0, 0.0, 0.0, 0.0],
         "border": [0.0, 0.0, 0.0, 0.0], "flex_grow": 0.0, "flex_shrink": 1.0,
-        # Never the parent's own basis: a table cell's is its whole
-        # column width, and a text fragment inheriting it took a full
-        # line to itself, stacking a cell's `<img/>B<img/>Y...` content
-        # one item per line (border-conflict-element-001d.xht).
+        # Never the parent's own basis: a table cell's is its whole column
+        # width, and a fragment inheriting it stacked content one item per
+        # line -- border-conflict-element-001d.xht.
         "flex_basis": "auto",
     })
     return style
@@ -780,11 +687,10 @@ def _block_margins_collapse_through(child, child_box) -> bool:
 def _empty_inline_strut_run(owner, leading_edge, trailing_edge, top_edge_val, extra_height, margin_start):
     """CSS 2.1 9.2.1.1/10.8: a genuinely empty, non-replaced inline still
     generates one zero-width inline box participating in the line --
-    contributing its own font/line-height to the line's height/baseline
-    like a real text run (`above`/`below`), while its own vertical
-    padding/border/margin only grow its own box (`box_height`), never the
-    line's. One empty `("", 0.0)` token so `measure()` places it without
-    treating it as wrappable content."""
+    contributing its font/line-height to the line's height/baseline like a
+    real text run, while its own vertical padding/border/margin only grow
+    its own box, never the line's. One empty ("", 0.0) token so measure()
+    places it without treating it as wrappable content."""
     paint_style = owner._chromonic_paint_style
     font_size = _fontmetrics.parse_length(paint_style["font_size"], default=16.0)
     family = "" if paint_style["font_family"] == "none" else paint_style["font_family"]
@@ -792,12 +698,9 @@ def _empty_inline_strut_run(owner, leading_edge, trailing_edge, top_edge_val, ex
     italic = fonts.is_italic(paint_style["font_style"])
     ascent, descent, normal_height = fonts.text_metrics(family, font_size, weight >= 600, italic)
     glyph_height = ascent + descent
-    # An explicit `line-height: 0` is a real, valid (if unusual) authored
-    # value, not "unset" -- `_resolved_line_height` already returns `None`
-    # for the genuinely-unset/`normal` case, so a `... or normal_height`
-    # here would wrongly treat the *value* `0.0` the same way, falling
-    # back to the font's own metrics-based line-height instead of the
-    # explicit zero the author asked for.
+    # An explicit line-height:0 is a real authored value, not "unset" --
+    # `_resolved_line_height` returns None for genuinely-unset/normal, so
+    # `... or normal_height` here would wrongly treat 0.0 the same way.
     resolved_line_height = _resolved_line_height(paint_style["line_height"])
     used_line_height = resolved_line_height if resolved_line_height is not None else normal_height
     above = ascent + math.floor((used_line_height - glyph_height) / 2)
@@ -884,17 +787,16 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
     `extra_height` on every run's box height, `margin_start`/`margin_end`
     applied once each around the whole sequence. `[]` if no non-empty text.
 
-    Shared by `_make_inline_formatting_plan` and `_split_wrapping_inline_
-    element` (CSS 2.1 9.2.1.1's split fragments, each passing 0 for
-    whichever edge it doesn't own).
+    Shared by `_make_inline_formatting_plan` and `_split_wrapping_inline_element`
+    (CSS 2.1 9.2.1.1's split fragments, each passing 0 for whichever edge
+    it doesn't own).
 
     `computed_cache`, when given, also handles two node kinds a split
-    segment can carry: a *simple* nested inline (text/`<br>` only, no
-    further nesting) is flattened in place via a recursive call with its
-    own paint style/edges; an absolutely-positioned element becomes an
-    "escapee" run -- no width/height of its own, but its position in
-    `runs` marks its CSS 2.1 10.3.7/10.6.4 static position for later use.
-    Anything deeper is silently skipped."""
+    segment can carry: a simple nested inline (text/`<br>` only) is
+    flattened in place via a recursive call with its own paint style/edges;
+    an absolutely-positioned element becomes an "escapee" run -- no
+    width/height of its own, but its position in `runs` marks its CSS 2.1
+    10.3.7/10.6.4 static position. Anything deeper is silently skipped."""
 
     def is_text_bearing(node) -> bool:
         node_type = getattr(node, "nodeType", None)
@@ -915,26 +817,16 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
         return []
     runs = []
     # Whitespace collapses across sibling-node boundaries the same way it
-    # does across run boundaries in `_make_inline_formatting_plan`'s own
-    # top-level text handling (`raw[:1]`/`raw[-1:]`) -- but unlike that
-    # one, every text run built below unconditionally strips *both* ends
-    # of its own text (`t.strip(...)`), with no equivalent restoration.
-    # `pending_space` carries a boundary space forward (from a text node
-    # that collapsed to nothing of its own, or a real node's own trailing
-    # whitespace) to whatever the *next* run turns out to be -- a plain
-    # text token, or a nested element's own first run. Confirmed directly
-    # rendering `news.ycombinator.com`: a subtext line's own `<span class=
-    # "subline">` wrapper (nested one level inside `<td>`, so its content
-    # is flattened here, not via that other, already-correct top-level
-    # path) rendered `Bluestein2 hours ago` -- an `<a>` immediately
-    # followed by a `<span>` with no space token anywhere between them.
+    # does across run boundaries in `_make_inline_formatting_plan`, but every
+    # text run built below unconditionally strips both ends of its own
+    # text, with no equivalent restoration. `pending_space` carries a
+    # boundary space forward to whatever the next run turns out to be --
+    # found rendering news.ycombinator.com: a nested `<span class=
+    # "subline">` (flattened here, not via the top-level path) rendered
+    # "Bluestein2 hours ago" without this.
     pending_space = False
-    # Same CSS 2.1 16.6.1 reasoning as `_inline_mixed_content`'s own
-    # `has_content` guard: whitespace collapses to nothing at the very
-    # *start* of this content (never to a real space), so neither a prior
-    # sibling's trailing whitespace nor this node's own leading whitespace
-    # should manufacture a leading-space token until something real has
-    # already been emitted.
+    # Same CSS 2.1 16.6.1 reasoning as `_inline_mixed_content`'s has_content
+    # guard: no leading-space token until real content has been emitted.
     has_content = False
     for node_index, child_node in enumerate(child_nodes):
         node_tag = (getattr(child_node, "tagName", "") or "").lower()
@@ -1017,18 +909,16 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
             })
         elif node_tag == "br":
             pending_space = False
-            # A forced line break starts a fresh line the same way the
-            # whole container's own start does -- whitespace right after
-            # it collapses to nothing too, not to a real space.
+            # A forced line break starts a fresh line, same as this
+            # container's own start -- whitespace right after it collapses too.
             has_content = False
             runs.append({"break": True, "element": child_node})
         elif dom._is_element(child_node) and computed_cache is not None:
             child_computed, child_style = dom._describe(child_node, computed_cache)
             if box_model._is_absolutely_positioned(child_style):
-                # Out of flow -- doesn't occupy an inline-content slot of
-                # its own, so any space pending before it isn't consumed
-                # here; it still belongs before whatever real content
-                # comes next.
+                # Out of flow -- doesn't occupy an inline-content slot, so a
+                # pending space isn't consumed here, and still belongs
+                # before whatever comes next.
                 runs.append({"escapee": True, "element": child_node,
                              "computed": child_computed, "style": child_style})
                 continue
@@ -1037,17 +927,11 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                 if dom._is_element(node) and (getattr(node, "tagName", "") or "").lower() != "br"
             ]
             if non_br_element_children and not _is_genuine_inline_wrapper(child_node, child_style):
-                # A nested block, `inline-block`, or replaced descendant
-                # needs its own dedicated treatment (the CSS 2.1 9.2.1.1
-                # split, or an atomic box with real intrinsic sizing) --
-                # this function only ever flattens plain text into runs,
-                # so it has no way to represent one and silently drops it,
-                # same as it already did for a one-level-nested one (a bare
-                # replaced/block element directly here, with no element
-                # children of its own, always recursed into a trivially-
-                # empty call and vanished the same way). Same reasoning as
-                # the escapee case just above: dropped, not consumed, so a
-                # pending space still belongs before whatever comes next.
+                # A nested block/inline-block/replaced descendant needs its
+                # own dedicated treatment (a 9.2.1.1 split, or an atomic
+                # box) -- this function only flattens plain text, so it
+                # silently drops it, same reasoning as the escapee case:
+                # dropped, not consumed, a pending space still carries forward.
                 continue
             needs_leading_space = has_content and pending_space
             pending_space = False
@@ -1075,42 +959,29 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
             )
             if needs_leading_space and nested_runs:
                 runs.append(_make_collapsed_space_run(paint_style, owner, top_edge_val, extra_height))
-            # CSS 2.1's bidi box model (box.html#bidi-box-model, confirmed
-            # directly against `left-rtl-ref.xht`'s own reference markup:
-            # `<span style="border-left-style:none; padding-right:10px;
-            # margin-right:60px">One</span>` for the DOM-first fragment of a
-            # `direction:rtl` box split by a line break) attaches this
-            # element's own *start*-side package (border+padding+margin
-            # together, on one physical side, nothing on the other) to the
-            # DOM-first non-break run and the *end*-side package to the
-            # DOM-last one -- start=left/end=right for `ltr`, start=right/
-            # end=left for `rtl`. `leading_edge`/`trailing_edge`/
-            # `margin_start`/`margin_end` above carry only outer-ancestor
-            # contributions (always physical, unswapped -- an ancestor's own
-            # side was already resolved at its own level); this element's
-            # own package is added directly onto the correct physical field
-            # of the correct run here, after the recursive call returns,
-            # since the recursive call's own `leading_edge`/`trailing_edge`
-            # params are structurally physical-left/physical-right and can't
-            # express "this element's start edge is physically on the right".
+            # CSS 2.1's bidi box model (box.html#bidi-box-model) attaches
+            # this element's own start-side package (border+padding+margin)
+            # to the DOM-first non-break run and the end-side package to
+            # the DOM-last one -- start=left/end=right for ltr, start=right/
+            # end=left for rtl -- left-rtl-ref.xht. `leading_edge`/
+            # `trailing_edge`/`margin_start`/`margin_end` above carry only
+            # outer-ancestor contributions (always physical); this
+            # element's own package is added directly onto the correct
+            # physical field here since the recursive call's own params
+            # can't express "this element's start edge is physically on the right".
             non_break_runs = [r for r in nested_runs if not r.get("break")]
             if non_break_runs:
                 first_run, last_run = non_break_runs[0], non_break_runs[-1]
                 is_rtl_nested = dom._element_direction(child_node, child_computed) == "rtl"
-                # Tells `_InlineFormattingPlan.measure()`'s whole-line RTL
-                # mirror not to fall back to the owner's raw CSS margin-right
-                # on this fragment even when its own `margin_end` is zero --
-                # zero is a real, direction-aware answer here (an `rtl`
-                # box's end fragment legitimately owns margin-*left*
-                # instead), not a sign the field was never threaded (which
-                # is what that fallback exists for, elsewhere).
+                # Tells measure()'s whole-line RTL mirror not to fall back
+                # to the owner's raw CSS margin-right even when margin_end
+                # is zero -- zero is a real, direction-aware answer here.
                 first_run["_bidi_margin_resolved"] = True
                 last_run["_bidi_margin_resolved"] = True
                 if first_run is last_run:
-                    # Unsplit -- the sole run owns both edges, physically,
-                    # regardless of direction (a box's own border/padding
-                    # doesn't change because its content is `rtl`; only a
-                    # line-break split invokes the start/end swap at all).
+                    # Unsplit -- the sole run owns both edges physically,
+                    # regardless of direction; only a line-break split
+                    # invokes the start/end swap.
                     first_run["leading"] = first_run.get("leading", 0.0) + nested_left
                     first_run["trailing"] = first_run.get("trailing", 0.0) + nested_right
                     first_run["margin_start"] = first_run.get("margin_start", 0.0) + nested_margin_left
@@ -1142,13 +1013,10 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
 
 
 def _is_genuine_inline_wrapper(node, style_obj) -> bool:
-    """Whether `node` is a genuinely `display:inline` wrapper, as opposed
-    to an atomic inline-level box (`inline-block`, replaced) that merely
-    happens to also be inline-level. Only a genuine wrapper's content is
-    reachable "through" it for CSS 2.1 9.2.1.1 (`_contains_in_flow_block`)
-    -- an `inline-block` owns its own BFC/descendants entirely, so a block
-    child inside one must never look like a direct block child of whatever
-    merely contains that inline-block."""
+    """Whether `node` is a genuinely display:inline wrapper, as opposed to
+    an atomic inline-level box (inline-block, replaced). Only a genuine
+    wrapper's content is reachable "through" it for CSS 2.1 9.2.1.1
+    (`_contains_in_flow_block`) -- an inline-block owns its own BFC entirely."""
     tag_name = (getattr(node, "tagName", "") or "").lower()
     return (
         tag_name not in box_model._REPLACED_OR_CONTROL_TAGS
@@ -1194,10 +1062,10 @@ def _contains_in_flow_block(element, computed_cache) -> bool:
 
 
 def _first_reachable_in_flow_block(element, computed_cache):
-    """Like `_contains_in_flow_block`, but returns the first descendant
-    node itself rather than a bool -- used so a *nested* wrapper's own
-    marker fragment (`_finalize_inline_owner_boxes`) has a real box to
-    read geometry from. `None` if nothing qualifies."""
+    """Like `_contains_in_flow_block`, but returns the first descendant node
+    itself rather than a bool -- used so a nested wrapper's own marker
+    fragment (`_finalize_inline_owner_boxes`) has a real box to read
+    geometry from. `None` if nothing qualifies."""
     tag_name = (getattr(element, "tagName", "") or "").lower()
     if tag_name in ("select", "svg", "svg:svg"):
         return None
@@ -1268,17 +1136,13 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
     wrapper._chromonic_native_style = native
     left_edge = box_model._numeric_edge(native["padding"][3]) + box_model._numeric_edge(native["border"][3])
     right_edge = box_model._numeric_edge(native["padding"][1]) + box_model._numeric_edge(native["border"][1])
-    # The split's leading/trailing fragments carry the wrapper's *logical*
+    # The split's leading/trailing fragments carry the wrapper's logical
     # start/end edge, not always its physical left/right -- in
-    # `direction:rtl`, the first-generated fragment owns the right
-    # border/padding/margin and the last owns the left, swapped from `ltr`.
-    # `left_edge`/`right_edge`/`margin_left`/`margin_right` themselves stay
-    # physical below (unswapped); which segment (first vs last) each gets
-    # routed to is decided per-segment further down instead, since a plain
-    # value-swap here would just move the *magnitude* without moving it to
-    # the physically-correct side (`_build_text_runs_from_nodes`'s own
-    # `leading_edge`/`trailing_edge` params are always physical-left/
-    # physical-right, tied structurally to first/last segment respectively).
+    # direction:rtl, the first-generated fragment owns the right
+    # border/padding/margin and the last owns the left, swapped from ltr.
+    # left_edge/right_edge/margin_left/margin_right stay physical below;
+    # which segment (first vs last) each routes to is decided per-segment
+    # further down instead.
     is_rtl = dom._element_direction(wrapper, wrapper_computed) == "rtl"
     top_edge_val = box_model._numeric_edge(native["padding"][0]) + box_model._numeric_edge(native["border"][0])
     extra_height = (top_edge_val + box_model._numeric_edge(native["padding"][2])
@@ -1288,10 +1152,9 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
     if wrapper is container:
         # The direct-child shape: `wrapper` is a real Taffy node, so Taffy
         # already physically shifted its text-leaf children by this same
-        # border/padding/margin -- zero them here to avoid double-counting
-        # horizontal position; `top_edge_val` stays (one-way addition, safe),
-        # its own vertical position corrected via `_chromonic_split_self_edges`
-        # in `_finalize_inline_owner_boxes` instead.
+        # border/padding/margin -- zeroed here to avoid double-counting
+        # horizontal position; vertical position is corrected via
+        # `_chromonic_split_self_edges` in `_finalize_inline_owner_boxes` instead.
         wrapper._chromonic_split_self_edges = (
             (right_edge if is_rtl else left_edge), (left_edge if is_rtl else right_edge), top_edge_val)
         left_edge = right_edge = margin_left = margin_right = 0.0
@@ -1302,12 +1165,10 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
     segments: list = [[]]
     blocks: list = []
     # A child that's itself an inline wrapper reaching a block only through
-    # further nesting (not directly) must not fall through to `segments[-1].
-    # append(node)` -- that treats it as ordinary content for
-    # `_build_text_runs_from_nodes`, which has no notion of a nested block
-    # and drops it. Recorded by segment index instead; resolved to a real
-    # block for the marker rect below, and split via recursive delegation
-    # at yield time rather than being flattened into `blocks` directly.
+    # further nesting must not fall through to `segments[-1].append(node)`
+    # -- `_build_text_runs_from_nodes` has no notion of a nested block and
+    # drops it. Recorded by segment index instead, split via recursive
+    # delegation at yield time.
     nested_wrapper_at: dict = {}
     for node in dom._child_nodes(wrapper):
         if dom._is_element(node):
@@ -1318,19 +1179,15 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
                 child_computed, child_style = dom._describe(node, computed_cache)
                 if not dom._renders(child_style):
                     continue
-                # CSS 2.1 9.2.1.1 only ever applies to an *in-flow* block
-                # child -- a `float:left`/`right` one is out of flow (still
-                # computed block-level, per 9.7's blockification, but never
-                # forces the wrapper to split around it): it stays ordinary
-                # segment content instead, built as its own atomic subtree
-                # below, the same way an `inline-block` already is.
+                # CSS 2.1 9.2.1.1 only applies to an in-flow block child --
+                # a float:left/right one is out of flow (still blockified
+                # per 9.7, but never forces a split): it stays ordinary
+                # segment content, built as its own atomic subtree below,
+                # the same way an inline-block already is.
                 if (not box_model._is_absolutely_positioned(child_style) and not box_model._is_floated(child_computed)
                         and not box_model._is_inline_level(node, child_style)):
-                    # `_fix_block_in_inline_rtl_position` needs the same
-                    # real containing block `wrapper` itself tracks --
-                    # CSS 2.1 9.2.1.1's split doesn't change this block's
-                    # own normal-flow containing block or positioning
-                    # rules, `direction:rtl` included.
+                    # The split doesn't change this block's own normal-flow
+                    # containing block or positioning rules, direction:rtl included.
                     node._chromonic_split_container = container
                     blocks.append((node, child_computed, child_style))
                     segments.append([])
@@ -1343,41 +1200,36 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
                     continue
         segments[-1].append(node)
 
-    # `getClientRects()`/`getBoundingClientRect()`: Chrome exposes one extra,
-    # zero-height rect per interruption -- positioned exactly where the
-    # interrupting block sits -- alongside the real leading/trailing
-    # fragment rects (confirmed: a 2-fragment split's `element.getClientRects
-    # ()` returns *3* rects in real Chrome, not 2). `_finalize_inline_owner_
-    # boxes` adds these once boxes are final; record which blocks to use here
-    # (overwritten fresh on every relayout that reaches this branch) rather
-    # than recomputing the split there, where only `owner_accum`'s already-
-    # merged rects are visible. A nested-wrapper interruption reports the
-    # first *real* block reachable through it -- the same element its own
-    # recursive split (below) will itself report a marker for -- so every
-    # ancestor level between the real block and the line gets its own
-    # marker rect at that same position, matching real Chrome.
+    # getClientRects(): Chrome exposes one extra, zero-height rect per
+    # interruption, positioned where the interrupting block sits -- a
+    # 2-fragment split's element.getClientRects() returns 3 rects in real
+    # Chrome, not 2. `_finalize_inline_owner_boxes` adds these once boxes are
+    # final; recorded here (overwritten fresh each relayout) rather than
+    # recomputed there, where only owner_accum's already-merged rects are
+    # visible. A nested-wrapper interruption reports the first real block
+    # reachable through it, so every ancestor level gets its own marker at
+    # that same position, matching Chrome.
     wrapper._chromonic_interruption_blocks = [
         block if block is not None else _first_reachable_in_flow_block(nested_wrapper_at[index], computed_cache)
         for index, (block, _computed, _style) in enumerate(blocks)
     ]
     wrapper._chromonic_atomic_segment_elements = {}
     wrapper._chromonic_split_edge_flow_height = {}
-    # `wrapper` itself is never built as a real Taffy node at all when it's
-    # a *nested* wrapper (see this function's own docstring) -- it never
-    # ends up in `node_map`, so nothing that only ever walks `node_map.
-    # values()` (e.g. `_fix_nested_split_flow_extent`) can discover it
-    # directly. Each real interruption block *is* a genuine node, though,
-    # so a back-reference on it is a reliable way back to its wrapper.
+    # `wrapper` itself is never built as a real Taffy node when it's a
+    # nested wrapper -- it never ends up in `node_map`, so a walk of
+    # `node_map.values()` (e.g. `_fix_nested_split_flow_extent`) can't discover
+    # it directly. Each real interruption block is a genuine node, so a
+    # back-reference on it is a reliable way back to its wrapper.
     for block, _computed, _style in blocks:
         if block is not None:
             block.__dict__["_chromonic_split_wrapper_ref"] = wrapper
 
     for index, seg_nodes in enumerate(segments):
         is_first, is_last = index == 0, index == len(segments) - 1
-        # `direction:rtl`: the first segment owns the *start* (physical-
-        # right) package, the last owns the *end* (physical-left) one --
-        # swapped from `ltr`'s first=left/last=right (CSS 2.1's own bidi box
-        # model, confirmed against `left-rtl-ref.xht`'s real geometry).
+        # direction:rtl: the first segment owns the start (physical-right)
+        # package, the last owns the end (physical-left) one -- swapped
+        # from ltr's first=left/last=right (CSS 2.1's bidi box model) --
+        # left-rtl-ref.xht.
         seg_leading = (left_edge if is_last else 0.0) if is_rtl else (left_edge if is_first else 0.0)
         seg_trailing = (right_edge if is_first else 0.0) if is_rtl else (right_edge if is_last else 0.0)
         seg_margin_start = (margin_left if is_last else 0.0) if is_rtl else (margin_left if is_first else 0.0)
@@ -1392,11 +1244,9 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
         )
         if not runs and (seg_leading or seg_trailing):
             # A leading/trailing segment with no real text still needs a
-            # fragment when it has real inline extent (own padding making
-            # it non-zero-width) -- CSS 2.1 9.2.1.1's split generates an
-            # anonymous inline box there even with no text, at the font's
-            # line-height plus the wrapper's vertical border/padding. A
-            # segment with *no* inline extent is genuinely `0x0` instead.
+            # fragment when it has real inline extent (own padding) -- CSS
+            # 2.1 9.2.1.1's split generates an anonymous inline box there
+            # even with no text. A segment with no inline extent is 0x0.
             runs = [_empty_inline_strut_run(
                 wrapper, seg_leading, seg_trailing, top_edge_val, extra_height, seg_margin_start,
             )]
@@ -1430,9 +1280,8 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
                 # `_finalize_inline_owner_boxes` skips its marker rect too.
                 runs = [_empty_decoration_only_run(wrapper, 0.0, 0.0, 0.0, 0.0, 0.0)]
             else:
-                # Genuinely nothing on this side -- still an explicit `0x0`
-                # fragment (Chrome reports one), but no height/font/flow
-                # contribution of its own.
+                # Genuinely nothing on this side -- still an explicit 0x0
+                # fragment (Chrome reports one), no height/font/flow of its own.
                 runs = [_empty_decoration_only_run(wrapper, 0.0, 0.0, 0.0, 0.0, 0.0)]
         if runs:
             # Tags each run with its segment index (document order), so
@@ -1442,13 +1291,9 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
                 if not run.get("break"):
                     run["split_group"] = index
                     if is_rtl and (is_first or is_last):
-                        # A zero `margin_end`/`margin_start` on this segment
-                        # is a real, direction-aware answer here (see the
-                        # identical tag elsewhere) -- suppress `measure()`'s
-                        # owner-raw-margin fallback, which exists only for
-                        # the untagged, non-`rtl` case above where that
-                        # fallback is genuinely needed (margin-right is
-                        # never threaded there at all).
+                        # Zero margin_end/margin_start on this segment is a
+                        # real, direction-aware answer -- suppress
+                        # measure()'s owner-raw-margin fallback.
                         run["_bidi_margin_resolved"] = True
             yield ("run", runs)
         if index < len(blocks):
@@ -1466,22 +1311,19 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
 def _split_inline_flow_around_blocks(element, inline_items, style, css_display, computed_cache):
     """`inline_items` contains, at some depth reachable only through
     inline-level elements, a genuine in-flow block -- CSS 2.1 9.2.1.1's
-    "anonymous block box" case (`<span>One<div/>Two</span>`: the block
-    forces `span` to split into a "One" fragment, the block, and a "Two"
-    fragment, siblings in normal block flow, not one flex row or a single
-    measured text leaf).
+    anonymous block box case (`<span>One<div/>Two</span>`: the block forces
+    `span` to split into a "One" fragment, the block, and a "Two" fragment,
+    siblings in normal block flow).
 
     Returns an ordered list of pieces -- `("plan", _InlineFormattingPlan)`
     or `("block", child, child_computed, child_style)` -- ready to become
     `element`'s ordinary block-stack Taffy children. `None` if nothing
-    needs splitting -- caller falls back to its existing handling.
+    needs splitting.
 
     Two shapes reach this function (`_has_direct_in_flow_block_child`
     distinguishes them): `element` itself directly parenting the block
-    (splits itself, dispatched immediately below), or a plain block
-    `element` merely containing a nested inline item that wraps a block
-    deeper (only that nested item splits; `element` stays an ordinary
-    container, handled by the per-item loop below)."""
+    (splits itself), or a plain block `element` containing a nested inline
+    item that wraps a block deeper (only that nested item splits)."""
     if _has_direct_in_flow_block_child(element, computed_cache):
         pieces: list = []
         runs_acc: list = []
@@ -1521,14 +1363,11 @@ def _split_inline_flow_around_blocks(element, inline_items, style, css_display, 
                 and _is_genuine_inline_wrapper(item, child_style)
                 and _contains_in_flow_block(item, computed_cache)):
             found_split = True
-            # CSS 2.1 9.2.1.1: the wrapper's own leading fragment isn't
-            # itself a line break -- any text already pending before it
-            # belongs on the *same* line box, right up until the first
-            # real block interruption actually forces a split. Seed
-            # `runs_acc` from `pending`'s own runs instead of flushing it
-            # as an independent, separately-positioned plan (which would
-            # otherwise stack it as its own zero-height row above the
-            # wrapper's leading segment rather than sharing its line).
+            # CSS 2.1 9.2.1.1: the wrapper's leading fragment isn't itself a
+            # line break -- pending text before it belongs on the same line
+            # box until the first real block interruption forces a split.
+            # Seeded from `pending`'s runs instead of flushed as an
+            # independent plan, which would stack it as its own row.
             runs_acc: list = []
             if pending:
                 pending_plan = _make_inline_formatting_plan(element, list(pending), style, css_display, computed_cache)
@@ -1543,23 +1382,17 @@ def _split_inline_flow_around_blocks(element, inline_items, style, css_display, 
                         plan = _InlineFormattingPlan(
                             element, runs_acc, element._chromonic_paint_style, css_display)
                         # A block interruption follows -- this plan is a
-                        # *leading* or *interior* segment, never the
-                        # wrapper's true trailing one, regardless of
-                        # whether it happens to be the only (and so,
-                        # locally, "last") entry in its own `placed` list.
-                        # `measure()`'s RTL mirror must not apply the
-                        # wrapper's margin-right to it on that false
-                        # signal -- margin-right belongs only to the one
-                        # segment that comes after every interruption.
+                        # leading/interior segment, never the wrapper's true
+                        # trailing one. measure()'s RTL mirror must not
+                        # apply the wrapper's margin-right on that false signal.
                         plan._chromonic_final_split_fragment = False
                         pieces.append(("plan", plan))
                         runs_acc = []
                     pieces.append(sub)
             if runs_acc:
                 # Nothing follows this plan for `item` -- the real trailing
-                # segment, where `measure()` should apply the wrapper's
-                # margin-right normally (the default when this attribute is
-                # absent, as for every ordinary non-split plan).
+                # segment, where measure() applies the wrapper's
+                # margin-right normally (the default for a non-split plan).
                 plan = _InlineFormattingPlan(
                     element, runs_acc, element._chromonic_paint_style, css_display)
                 plan._chromonic_final_split_fragment = True
@@ -1581,67 +1414,41 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
     alone between two blocks inside an inline span was simply dropped)."""
     if any(kind == "element" and (
             (box_model._is_absolutely_positioned(child_style) and not allow_escapees)
-            # CSS 2.1 9.5: a float, like an abs-pos item, is out of flow --
-            # but unlike abs-pos this plan has no escapee/static-position
-            # handling for one (real float positioning needs the
-            # block-level packer, `_fix_float_flow_after_block_sibling`-
-            # style logic, not a text-flow static position) -- always
-            # bails to the `elif inline_items:` flex-row fallback, which
-            # `build()` gives its own float handling
+            # CSS 2.1 9.5: a float is out of flow like an abs-pos item, but
+            # this plan has no escapee/static-position handling for one --
+            # always bails to the `elif inline_items:` flex-row fallback,
+            # which build() gives its own float handling
             # (`_chromonic_inline_floats`/`_fix_inline_float_position`).
             or box_model._is_floated(child_computed)
             or isinstance(item, dom._PseudoElement)
-            # A *real* nested element with only text children (no further
-            # element nesting) would otherwise be absorbed straight into
-            # this plan as flattened text runs (see the "element" branch
-            # below, `_build_text_runs_from_nodes`) -- which never calls
-            # `build()` on it at all, so its *own* `::before`/`::after`
-            # (one level deeper than this function ever looks) would
-            # silently never be considered. Bail so the flex-row fallback's
-            # real recursive `build()` call on it runs instead, exactly
-            # like an absolutely-positioned or pseudo item already does.
+            # A nested element with only text children would otherwise be
+            # absorbed into this plan as flattened text runs
+            # (`_build_text_runs_from_nodes`), which never calls build() on
+            # it, so its own ::before/::after would never be considered.
+            # Bail so the flex-row fallback's real recursive build() call runs.
             or getattr(item, "_chromonic_before_pseudo", None) is not None
             or getattr(item, "_chromonic_after_pseudo", None) is not None
-            # `inline-block` (CSS 2.1 10.3.10) is always an atomic box with
-            # its own formatting context, own explicit/auto width+height,
-            # never flattened text runs sharing this plan's line metrics --
-            # the "element" branch below only ever tries to flatten a
-            # nested element's own *text* into runs, which for a genuinely
-            # empty `inline-block` (no text, no children at all) produces
-            # zero runs and *no fallback strut either* (that fallback is
-            # deliberately `display:inline`-only, since only a plain empty
-            # inline collapses to nothing -- an empty inline-block still
-            # keeps its own explicit box, CSS 2.1 9.2.1.1/10.8) -- silently
-            # dropping the element from the plan's own `runs` entirely, and
-            # therefore from `node_map`, painted or not. Confirmed on `wpt/
-            # css/CSS2/visudet/inline-block-baseline-011.xht`: an empty
-            # `<span style="display:inline-block">` between two text runs
-            # never got a Taffy node at all. Bailing here routes it through
-            # the flex-row fallback instead, which already builds every
-            # element item as its own real recursive `build()` subtree.
+            # inline-block (CSS 2.1 10.3.10) is always an atomic box with
+            # its own formatting context, never flattened text runs -- for a
+            # genuinely empty one, the "element" branch below produces zero
+            # runs and no fallback strut (deliberately inline-only, since an
+            # empty inline-block still keeps its own explicit box, CSS 2.1
+            # 9.2.1.1/10.8), silently dropping it from node_map entirely --
+            # wpt/css/CSS2/visudet/inline-block-baseline-011.xht. Bailing
+            # here routes it through the flex-row fallback instead.
             or getattr(child_style.display, "value", "") in (
                 "inline-block", "inline-flex", "inline-grid", "-webkit-inline-flex")
-            # An `inline-table` (CSS 2.1 17.4) -- a real element's, or a
-            # CSS 2.1 17.2.1 anonymous one generated around loose cells
-            # inside this inline (`_AnonymousTableBox`) -- is exactly as
-            # atomic: one box, laid out by its own table algorithm.
-            # Flattened as if it were a plain inline, its cells (never
-            # inline-level themselves) read as in-flow blocks that split
-            # this inline around them, one full-width row per cell
-            # (table-anonymous-objects-177.xht).
+            # An inline-table (CSS 2.1 17.4) -- real or a 17.2.1 anonymous
+            # one (`_AnonymousTableBox`) -- is exactly as atomic: one box, its
+            # own table algorithm. Flattened as a plain inline, its cells
+            # would read as in-flow blocks splitting this inline around
+            # them -- table-anonymous-objects-177.xht.
             or getattr(child_style.display, "value", "") == "inline-table"
-            # A replaced element (`<img>`, `<canvas>`, `<svg>`, `<iframe>`,
-            # a form control) is exactly as atomic as `inline-block` above
-            # -- its own box is a real Taffy leaf sized from its own
-            # intrinsic/authored width+height, never flattened text runs --
-            # and one is typically a void element with no `childNodes` of
-            # its own at all, so it hits the exact same silent-drop gap:
-            # zero runs, no empty-strut fallback (also deliberately
-            # excluded for these tags, since they don't collapse to
-            # nothing like a plain empty inline can). Confirmed directly on
-            # `wpt/css/CSS2/visudet/replaced-elements-width-40.html`: every
-            # `<img>` meant to flow inline with the comma-separated text
-            # between them vanished from layout entirely once that text
+            # A replaced element is exactly as atomic as inline-block above
+            # -- typically a void element with no childNodes, hitting the
+            # same silent-drop gap (no empty-strut fallback for these tags
+            # either) -- wpt/css/CSS2/visudet/replaced-elements-width-40.html:
+            # every <img> meant to flow inline vanished from layout entirely
             # started actually being recognised as inline-mixed content
             # (see `box_model._USUALLY_INLINE_TAGS` picking up `img`/`canvas`/`svg`/
             # `iframe`).
@@ -1674,31 +1481,23 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
             native = None
         else:
             # Nested markup is flattened into this plan when it contains
-            # text and `<br>` forced line-breaks -- and, recursively, any
-            # further plain (`_is_genuine_inline_wrapper`) inline nesting
-            # too (`_build_text_runs_from_nodes`, called below, recurses
-            # into each non-`<br>` element child the same way). A nested
-            # block, `inline-block`, or replaced descendant still can't be
-            # represented as a flattened text run, so it's silently
-            # dropped rather than bailing this whole plan to the flex-row
-            # fallback -- confirmed directly that fallback mismeasures
-            # mixed text + nested-inline content (real Chrome vs chromonic
-            # on `news.ycombinator.com`'s subtext line, `<span class="age">
-            # <a>1 hour ago</a></span>` sitting among plain text and other
-            # `<a>`s: the whole line was scrambled -- the nested `<a>`'s
-            # own text wrapped internally into two lines and landed out of
-            # DOM order relative to its siblings).
+            # text and <br> breaks, recursively including further genuine
+            # inline nesting (`_build_text_runs_from_nodes`). A nested block/
+            # inline-block/replaced descendant can't be a flattened text
+            # run, so it's silently dropped rather than bailing the whole
+            # plan to the flex-row fallback, which mismeasures mixed text +
+            # nested-inline content -- confirmed on news.ycombinator.com's
+            # subtext line.
             # `item` is on the ordinary (non-split) path this layout --
             # clear any stale interruption-block bookkeeping a previous
             # layout's split may have left on it.
             item.__dict__.pop("_chromonic_interruption_blocks", None)
             item.__dict__.pop("_chromonic_split_container", None)
             # Walk childNodes to collect text segments and <br> breaks,
-            # producing runs for each and decorating them with the child
-            # element's border+padding edges (CSS 2.1: first fragment gets
-            # left edge, last fragment gets right edge). See
-            # `_build_text_runs_from_nodes` -- also reused, with a real
-            # split, by `_split_wrapping_inline_element`.
+            # decorating them with the child element's border+padding edges
+            # (first fragment gets left edge, last gets right) -- see
+            # `_build_text_runs_from_nodes`, also reused by
+            # `_split_wrapping_inline_element`.
             native = style_bridge.to_dict(child_style)
             item._chromonic_native_style = native
             left_edge = (box_model._numeric_edge(native["padding"][3])
@@ -1711,27 +1510,23 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
                             + box_model._numeric_edge(native["padding"][2])
                             + box_model._numeric_edge(native["border"][2]))
             # margin-left/-right apply before the first/after the last LTR
-            # fragment only; CSS 2.1 10.3.1/10.3.3: real spacing, but never
-            # part of either fragment's own rect, and -- unlike a block's
-            # vertical margins -- never collapses with an adjoining
-            # element's own margin (`_InlineFormattingPlan.measure()`'s own
-            # `margin_end` handling adds both sides independently).
+            # fragment only; CSS 2.1 10.3.1/10.3.3: real spacing, never part
+            # of either fragment's own rect, and never collapses with an
+            # adjoining element's margin.
             margin_start = box_model._numeric_edge(native["margin"][3])
             margin_end = box_model._numeric_edge(native["margin"][1])
-            # CSS 2.1's bidi box model (box.html#bidi-box-model, confirmed
-            # against `left-rtl-ref.xht`'s own reference markup) attaches
-            # the *start*-side package (border+padding+margin together) to
-            # the DOM-first fragment and the *end*-side package to the
-            # DOM-last one -- start=left/end=right for `ltr`, start=right/
-            # end=left for `rtl`. `_build_text_runs_from_nodes`'s own
-            # `leading_edge`/`trailing_edge` params are always physical-left/
-            # physical-right, so for a `direction:rtl` item the two edge
-            # packages are built unswapped here and then swapped onto the
-            # correct fragment below, once the actual (possibly `<br>`-
-            # split) fragments are known.
+            # CSS 2.1's bidi box model attaches the start-side package
+            # (border+padding+margin) to the DOM-first fragment and the
+            # end-side package to the DOM-last one -- start=left/end=right
+            # for ltr, swapped for rtl -- left-rtl-ref.xht.
+            # `_build_text_runs_from_nodes`'s leading_edge/trailing_edge params
+            # are always physical, so for a direction:rtl item the packages
+            # are built unswapped here and swapped onto the correct
+            # fragment below, once the real (possibly <br>-split) fragments
+            # are known.
             is_rtl_item = dom._element_direction(item, child_computed) == "rtl"
             # Flattened into this plan: no Taffy box of its own this pass
-            # (`build()` clears the mark when it does build the element).
+            # (build() clears the mark when it does build the element).
             item.__dict__["_chromonic_flattened_inline"] = True
             child_runs = _build_text_runs_from_nodes(
                 list(dom._child_nodes(item)), item._chromonic_paint_style, item,
@@ -1745,18 +1540,12 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
             leading_space_run = None
             if getattr(item, "_chromonic_leading_collapsed_space", False) and child_runs:
                 # A whitespace-only text node right before this element
-                # collapsed to nothing of its own (see where this flag is
-                # set, in `_inline_mixed_content`) -- restore it as its
-                # own standalone run, owned by this shared plan's own
-                # `element` (the same as any other collapsed-whitespace
-                # text node would be), the same collapsed space a plain
-                # text item's own `inferred_leading` (just below) restores
-                # for itself. Kept as a *separate* run rather than merged
-                # into this element's own first token -- confirmed wrong
-                # directly on `inline-formatting-context-013.xht`: merged,
-                # a wrap point landing between the space and this
-                # element's own content left a stray zero-width space
-                # fragment on the previous line real Chrome never reports.
+                # collapsed to nothing of its own (set in
+                # `_inline_mixed_content`) -- restored as its own standalone
+                # run rather than merged into this element's first token --
+                # merged, a wrap point between the space and this element's
+                # content left a stray zero-width space on the previous
+                # line -- inline-formatting-context-013.xht.
                 leading_space_run = _make_collapsed_space_run(
                     element._chromonic_paint_style, element, top_edge_val, extra_height)
             if is_rtl_item:
@@ -1764,12 +1553,12 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
                 if non_break_runs:
                     first_run, last_run = non_break_runs[0], non_break_runs[-1]
                     # See the identical tag in `_build_text_runs_from_nodes`'s
-                    # nested-element branch: a zero `margin_end` here is a
+                    # nested-element branch: a zero margin_end here is a
                     # real, direction-aware answer, not an unthreaded field.
                     first_run["_bidi_margin_resolved"] = True
                     last_run["_bidi_margin_resolved"] = True
                     if first_run is last_run:
-                        # Unsplit -- the sole run owns both edges, physically,
+                        # Unsplit -- the sole run owns both edges physically,
                         # regardless of direction.
                         first_run["leading"] = first_run.get("leading", 0.0) + left_edge
                         first_run["trailing"] = first_run.get("trailing", 0.0) + right_edge
@@ -1791,10 +1580,9 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
             item_tag = (getattr(item, "tagName", "") or "").lower()
             if (not child_runs and not dom._child_nodes(item)
                     and item_display == "inline" and item_tag not in box_model._REPLACED_OR_CONTROL_TAGS):
-                # CSS 2.1 9.2.1.1/10.8's empty-inline strut applies only to
-                # a plain, non-replaced `display:inline` -- an `inline-
-                # block`/replaced element keeps its own explicit width/
-                # height even with no content (CSS 2.1 10.3.10).
+                # CSS 2.1 9.2.1.1/10.8's empty-inline strut applies only to a
+                # plain non-replaced display:inline -- inline-block/replaced
+                # keeps its own explicit width/height even empty (10.3.10).
                 child_runs = [_empty_inline_strut_run(
                     item, left_edge, right_edge, top_edge_val, extra_height, margin_start,
                 )]
@@ -1867,10 +1655,9 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
     # boundaries. Preserve the pair adjustment across adjacent text owners.
     shaping_keys = ("font_family", "font_size", "font_weight", "font_style",
                     "letter_spacing", "word_spacing")
-    # CSS 2.1 16.6.1: collapsible spaces collapse across element
-    # boundaries too -- a run ending in a space followed by one starting
-    # with a space keeps just one (abspos-inline-001.xht: `<span>...text.
-    # </span>\n<span> The test...`, one 7.8px space in Chrome, not two).
+    # CSS 2.1 16.6.1: collapsible spaces collapse across element boundaries
+    # too -- a trailing-space run followed by a leading-space one keeps
+    # just one -- abspos-inline-001.xht.
     previous = None
     for run in runs:
         if run.get("break") or run.get("escapee"):
@@ -1909,23 +1696,18 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
 
 def _needs_inline_flow_grouping(child, child_style) -> bool:
     """Whether `child` still needs `_group_inline_element_runs`'s flex-row
-    simulation of real inline flow. An inline-level *tag* (`_is_inline_
-    level`) that CSS 2.1 9.2.1.1 has already split around an in-flow block
-    child (`_split_wrapping_inline_element` marks this on the element
-    itself via `_chromonic_split_container`, set every time it runs) no
-    longer needs it: `build()` already represents that element as an
-    ordinary block-flow Taffy node (ordinary sibling block pieces, not
-    real horizontal inline content), so wrapping it in a flex row here
-    would be both redundant and actively wrong -- CSS margins never
-    collapse across a flex formatting context, so a plain block sibling
-    after it could never collapse through the wrapper with the split's
-    own trailing margin, even though nothing here is really "inline"
-    content anymore. Confirmed directly: `<div class="container"><span>
-    <div class="first"></div></span><div class="second"></div></div>`
-    only collapsed margin-bottom/margin-top additively (70px) instead of
-    the correct `max()` (40px) until this exemption was added -- the
-    anonymous flex wrapper `_group_inline_element_runs` built around the
-    already-dissolved `<span>` was the collapse barrier."""
+    simulation of real inline flow. An inline-level tag that CSS 2.1
+    9.2.1.1 already split around an in-flow block child
+    (`_split_wrapping_inline_element` marks `_chromonic_split_container`
+    every time it runs) no longer needs it -- build() already represents
+    it as ordinary block-flow Taffy nodes, so wrapping it in a flex row
+    would be redundant and wrong: CSS margins never collapse across a flex
+    formatting context, so a plain block sibling after it could never
+    collapse through the wrapper with the split's trailing margin.
+    Confirmed: a container's margin-bottom/margin-top collapsed
+    additively instead of max() until this exemption was added -- the
+    anonymous flex wrapper around an already-dissolved <span> was the
+    collapse barrier."""
     return box_model._is_inline_level(child, child_style) and getattr(child, "_chromonic_split_container", None) is None
 
 
@@ -1958,16 +1740,10 @@ def _group_inline_element_runs(tree, parent, entries, parent_style, node_map, pr
         wrapper_style.update({"display": "flex", "flex_direction": "row", "flex_wrap": "nowrap",
                               "align_items": "baseline"})
         wrapper._chromonic_native_style = wrapper_style
-        # `_fix_flex_row_baseline_alignment` only corrects Taffy's own
-        # (sometimes wrong -- see that function's docstring) baseline
-        # cross-axis placement for a row it can find via this attribute;
-        # never set here before, so a run of consecutive real inline-level
-        # element siblings (not the separate mixed-text-and-elements `elif
-        # inline_items:` approximation, which already sets it) got no such
-        # correction at all. Confirmed on `wpt/css/CSS2/visudet/content-
-        # height-001.html`: three sibling `display:inline-block` divs with
-        # different `line-height`s (so genuinely different heights) landed
-        # at the wrong `y` relative to each other, silently unfixed.
+        # `_fix_flex_row_baseline_alignment` only corrects Taffy's baseline
+        # cross-axis placement for a row it can find via this attribute --
+        # a run of consecutive inline-level element siblings got no
+        # correction without it -- wpt/css/CSS2/visudet/content-height-001.html.
         wrapper._chromonic_flex_row_members = run_elements
         wrapper_id = (projection.upsert(wrapper, wrapper_style, run, None, None)
                       if projection else tree.new_with_children(wrapper_style, run))
@@ -1998,10 +1774,9 @@ def _parse_font_weight(value) -> float:
 
 def _resolved_line_height(value) -> "float | None":
     """`None` means "normal" -- let Parley use the font's own metrics-based
-    line height (its own default), rather than guessing one ourselves.
-    domonic already resolves an explicit `line-height` (unitless or not) to
-    a plain `"Npx"` string, so this is just `_fontmetrics.parse_length`
-    guarded against the unset/"normal" case."""
+    line height rather than guessing. domonic resolves an explicit
+    line-height to a plain "Npx" string, so this is just
+    `_fontmetrics.parse_length` guarded against the unset/normal case."""
     if not value or value == "normal":
         return None
     return _fontmetrics.parse_length(value, default=None)
@@ -2011,10 +1786,9 @@ def _resolved_line_height(value) -> "float | None":
 def _make_measure(paint_style: dict, text: str, element):
     """Real text layout via Parley (`chromonic._native.layout_text`) -- font
     matching, shaping, and genuine Unicode line-breaking. `font_family` is
-    read from `paint_style` (already extracted by `dom._describe`), not a
-    fresh `computed.fontFamily` access, to avoid re-resolving it. Parley's
-    job is strictly layout (line breaks, space needed), not painting --
-    `chromonic.fonts` separately resolves the actual Skia typeface."""
+    read from `paint_style` (already extracted by `dom._describe`), not
+    re-resolved from `computed.fontFamily`. Parley's job is strictly
+    layout; `chromonic.fonts` separately resolves the actual Skia typeface."""
     font_family = paint_style["font_family"]
     if font_family == "none":
         font_family = ""
@@ -2026,25 +1800,19 @@ def _make_measure(paint_style: dict, text: str, element):
     line_height = _resolved_line_height(paint_style["line_height"])
     word_break = (paint_style.get("word_break") or "normal").strip().lower()
     overflow_wrap = (paint_style.get("overflow_wrap") or "normal").strip().lower()
-    # CSS Sizing 3's min-content carve-out: `overflow-wrap: break-word`
-    # (unlike `anywhere`) must *not* shrink the min-content contribution
+    # CSS Sizing 3's min-content carve-out: overflow-wrap:break-word
+    # (unlike `anywhere`) must not shrink the min-content contribution
     # below "widest whole word" -- it only breaks a word that would
-    # otherwise overflow its line, which by definition never happens at
-    # a min-content query's own (infinitely narrow) constraint. `word-
-    # break: break-all` has no such carve-out; it always may break
-    # anywhere. Matches Parley's own `OverflowWrap::BreakWord` doc note
-    # ("treated differently for min-content sizing"); handled here
-    # rather than assumed inside Parley itself, since the `max_width:
-    # 1.0` call below is this function's own proxy for "give me min-
-    # content", not a dedicated min-content request Parley can key off.
+    # overflow its line, which never happens at min-content's own
+    # infinitely-narrow constraint. word-break:break-all has no such
+    # carve-out. Matches Parley's OverflowWrap::BreakWord doc note.
     breaks_within_words_at_min_content = word_break == "break-all" or overflow_wrap == "anywhere"
     ascent, descent, normal_height = fonts.text_metrics(font_family, font_size, font_weight >= 600, italic)
 
     def measure(available_width, available_height, _known_width=None, _known_height=None):
-        # `-1.0` is `src/lib.rs`'s sentinel for Taffy's `MinContent`
-        # request: wrap at every opportunity, so the reported width is
-        # the widest unbreakable piece (`white-space: nowrap`/`pre` text
-        # has no break opportunities -- its min-content is its max-content).
+        # -1.0 is src/lib.rs's sentinel for Taffy's MinContent request: wrap
+        # at every opportunity, so width is the widest unbreakable piece
+        # (white-space:nowrap/pre has no break opportunities).
         min_content = available_width is not None and available_width < 0
         if min_content:
             available_width = None
@@ -2058,14 +1826,11 @@ def _make_measure(paint_style: dict, text: str, element):
         )
         if (min_content and paint_style.get("white_space") not in ("pre", "nowrap")
                 and not breaks_within_words_at_min_content):
-            # A wrapped line's width from Parley keeps its trailing space
-            # (`"IT "` = 150px in 50px Ahem); the min-content width is the
-            # widest *word* (`"IT"` = 100px, Chrome's answer). Skipped
-            # above when `word-break`/`overflow-wrap` allow breaking
-            # *within* a word -- there, `width` already reflects that
-            # (the `max_width: 1.0` call above forces every break Parley
-            # will take), and re-measuring whole whitespace-delimited
-            # words here would silently ignore it, overstating min-content.
+            # A wrapped line's width from Parley keeps its trailing space;
+            # min-content is the widest word alone. Skipped when
+            # word-break/overflow-wrap allow breaking within a word --
+            # `width` already reflects that there, and re-measuring whole
+            # words would overstate min-content.
             words = [word for word in re.split(r"[ \t\n\r\f]+", text) if word]
             if words:
                 width = max(layout_text(word, font_family, font_size, font_weight=font_weight, italic=italic,
@@ -2074,22 +1839,18 @@ def _make_measure(paint_style: dict, text: str, element):
         if line_height is None and lines:
             # Chrome exposes integral line-box heights for platform fonts
             # while Parley's raw metrics are fractional -- normalize the
-            # implicit `normal` line box before it accumulates down a page.
+            # implicit normal line box before it accumulates down a page.
             lines = [(line_text, line_width, normal_height)
                      for line_text, line_width, _height in lines]
             height = normal_height * len(lines)
-        # stashed for paint.py -- the *only* record of how this text wrapped
-        # (and, now, its real per-line height); paint draws exactly these
-        # lines rather than re-wrapping or re-measuring itself.
+        # Stashed for paint.py -- the only record of how this text wrapped;
+        # paint draws exactly these lines rather than re-wrapping itself.
         element._chromonic_text_lines = [line_text for line_text, _line_width, _line_height in lines]
         line_widths = [line_width for _line_text, line_width, _line_height in lines]
-        # CSS Text 3 `text-align: justify`: every line but the last (unless
-        # `text-align-last` says otherwise) stretches to fill the line box
-        # -- paint.py doesn't yet re-space individual words to visually
-        # match (a real leaf here has no per-word gap bookkeeping the way
-        # `_InlineFormattingPlan` does), but the *reported* line width
-        # (hit-testing/`getClientRects()`) must still reflect the real,
-        # filled extent, not each line's own natural shrink-to-fit one.
+        # CSS Text 3 text-align:justify: every line but the last stretches
+        # to fill the line box -- paint.py doesn't re-space individual
+        # words, but the reported line width (hit-testing/getClientRects())
+        # must still reflect the real filled extent, not shrink-to-fit.
         if (len(line_widths) > 1 and (paint_style.get("text_align") or "").strip().lower() == "justify"
                 and available_width and 0 < available_width < 1_000_000):
             text_align_last = (paint_style.get("text_align_last") or "auto").strip().lower()
@@ -2101,16 +1862,11 @@ def _make_measure(paint_style: dict, text: str, element):
             ]
         element._chromonic_text_line_widths = line_widths
         element._chromonic_line_height = lines[0][2] if lines else font_size * 1.2
-        # `_fix_flex_row_baseline_alignment` needs this to re-assert the
-        # real measured content height onto a member of an `align-items:
-        # baseline` row -- Taffy's own cross-axis sizing for a custom
-        # `MeasureFunc` leaf doesn't reliably keep this method's own
-        # returned `height` once that alignment mode is in play (the same
-        # quirk `_InlineFormattingPlan.measure()`'s own leaves have,
-        # confirmed on `wpt/css/CSS2/visudet/inline-block-baseline-001.xht`:
-        # a `display:inline-block` `<span>`'s `line-height:5`-driven `75px`
-        # height came back `17px` -- this method itself, called directly
-        # with the same arguments, correctly returns `75`).
+        # `_fix_flex_row_baseline_alignment` needs this to re-assert the real
+        # measured content height onto an align-items:baseline row member --
+        # Taffy's cross-axis sizing for a custom MeasureFunc leaf doesn't
+        # reliably keep this method's own returned height once that
+        # alignment mode is in play -- wpt/css/CSS2/visudet/inline-block-baseline-001.xht.
         element._chromonic_measured_height = height
         return (width, height)
 
