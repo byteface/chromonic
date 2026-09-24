@@ -30,17 +30,14 @@ def _apply_linebox_strut_height(node_map: dict) -> None:
         if native is None:
             continue
         # A fixed-height container still places its atomics on each line's
-        # baseline (flex-wrap-002.html: 0px-tall inline-blocks in a 100px
-        # box sit 15px down, on the 20px line's baseline); only the
-        # container's own growth below is reserved for `height: auto`.
+        # baseline -- flex-wrap-002.html; only the container's own growth
+        # below is reserved for height:auto.
         height_auto = native.get("height") == "auto"
         resolved = getattr(element, "_chromonic_resolved_style", None)
         if resolved is not None and getattr(resolved[1].display, "value", "") in (
                 flex_grid._FLEX_DISPLAYS + ("grid", "inline-grid")):
             # A real flex/grid container has no line box: its inline-block
-            # children are flex/grid items (flex-direction-column.html:
-            # four stacked inline-block items were pulled back onto one
-            # "baseline" at the container's top).
+            # children are flex/grid items -- flex-direction-column.html.
             continue
         box = element.__dict__.get("_layout_box")
         if box is None:
@@ -66,9 +63,9 @@ def _apply_linebox_strut_height(node_map: dict) -> None:
                 break
             if tag_name in box_model._REPLACED_OR_CONTROL_TAGS and display in (
                     "block", "flex", "grid", "table", "list-item", "flow-root"):
-                # A replaced element made block-level (`img { display:
-                # block }`, empty-cells-007.xht) is a block box: no line
-                # box, no strut, nothing to sit on a baseline.
+                # A replaced element made block-level (img{display:block},
+                # empty-cells-007.xht) is a block box: no line box, no
+                # strut, nothing to sit on a baseline.
                 atomic_children = None
                 break
             vertical_align = (getattr(computed, "verticalAlign", "") or "baseline").strip().lower()
@@ -97,12 +94,11 @@ def _apply_linebox_strut_height(node_map: dict) -> None:
         for child, child_box in atomic_children:
             child_native = getattr(child, "_chromonic_native_style", None) or {}
             margin = child_native.get("margin") or (0.0, 0.0, 0.0, 0.0)
-            # `vertical-align:baseline` on an atomic box aligns its own
-            # baseline to the line's (CSS 2.1 10.8.1): a replaced box's or
-            # an empty inline-block's is its bottom margin edge; an
-            # inline-block with text sits on its last line's baseline
-            # (absolute-non-replaced-width-017.xht: a 120px inline-block
-            # of 30px/4 text makes a 120px line, not 171).
+            # vertical-align:baseline on an atomic box aligns its baseline
+            # to the line's (CSS 2.1 10.8.1): a replaced box's or empty
+            # inline-block's is its bottom margin edge; an inline-block
+            # with text sits on its last line's baseline --
+            # absolute-non-replaced-width-017.xht.
             own = box_model._element_own_baseline(child)
             if own is None:
                 child_above = child_box.height + box_model._numeric_edge(margin[0]) + box_model._numeric_edge(margin[2])
@@ -113,12 +109,11 @@ def _apply_linebox_strut_height(node_map: dict) -> None:
             aboves[id(child)] = child_above
             belows[id(child)] = child_below
         # The atomics wrap into line boxes (the flex-row approximation's
-        # own `flex-wrap: wrap` rows): a new line starts where x turns
-        # back, or fails to advance while y moves on. Each line is at
-        # least one strut tall and stacks under the previous one -- the
-        # old single-line reading pulled every wrapped row onto the first
-        # baseline (flex-wrap-002.html: five 25px inline-blocks in a 50px
-        # box are three lines, 20px apart).
+        # flex-wrap:wrap rows): a new line starts where x turns back, or
+        # fails to advance while y moves on. Each line is at least one
+        # strut tall and stacks under the previous one -- the old
+        # single-line reading pulled every wrapped row onto the first
+        # baseline -- flex-wrap-002.html.
         lines: list = []
         current: list = []
         prev_x = prev_bottom = None
@@ -137,10 +132,9 @@ def _apply_linebox_strut_height(node_map: dict) -> None:
         if current:
             lines.append(current)
         # Each atomic box sits with its bottom margin edge on its line's
-        # baseline, `max_above` below the line top (CSS 2.1 10.8.1) --
-        # Taffy's own baseline placement only knows the boxes, not the
-        # strut (empty-cells-008.xht: a 0x0 `<img>` in an otherwise empty
-        # cell reports its top at the baseline, 14px down, not centred).
+        # baseline, max_above below the line top (CSS 2.1 10.8.1) --
+        # Taffy's baseline placement only knows the boxes, not the strut --
+        # empty-cells-008.xht.
         content_top = box.y + box.border_top + element.__dict__.get("_chromonic_padding", (0.0,) * 4)[0]
         line_top = content_top
         for line in lines:
@@ -157,22 +151,20 @@ def _apply_linebox_strut_height(node_map: dict) -> None:
         if not height_auto or needed_height <= box.height + 0.01:
             continue
         delta = needed_height - box.height
-        # Grown through `geometry._grow_and_reflow`: whatever follows moves down and
-        # every auto-height ancestor grows with it (empty-cells-008.xht: a
-        # cell holding only a 0x0 image is one strut tall, and so are its
-        # row and table).
+        # Grown through `geometry._grow_and_reflow`: whatever follows moves down
+        # and every auto-height ancestor grows with it -- empty-cells-008.xht.
         geometry._grow_and_reflow(element, delta)
 
 
 
 def _apply_empty_inline_block_min_height(node_map: dict) -> None:
-    """A genuinely empty `display:inline-block` box still measures
-    `height:auto` as one line's worth of its own font/line-height, not
-    zero -- unlike a plain non-replaced `display:inline`, whose *shared*
-    ancestor line can legitimately collapse to zero when empty (CSS 2.1
-    9.4.2), an inline-block always establishes its own self-contained
-    formatting context, whose line box exists even with nothing in it.
-    `build()`'s childless fallback gives it no such machinery on its own."""
+    """A genuinely empty display:inline-block box still measures
+    height:auto as one line's worth of font/line-height, not zero --
+    unlike a plain non-replaced display:inline, whose shared ancestor line
+    can legitimately collapse to zero when empty (CSS 2.1 9.4.2), an
+    inline-block always establishes its own formatting context, whose line
+    box exists even with nothing in it. build()'s childless fallback gives
+    it no such machinery on its own."""
     for element in node_map.values():
         if not dom._is_element(element):
             continue
@@ -186,22 +178,21 @@ def _apply_empty_inline_block_min_height(node_map: dict) -> None:
         box = element.__dict__.get("_layout_box")
         if box is None:
             continue
-        # CSS 2.1 10.6.1/10.6.7: a block container with *no* line boxes is
-        # zero tall -- a genuinely empty inline-block (no child node with
-        # any content: `css-flexbox/flex-wrap-002.html`'s `<div style=
-        # "width: 25px; display: inline-block"></div>` is 25x0 in Chrome)
-        # has no line box to be one line tall. Only an inline-block with
-        # some content, laid out shorter than a line, is corrected here.
+        # CSS 2.1 10.6.1/10.6.7: a block container with no line boxes is
+        # zero tall -- a genuinely empty inline-block has no line box to be
+        # one line tall -- css-flexbox/flex-wrap-002.html. Only an
+        # inline-block with some content, laid out shorter than a line, is
+        # corrected here.
         if not any(
                 (getattr(node, "nodeType", None) == dom.TEXT_NODE
                  and dom._collapsed_text_node(node).strip(inline_formatting._CSS_WHITESPACE_STRIP_CHARS))
                 or dom._is_element(node)
                 for node in dom._child_nodes(element)):
             continue
-        # Deliberately not gated on `_chromonic_has_layout_children` --
-        # that flag can be set for degenerate content too. What matters is
-        # only whether the box ended up shorter than one line, checked
-        # below against `needed_height`.
+        # Deliberately not gated on `_chromonic_has_layout_children` -- that
+        # flag can be set for degenerate content too. What matters is only
+        # whether the box ended up shorter than one line, checked below
+        # against needed_height.
         paint_style = getattr(element, "_chromonic_paint_style", None) or {}
         font_size = _fontmetrics.parse_length(paint_style.get("font_size"), default=16.0)
         family = paint_style.get("font_family", "") or ""
@@ -250,24 +241,19 @@ def _merge_adjacent_same_line_rects(rects) -> list:
 def _resync_interruption_marker_heights(node_map: dict) -> None:
     """`_finalize_inline_owner_boxes` builds each CSS 2.1 9.2.1.1
     interruption marker's rect from its block's `_layout_box` height at
-    that point in the pipeline -- before the float-auto-height
-    corrections (`_fix_float_flow_container_auto_height`/`_fix_nested_bfc_
-    float_auto_height`, both run after `_publish_inline_formatting`) have
-    had a chance to zero out a float-only block's own contribution. A
-    block whose in-flow content is nothing but a float (CSS 2.1 9.5: a
-    float doesn't contribute to its containing block's auto-height) still
-    got its pre-correction, float-inflated height baked into the marker,
-    and so did the owner's own bounding box built from it.
+    that point in the pipeline -- before the float-auto-height corrections
+    (`_fix_float_flow_container_auto_height`/`_fix_nested_bfc_float_auto_height`,
+    both run after `_publish_inline_formatting`) have zeroed out a
+    float-only block's contribution (CSS 2.1 9.5: a float doesn't
+    contribute to auto-height). That pre-correction, float-inflated
+    height got baked into the marker and the owner's bounding box.
 
-    Patches each marker rect's height back in sync with the block's real,
-    final height now that it's known, and re-derives the owner's own
-    bounding box from the corrected rects the same way `_finalize_inline_
-    owner_boxes` first did -- idempotent, so a block whose height didn't
-    actually change after all is simply a no-op. A *nested* split wrapper
-    (CSS 2.1 9.2.1.1, see `_split_wrapping_inline_element`'s docstring)
-    never appears in `node_map` itself -- reached instead the same way
+    Patches each marker rect's height back in sync with the block's real
+    final height, and re-derives the owner's bounding box the same way
+    `_finalize_inline_owner_boxes` first did -- idempotent. A nested split
+    wrapper never appears in `node_map` itself -- reached the same way
     `_fix_nested_split_flow_extent` reaches it, via each interruption
-    block's own `_chromonic_split_wrapper_ref` back-reference."""
+    block's `_chromonic_split_wrapper_ref` back-reference."""
     seen_ids: set = set()
     for node in list(node_map.values()) + [
         node.__dict__.get("_chromonic_split_wrapper_ref")
@@ -298,10 +284,9 @@ def _resync_interruption_marker_heights(node_map: dict) -> None:
         if not changed:
             continue
         owner.__dict__["_chromonic_inline_boxes"] = rects
-        # Same all-degenerate fallback as `_finalize_inline_owner_boxes`
-        # (see its own comment) -- kept in sync here since this can be the
-        # pass that *makes* every rect degenerate (a float-only marker
-        # zeroing out).
+        # Same all-degenerate fallback as `_finalize_inline_owner_boxes` --
+        # kept in sync here since this can be the pass that makes every
+        # rect degenerate (a float-only marker zeroing out).
         bounding_rects = [r for r in rects if r[2] != 0.0 and r[3] != 0.0] or rects[-1:]
         left = min(r[0] for r in bounding_rects); top = min(r[1] for r in bounding_rects)
         right = max(r[0] + r[2] for r in bounding_rects); bottom = max(r[1] + r[3] for r in bounding_rects)
@@ -373,23 +358,21 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
     """Merge each inline owner's accumulated fragment rects -- gathered
     across every `_InlineFormattingPlan` that published fragments for it
     (CSS 2.1 9.2.1.1's split contributes from multiple independent plans
-    belonging to the same owner) -- into its final `_chromonic_inline_
-    boxes`/`_layout_box`/`_chromonic_owned_fragments`, once per owner per pass.
+    belonging to the same owner) -- into its final _chromonic_inline_boxes/
+    _layout_box/_chromonic_owned_fragments, once per owner per pass.
 
-    Rects are grouped by split segment (`run["split_group"]`) rather than
-    merged as one re-sorted list -- `getClientRects()` preserves document
+    Rects are grouped by split segment (run["split_group"]) rather than
+    merged as one re-sorted list -- getClientRects() preserves document
     order, not a geometric sort.
 
     CSS 2.1 9.2.1: an inline's line-box fragments cover nested inline
     descendants' content too -- each owner's merged rects are folded into
     every tracked inline ancestor's, deepest owner first."""
-    # An inline wrapper flattened into the plan with no text of its own
-    # (`<span class="test"><span>FAILED</span></span>`) is never a
-    # fragment owner, so it would get no box at all -- Chrome reports
-    # its descendants' union (abspos-inline-003.xht, where that span is
-    # also the containing block of an absolutely positioned child). It
-    # borrows its descendants' rects here; `_chromonic_native_style` set
-    # means the element has a real Taffy box already and stops the walk.
+    # An inline wrapper flattened into the plan with no text of its own is
+    # never a fragment owner, so it would get no box at all -- Chrome
+    # reports its descendants' union -- abspos-inline-003.xht. It borrows
+    # its descendants' rects here; _chromonic_native_style set means the
+    # element has a real Taffy box already and stops the walk.
     for key, (owner, groups, _fragments) in list(owner_accum.items()):
         if not groups:
             continue
@@ -397,7 +380,7 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
         while parent is not None and _is_flattened_inline(parent):
             entry = owner_accum.get(id(parent))
             if entry is None:
-                # Only an ancestor with no fragments of its own: one that
+                # Only an ancestor with no fragments of its own -- one that
                 # has some folds its descendants into them below instead.
                 entry = owner_accum[id(parent)] = (parent, {}, [])
                 for group_key, rects in groups.items():
@@ -419,8 +402,8 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
             node = getattr(node, "parentElement", None)
         return depth
 
-    # `descendant_only[key]`: every rect contributed by `key`'s inline
-    # descendants, excluding `key`'s own -- kept separate since only the
+    # descendant_only[key]: every rect contributed by key's inline
+    # descendants, excluding key's own -- kept separate since only the
     # horizontal extent folds upward, never the vertical.
     descendant_only = {key: [] for key in own_merged}
     for key in sorted(own_merged, key=lambda key: _depth(owner_accum[key][0]), reverse=True):
@@ -445,9 +428,8 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
         if desc:
             desc_left = min(r[0] for r in desc)
             desc_right = max(r[0] + r[2] for r in desc)
-            # Vertically too: a `position: relative` descendant's shifted
-            # box stretches its inline ancestor's rect (position-relative-
-            # 032.xht: a span holding a `top: 25px` span is 43px tall).
+            # Vertically too: a position:relative descendant's shifted box
+            # stretches its inline ancestor's rect -- position-relative-032.xht.
             desc_top = min(r[1] for r in desc)
             desc_bottom = max(r[1] + r[3] for r in desc)
             all_merged = [
@@ -458,12 +440,11 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
             ]
         else:
             all_merged = own_merged[key]
-        # `getClientRects()`: real Chrome exposes one extra rect per in-flow
+        # getClientRects(): real Chrome exposes one extra rect per in-flow
         # block interruption (CSS 2.1 9.2.1.1) -- the anonymous block box
-        # wrapping the real interrupting block, not the block's own
-        # (possibly narrower) box. It's `width:auto`, 100% of `owner`'s
-        # containing block, on top of (not merged with) the real leading/
-        # trailing fragments, at its logical split position.
+        # wrapping the interrupting block, not the block's own (possibly
+        # narrower) box. It's width:auto, 100% of owner's containing
+        # block, on top of the real leading/trailing fragments.
         interruption_blocks = getattr(owner, "_chromonic_interruption_blocks", None) or ()
         if interruption_blocks:
             container = getattr(owner, "_chromonic_split_container", None)
@@ -476,29 +457,17 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
             self_left, self_right, self_top = self_edges or (0.0, 0.0, 0.0)
             if self_edges and merged_groups:
                 # `owner` is a real Taffy node here (the direct-child split
-                # shape), so *every* one of its text-leaf children -- not
-                # just the leading segment's -- already sits physically
-                # shifted right by `owner`'s own real border-left/padding-
-                # left/top (Taffy applies that to every child alike).
-                # Every rect in every group needs that same shift undone
-                # first -- otherwise a trailing segment (which only ever
-                # gains *width* below, never its own position correction)
-                # stays off by that same amount, on both axes: `top_edge_
-                # val` is never zeroed out of `box_height` (a one-way
-                # addition, so it can't double-count there), but the
-                # *position* it feeds into (`owner_y` in `publish()`)
-                # cancels back to the leaf's own already-shifted position
-                # exactly the way the horizontal one does. Only *after*
-                # undoing the horizontal shift uniformly does the real
-                # edge apply once more, correctly, to only the true
-                # leading/trailing rects: left-widening the very first
-                # rect of the first (leading) group, right-widening the
-                # very last rect of the last (trailing) one -- exactly
-                # which fragments a real inline box's own edges ever show
-                # up on. The vertical shift has no such edge-widening
-                # counterpart -- every segment's own `box_height` already
-                # carries the *full* top+bottom edge unconditionally, so
-                # only the position needs correcting, everywhere.
+                # shape), so every one of its text-leaf children already
+                # sits physically shifted right by owner's own real
+                # border-left/padding-left/top (Taffy applies that to every
+                # child alike). Every rect in every group needs that shift
+                # undone first, then the real edge re-applied only to the
+                # true leading/trailing rects: left-widening the first rect
+                # of the leading group, right-widening the last rect of the
+                # trailing one -- exactly which fragments a real inline
+                # box's edges show up on. The vertical shift has no such
+                # edge-widening counterpart -- every segment's box_height
+                # already carries the full top+bottom edge unconditionally.
                 if self_top:
                     merged_groups = [
                         [(rx, ry - self_top, rw, rh) for rx, ry, rw, rh in group]
@@ -526,14 +495,11 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
             atomic_segment_elements = getattr(owner, "_chromonic_atomic_segment_elements", None) or {}
             for index, group in enumerate(merged_groups):
                 atomic_nodes = atomic_segment_elements.get(group_keys[index])
-                # An *interior* segment (between two interruption blocks,
-                # never the wrapper's own true leading/trailing one) with
-                # no real content of its own -- no text, no atomic element,
-                # nothing -- gets no fragment of its own in real Chrome:
-                # nothing there ever generated an anonymous inline box to
-                # begin with. The leading/trailing 0x0 case is different
-                # (kept as-is) -- that one *is* a real, if empty, fragment
-                # of the wrapper's own remaining content on that side.
+                # An interior segment (between two interruption blocks) with
+                # no real content gets no fragment of its own in real
+                # Chrome. The leading/trailing 0x0 case is different -- that
+                # one is a real, if empty, fragment of the wrapper's own
+                # remaining content on that side.
                 interior_empty = (
                     not atomic_nodes and 0 < index < len(merged_groups) - 1
                     and len(group) == 1 and group[0][2] == 0.0 and group[0][3] == 0.0
@@ -554,13 +520,12 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
                     if block_box is not None and container_box is not None:
                         block_y = block_box.y
                         if container is owner:
-                            # The direct-child shape: `container` is `owner`
-                            # itself, forced to `width:100%` of its own
-                            # containing block, so the marker uses the
-                            # whole border box, uninset by `owner`'s own
-                            # edges (never carried by the anonymous block
-                            # box). `block_box.y` still needs the same
-                            # border-top correction the text rects got.
+                            # The direct-child shape: container is owner
+                            # itself, forced to width:100% of its own
+                            # containing block, so the marker uses the whole
+                            # border box, uninset by owner's own edges.
+                            # block_box.y still needs the same border-top
+                            # correction the text rects got.
                             marker_x = container_box.x
                             marker_width = container_box.width
                             block_y = block_y - self_top
@@ -568,17 +533,13 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
                             marker_x = container_box.x + container_box.border_left + cpl
                             marker_width = container_box.client_width - cpl - cpr
                         # CSS 2.1 9.2.1.1's anonymous block box wraps the
-                        # real interrupting block, but the marker rect
-                        # reports the block's own border box, not a
-                        # margin-inflated union -- margin still participates
-                        # in block-flow spacing, but isn't part of any
-                        # box's own border-box geometry or hit region.
+                        # interrupting block, but the marker rect reports
+                        # the block's own border box, not a margin-inflated
+                        # union.
                         marker_rect = (marker_x, block_y, marker_width, block_box.height)
                         # Two markers with a skipped, genuinely-empty
-                        # interior segment between them (just above) are
-                        # visually contiguous -- nothing (no line box) ever
-                        # separated them, so real Chrome reports them as
-                        # one merged rect, not two back to back.
+                        # interior segment between them are visually
+                        # contiguous -- Chrome reports one merged rect.
                         prev = final_rects[-1] if final_rects else None
                         if (interior_empty and prev is not None
                                 and abs(prev[0] - marker_rect[0]) < 0.01
@@ -597,15 +558,12 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
             all_merged = final_rects  # the block interruption also grows getBoundingClientRect()
         else:
             owner.__dict__["_chromonic_inline_boxes"] = all_merged
-        # `getBoundingClientRect()` unions every `getClientRects()` rect
-        # except zero-width/height ones -- `all_merged`/`final_rects`
-        # themselves stay unfiltered (a zero-sized rect is a real fragment
-        # there); only the union bounds here drop them. When *every* rect
-        # is degenerate (e.g. a float-only interruption block whose marker
-        # legitimately collapses to 0 height, CSS 2.1 9.5), real Chrome's
-        # own bounding rect isn't a union of their differing positions --
-        # confirmed empty (0x0) at the position of the *last* one, not a
-        # box spanning from the first to the last.
+        # getBoundingClientRect() unions every getClientRects() rect except
+        # zero-width/height ones -- all_merged/final_rects themselves stay
+        # unfiltered; only the union bounds here drop them. When every rect
+        # is degenerate (e.g. a float-only interruption marker collapsing
+        # to 0 height, CSS 2.1 9.5), Chrome's bounding rect is 0x0 at the
+        # position of the last one, not a union spanning first to last.
         bounding_rects = [r for r in all_merged if r[2] != 0.0 and r[3] != 0.0] or all_merged[-1:]
         left = min(r[0] for r in bounding_rects); top = min(r[1] for r in bounding_rects)
         right = max(r[0] + r[2] for r in bounding_rects); bottom = max(r[1] + r[3] for r in bounding_rects)
@@ -642,17 +600,15 @@ def _publish_inline_formatting(node_map) -> None:
 
 
 def _fix_split_inline_relative_offset(owners) -> None:
-    """CSS 2.1 9.4.3: `position:relative`'s `top`/`left` offset shifts
-    every box an element generates -- for a split inline (CSS 2.1
-    9.2.1.1), that includes the real block child's own box too. `wrapper`
-    (the split inline) is never built as a real Taffy node, so Taffy's own
-    `position:relative` handling never sees it -- reapplied by hand here,
-    after `_finalize_inline_owner_boxes` has published `wrapper`'s own
-    fragment geometry.
+    """CSS 2.1 9.4.3: position:relative's top/left offset shifts every box
+    an element generates -- for a split inline (9.2.1.1), that includes
+    the real block child's own box too. The split wrapper is never built
+    as a real Taffy node, so Taffy's own position:relative handling never
+    sees it -- reapplied by hand here, after `_finalize_inline_owner_boxes`
+    has published its fragment geometry.
 
     Takes the owners `_finalize_inline_owner_boxes` just published rather
-    than walking `node_map` -- a nested split wrapper never appears there
-    at all."""
+    than walking `node_map` -- a nested split wrapper never appears there."""
     for owner in owners:
         interruption_blocks = getattr(owner, "_chromonic_interruption_blocks", None)
         if not interruption_blocks:
@@ -693,17 +649,16 @@ def _fix_split_inline_relative_offset(owners) -> None:
 
 def _fix_nested_split_flow_extent(node_map: dict) -> None:
     """A nested CSS 2.1 9.2.1.1 split wrapper (never a real Taffy node)
-    still gets a `_layout_box` published for it -- the visual union of
-    every generated fragment, border/padding decoration included, which
-    can be taller than the real vertical space those fragments occupy in
-    ordinary block flow (an edge fragment's border can overlap an
-    adjoining one). An ancestor's auto-height must not read it directly.
+    still gets a `_layout_box` published -- the visual union of every
+    generated fragment, border/padding decoration included, which can be
+    taller than the real vertical space those fragments occupy in
+    ordinary block flow. An ancestor's auto-height must not read it directly.
 
     Computes a second, decoration-free box instead -- the real block-flow
-    extent: the interruption blocks' own final top/bottom edges, extended
-    by whichever edge fragments contributed real flow height. Ordinary
-    sequential stacking, so it can't overlap; `_adjust_body_collapsed_
-    margins` prefers this when present."""
+    extent: the interruption blocks' final top/bottom edges, extended by
+    whichever edge fragments contributed real flow height. Ordinary
+    sequential stacking, so it can't overlap; `_adjust_body_collapsed_margins`
+    prefers this when present."""
     seen_wrappers: set = set()
     for node in node_map.values():
         if not dom._is_element(node):
