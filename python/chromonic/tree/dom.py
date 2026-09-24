@@ -26,10 +26,10 @@ def _layout_parent(node):
 
 
 class _PseudoElement:
-    """A `::before`/`::after` generated box -- not a real DOM node, just
-    enough surface for `build()`/`paint.py` to treat it like a childless
-    element. Never appears in real `childNodes` -- reached only via
-    `_inline_mixed_content`'s synthesized items and `_chromonic_inline_fragments`."""
+    """A ::before/::after generated box -- not a real DOM node, just enough
+    surface for build()/paint.py to treat it like a childless element.
+    Never appears in real childNodes -- reached only via
+    `_inline_mixed_content`'s synthesized items and _chromonic_inline_fragments."""
 
     def __init__(self, owner, which):
         self.owner = owner
@@ -64,16 +64,10 @@ def _get_pseudo_object(element, which: str) -> "_PseudoElement":
 
 
 # Metadata/logic tags a real browser hardcodes as never painting a box;
-# domonic's cascade gives these no such default on its own. `colgroup`/`col`
-# (CSS 2.1 17.2.1: `display:table-column-group`/`table-column` "are not
-# rendered" -- they exist purely as column-styling/-sizing metadata, never a
-# box) belong here too: without it, they fell through to ordinary block
-# treatment, taking a real flow position and height between a table's
-# `<caption>` and its row-groups -- confirmed directly on a `<colgroup>` +
-# `<thead>`/`<tbody>`/`<tfoot>` table, where the extra slot corrupted the
-# header/body/footer reordering (CSS 2.1 17.5.3) badly enough that `<tbody>`
-# ended up overlapping `<colgroup>`'s claimed position and `<thead>` landed
-# *above* the caption instead of below it.
+# domonic's cascade gives these no default of its own. colgroup/col (CSS
+# 2.1 17.2.1: "are not rendered") belong here too -- without it they fell
+# through to ordinary block treatment, corrupting header/body/footer
+# reordering (17.5.3) badly enough that thead landed above the caption.
 _NON_RENDERING_TAGS = frozenset({
     "script", "style", "head", "title", "meta", "link", "noscript", "template",
     "colgroup", "col",
@@ -103,22 +97,17 @@ def _child_nodes(element):
 
 
 def _element_direction(element, computed=None) -> str:
-    """CSS `direction`'s real used value for `element`. An explicit author
-    CSS declaration (inherited normally -- domonic's own cascade already
-    handles that correctly) always wins. But domonic's cascade has no
-    UA-stylesheet mapping for HTML's own `dir` attribute at all (a real UA
-    rule every browser has, `[dir=rtl] { direction: rtl }`), and no
-    attribute-selector support to add one via `ua_style.py` either
-    (verified directly: `[dir="rtl"] {...}` never matches in domonic) --
-    so a plain `<section dir="rtl">`, with no CSS `direction` anywhere,
-    resolves `ltr` here, silently wrong. Falls back to walking the DOM for
-    the attribute directly (nearest ancestor-or-self, mirroring its own
-    real inheritance) only when the cascade resolved plain `ltr` -- which
-    it only ever does when no CSS rule set `direction` anywhere up the
-    chain (proven by the explicit-CSS case correctly resolving `rtl`
-    through this same inheritance), so this can't shadow a real author
-    declaration except the rare, self-contradictory case of *also* writing
-    literal `direction: ltr` on top of a `dir="rtl"` attribute."""
+    """CSS direction's real used value for `element`. An explicit author
+    CSS declaration (inherited normally by domonic's own cascade) always
+    wins. But domonic's cascade has no UA-stylesheet mapping for HTML's
+    dir attribute at all (every real browser has `[dir=rtl] {
+    direction:rtl }`), and no attribute-selector support to add one via
+    `ua_style.py` -- so a plain `<section dir="rtl">` with no CSS direction
+    resolves ltr here, silently wrong. Falls back to walking the DOM for
+    the attribute directly only when the cascade resolved plain ltr, which
+    can't shadow a real author declaration except the rare
+    self-contradictory case of also writing `direction:ltr` on a
+    `dir="rtl"` attribute."""
     if computed is None:
         computed = getattr(element, "_chromonic_computed_style", None)
     resolved = (getattr(computed, "direction", "ltr") or "ltr").strip().lower() if computed is not None else "ltr"
@@ -136,11 +125,10 @@ def _element_direction(element, computed=None) -> str:
 
 
 def _extract_paint_style(computed) -> dict:
-    """The handful of paint-only properties `paint.py` needs, read out of
-    `computed` exactly once here and cached as plain strings -- a
-    `ComputedStyleDeclaration` attribute access re-resolves from the
-    underlying style text on every access, so without this every repaint
-    (not just relayout) re-parses every element's colours/fonts from scratch."""
+    """The handful of paint-only properties paint.py needs, read out of
+    `computed` once and cached as plain strings -- a ComputedStyleDeclaration
+    attribute access re-resolves from the underlying style text every time,
+    so without this every repaint re-parses every element's colours/fonts."""
     raw = computed._resolved.get
 
     def raw_or_computed(name: str) -> str:
@@ -237,23 +225,16 @@ def _extract_generated_content(element, computed_cache):
 
     chain_cache = computed_cache.setdefault("_chromonic_chain_cache", {})
 
-    # domonic's own rule index (built the moment any element's *real*
-    # `ComputedStyleDeclaration` resolves on this `chain_cache` -- always
-    # true here, since `_describe()` resolves `element`'s own style right
-    # before calling this) tracks which pseudo-element names any selector
-    # in the document's stylesheets targets at all (see `_build_rule_index`
-    # in domonic/style.py). Most pages never author a `::before`/`::after`
-    # rule, so when neither name is in that set, skip building *two* full
-    # `ComputedStyleDeclaration`s (each its own cascade resolution) just to
-    # learn `content` is the initial `normal` on both. Safe for the rest of
-    # this layout pass: `chain_cache` is fresh per pass and nothing mutates
-    # the DOM/stylesheets mid-pass (see the module docstring), so once this
-    # entry is populated its pseudo-name set can't go stale before the next
-    # `layout()` call builds a new `chain_cache` from scratch. If the entry
-    # isn't populated yet (rare -- would need this to be a per-element style
-    # cache hit that skipped the cascade, and no earlier element this pass
-    # to have populated it either), fall through to the full resolution
-    # below; that's always correct, just not the fast path.
+    # domonic's own rule index (built the moment any element's real
+    # ComputedStyleDeclaration resolves, always true here since _describe()
+    # already resolved element's own style) tracks which pseudo-element
+    # names any selector in the document's stylesheets targets --
+    # `_build_rule_index` in domonic/style.py. Most pages never author a
+    # ::before/::after rule, so when neither name is in that set, skip
+    # building two full ComputedStyleDeclarations just to learn content is
+    # normal on both. Safe for the rest of this pass: chain_cache is fresh
+    # per pass and nothing mutates the DOM/stylesheets mid-pass. If the
+    # entry isn't populated yet, fall through to the full resolution below.
     rule_index_entry = chain_cache.get("__rule_index__")
     if rule_index_entry is not None:
         pseudo_names = rule_index_entry[2]
@@ -281,20 +262,20 @@ def _extract_generated_content(element, computed_cache):
 
 def _describe(element, computed_cache=None, *, reuse_styles=False):
     """`(ComputedStyleDeclaration, LayoutStyle)` for `element`. Stashes the
-    `ComputedStyleDeclaration` and its extracted paint style on the element
-    itself so `paint.py`'s later walk, and a repaint with no relayout in
+    ComputedStyleDeclaration and its extracted paint style on the element
+    itself so paint.py's later walk, and a repaint with no relayout in
     between, don't re-resolve either.
 
-    `reuse_styles=True` skips resolving CSS entirely if a prior resolution
-    (`element._chromonic_resolved_style`) exists, reusing it as-is -- CSS
-    resolution, not Taffy, dominates relayout cost (domonic re-parses every
-    selector from scratch, uncached), so a relayout triggered by something
-    that can't have changed any element's class/inline-style/stylesheets
-    (an image arriving, a same-bucket resize) passes this to skip it.
+    reuse_styles=True skips resolving CSS entirely if a prior resolution
+    (element._chromonic_resolved_style) exists, reusing it as-is -- CSS
+    resolution, not Taffy, dominates relayout cost, so a relayout
+    triggered by something that can't have changed any element's
+    class/inline-style/stylesheets (an image arriving, a same-bucket
+    resize) passes this to skip it.
 
-    `computed_cache` holds our own `(computed, style_obj)` tuples keyed by
-    `id(element)`, kept separate from domonic's own `_chain_cache` (which
-    expects bare `ComputedStyleDeclaration` values) under a nested dict."""
+    computed_cache holds our own (computed, style_obj) tuples keyed by
+    id(element), kept separate from domonic's own _chain_cache (which
+    expects bare ComputedStyleDeclaration values) under a nested dict."""
     cache = {} if computed_cache is None else computed_cache
     cached = cache.get(id(element))
     if cached is not None:
@@ -302,8 +283,8 @@ def _describe(element, computed_cache=None, *, reuse_styles=False):
 
     synthetic = element.__dict__.get("_chromonic_synthetic_style") if hasattr(element, "__dict__") else None
     if synthetic is not None:
-        # An anonymous table box (`_AnonymousTableBox`): no cascade to run,
-        # its style was synthesized from its parent's when it was generated.
+        # An anonymous table box (_AnonymousTableBox): no cascade to run,
+        # its style was synthesized from its parent's when generated.
         element._chromonic_computed_style = synthetic[0]
         element._chromonic_resolved_style = synthetic
         cache[id(element)] = synthetic
@@ -319,9 +300,9 @@ def _describe(element, computed_cache=None, *, reuse_styles=False):
     # domonic's default cache only spans one element's ancestor walk.
     chain_cache = cache.setdefault("_chromonic_chain_cache", {})
     computed = ComputedStyleDeclaration(element, _chain_cache=chain_cache)
-    # domonic's `_parent_computed()` only reads `chain_cache`, never
-    # registers itself in it -- without this, a child resolved right after
-    # `element` would build a second, separate `ComputedStyleDeclaration` for it.
+    # domonic's _parent_computed() only reads chain_cache, never registers
+    # itself in it -- without this, a child resolved right after element
+    # would build a second, separate ComputedStyleDeclaration for it.
     chain_cache[id(element)] = computed
     style_obj = LayoutStyle.from_computed(computed)
     element._chromonic_computed_style = computed
@@ -341,37 +322,25 @@ def _describe(element, computed_cache=None, *, reuse_styles=False):
 
 
 
-#: CSS 2.1 17.2.1: `table-column`/`table-column-group` "are not rendered"
-#: -- no box at all, same as `display:none` for box-generation purposes,
-#: whether reached via a literal `<colgroup>`/`<col>` tag (already excluded
-#: earlier, by tag, in `_NON_RENDERING_TAGS`) or an arbitrary element
-#: authored with one of these two `display` values directly (`_renders`
-#: is the computed-style-driven check for exactly that latter case, since
-#: `_NON_RENDERING_TAGS`'s tag-based check runs *before* any style is even
-#: resolved and so can't see it).
+#: CSS 2.1 17.2.1: table-column/table-column-group "are not rendered" --
+#: no box at all, same as display:none, whether via a literal
+#: colgroup/col tag (`_NON_RENDERING_TAGS`) or an arbitrary element authored
+#: with one of these display values directly (`_renders` covers that case).
 _NON_RENDERING_DISPLAYS = frozenset({"table-column", "table-column-group"})
 
 
 
 def _renders(style_obj) -> bool:
     """Whether an element already known to be an ordinary rendering tag (see
-    `_NON_RENDERING_TAGS`, checked by the caller before this) should still be
-    walked into the Taffy tree -- false for anything the cascade resolved to
-    `display: none` (a real browser's "don't lay this out, don't paint it,
-    don't hit-test it" is exactly `display: none`), or to `table-column`/
-    `table-column-group` (see `_NON_RENDERING_DISPLAYS`), *unless* this box
-    is absolutely positioned. CSS 2.1 9.7 blockifies `display` for any
-    `position:absolute`/`fixed` box regardless of its specified value (with
-    `none` the only exception, already handled above) -- an author-written
-    `display: table-column-group` on an absolutely positioned element
-    computes to `block`, a perfectly ordinary rendered box, not the
-    17.2.1 "not rendered" rule this function otherwise applies to a literal
-    (in-flow) `table-column`/`table-column-group`. Confirmed directly on
-    `bottom-applies-to-005.xht`: unfixed, such an element was dropped
-    entirely (never even reaching Taffy), instead of rendering as an
-    ordinary absolutely positioned block. The `float`-blockified case CSS
-    2.1 9.7 also covers isn't handled here -- would need `computed` (for
-    `float`), not just `style_obj`, threaded through every call site."""
+    `_NON_RENDERING_TAGS`) should still be walked into the Taffy tree --
+    false for display:none, or table-column/table-column-group (see
+    `_NON_RENDERING_DISPLAYS`), unless absolutely positioned. CSS 2.1 9.7
+    blockifies display for any position:absolute/fixed box regardless of
+    its specified value -- an author-written display:table-column-group
+    on an absolutely positioned element computes to block, an ordinary
+    rendered box, not the 17.2.1 "not rendered" rule -- confirmed on
+    bottom-applies-to-005.xht. The float-blockified case 9.7 also covers
+    isn't handled here -- would need `computed`, not just `style_obj`."""
     display = style_obj.display
     value = getattr(display, "value", display)
     if value == "none":
@@ -384,11 +353,10 @@ def _renders(style_obj) -> bool:
 
 def _child_elements(element, computed_cache=None, *, reuse_styles=False) -> list:
     """`[(child, computed, style_obj), ...]` for children that should
-    render -- each child's style computed exactly once here, then handed
-    straight to the recursive `build()` call below instead of being
-    recomputed there. Anonymous table/block boxes (CSS 2.1 17.2.1/9.2.1.1)
-    appear here in place of the nodes they wrap -- see
-    `anonymous_boxes._normalized_child_nodes`."""
+    render -- each child's style computed once here, then handed straight
+    to the recursive build() call instead of being recomputed there.
+    Anonymous table/block boxes (CSS 2.1 17.2.1/9.2.1.1) appear here in
+    place of the nodes they wrap -- see `anonymous_boxes._normalized_child_nodes`."""
     result = []
     if computed_cache is None:
         computed_cache = {}
@@ -409,11 +377,11 @@ def _child_elements(element, computed_cache=None, *, reuse_styles=False) -> list
 
 
 def _clear_stale_layout_geometry(element) -> None:
-    """`element` just resolved to `display:none` -- clear its (and its
-    subtree's) `_layout_box`/`_chromonic_inline_fragments` rather than
-    leaving them from whenever it last rendered, or `paint_tree`/hit-
-    testing/`getBoundingClientRect()` (which all walk the real DOM, not
-    `node_map`) keep reading it as still having a box."""
+    """`element` just resolved to display:none -- clear its (and its
+    subtree's) _layout_box/_chromonic_inline_fragments rather than leaving
+    them from whenever it last rendered, or paint_tree/hit-testing/
+    getBoundingClientRect() (which walk the real DOM, not node_map) keep
+    reading it as still having a box."""
     element.__dict__.pop("_layout_box", None)
     element.__dict__.pop("_chromonic_inline_fragments", None)
     for child in _child_nodes(element):
@@ -437,8 +405,8 @@ def _apply_text_transform(text: str, transform: str | None) -> str:
 def _own_text(element) -> str:
     # Mixed content (text alongside child elements) is out of scope -- only
     # a childless element's own text is measured. `_rendering_text_content`,
-    # not raw `.textContent`, since a "childless" element can still have a
-    # `<style>`/`<script>` descendant whose raw source text isn't real prose.
+    # not raw .textContent, since a "childless" element can still have a
+    # <style>/<script> descendant whose raw source text isn't real prose.
     text = (
         getattr(element, "_chromonic_before_text", "")
         + _rendering_text_content(element)
@@ -463,12 +431,12 @@ def _collapsed_text_node(node) -> str:
 
 
 def _rendering_text_content(element) -> str:
-    """`element.textContent`, but skipping any descendant subtree rooted at
-    a `_NON_RENDERING_TAGS` tag -- plain `.textContent` includes their raw
+    """element.textContent, but skipping any descendant subtree rooted at a
+    `_NON_RENDERING_TAGS` tag -- plain .textContent includes their raw
     source text verbatim, which is never actually rendered.
 
-    No `childNodes` at all (e.g. a `_PseudoElement`'s generated-content
-    text) falls back to `element.textContent` directly."""
+    No childNodes at all (e.g. a _PseudoElement's generated-content text)
+    falls back to element.textContent directly."""
     child_nodes = getattr(element, "childNodes", None)
     if not child_nodes:
         return getattr(element, "textContent", None) or ""
@@ -476,7 +444,7 @@ def _rendering_text_content(element) -> str:
 
     def walk(node):
         # A plain-string child (domonic's programmatic constructors never
-        # wrap one in a Text node) has no `nodeType` at all, so it must be
+        # wrap one in a Text node) has no nodeType at all, so it must be
         # checked for explicitly or it's silently dropped.
         if isinstance(node, str):
             if node:
