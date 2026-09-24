@@ -145,6 +145,9 @@ def _extract_paint_style(computed) -> dict:
         "overflow_x": computed.getPropertyValue("overflow-x"),
         "overflow_y": computed.getPropertyValue("overflow-y"),
         "border_top_color": computed.getPropertyValue("border-top-color"),
+        "border_right_color": computed.getPropertyValue("border-right-color"),
+        "border_bottom_color": computed.getPropertyValue("border-bottom-color"),
+        "border_left_color": computed.getPropertyValue("border-left-color"),
         "color": computed.getPropertyValue("color"),
         "font_size": computed.getPropertyValue("font-size"),
         # These three have no used-value conversion in getPropertyValue;
@@ -360,6 +363,13 @@ def _child_elements(element, computed_cache=None, *, reuse_styles=False) -> list
     result = []
     if computed_cache is None:
         computed_cache = {}
+    # <details> without `open` renders only its first <summary> -- the rest
+    # of its content is the disclosed part, hidden until toggled.
+    is_closed_details = (
+        (getattr(element, "tagName", "") or "").lower() == "details"
+        and not getattr(element, "open", False)
+    )
+    seen_summary = False
     for child in anonymous_boxes._normalized_child_nodes(
         element, computed_cache, reuse_styles=reuse_styles,
     ):
@@ -367,6 +377,12 @@ def _child_elements(element, computed_cache=None, *, reuse_styles=False) -> list
             continue
         if (getattr(child, "tagName", "") or "").lower() in _NON_RENDERING_TAGS:
             continue
+        if is_closed_details:
+            if (getattr(child, "tagName", "") or "").lower() == "summary" and not seen_summary:
+                seen_summary = True
+            else:
+                _clear_stale_layout_geometry(child)
+                continue
         computed, style_obj = _describe(child, computed_cache, reuse_styles=reuse_styles)
         if _renders(style_obj):
             result.append((child, computed, style_obj))

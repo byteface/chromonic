@@ -25,7 +25,9 @@ _log = logging.getLogger(__name__)
 
 from . import (
     domonic_ch_unit_patch,
+    domonic_details_element_patch,
     domonic_ex_unit_patch,
+    domonic_radio_group_patch,
     # Domonic 1.8.4 expands var() in `_font_size_px` itself. This remaining
     # patch only supplies the browser-specific monospace default-size rule.
     domonic_monospace_font_size_patch,
@@ -691,8 +693,22 @@ def _ensure_window(page) -> None:
         Window(doc=page.document)
 
 
-def load(url: str, *, method: str = "GET", data=None, http_session=None):
+def load(url: str, *, method: str = "GET", data=None, http_session=None, run_scripts: bool = True):
     """Fetch + parse `url` with domonic 1.8.4 for HTTP(S), myjs for local files.
+
+    `run_scripts=False` skips the remote-page JS execution step below
+    entirely -- used by the WPT conformance harness (`tests/layout/
+    harness/native_runner.py`), which loads every fixture through an
+    `http://` URL (a local test server, so `_load_remote`'s branch fires)
+    purely to measure *static* CSS/layout correctness against a Chrome
+    screenshot. Chromonic's still-young JS engine actually running each
+    fixture's own script -- `testharness.js` included, which paints a
+    real assertion-results table Chrome's own capture deliberately hides
+    -- would conflate "is the CSS layout right" with "does the JS engine
+    handle this fixture's script," change what the comparison numbers
+    mean fixture to fixture, and make them incomparable with every
+    number from before JS execution existed. Real browsing (`ibrowse.py`,
+    `chromonic://` pages) leaves this at its default `True`.
 
     `method`/`data` (ignored for local files -- forms don't target them in
     practice) let a caller submit a real HTML form: `method="POST"` with
@@ -726,6 +742,12 @@ def load(url: str, *, method: str = "GET", data=None, http_session=None):
         page.url,
     )
 
+    from . import video_backend
+    video_backend.resolve_video_sources(page.document, page.url)
+    for video in page.document.getElementsByTagName("video"):
+        if video.hasAttribute("autoplay"):
+            video.play()
+
     # Run the page's own `<script>` elements -- ordinary browser behaviour,
     # same as any other browser does on every site -- against a sandboxed
     # `myjs` session (see `js_sandbox`'s own docstring for why: unlike
@@ -734,7 +756,7 @@ def load(url: str, *, method: str = "GET", data=None, http_session=None):
     # shell, or `require()` of an arbitrary Python module). Local files and
     # chromonic's own internal pages don't run scripts at all yet -- out of
     # scope here, and neither needs the remote case's sandboxing anyway.
-    if is_remote:
+    if is_remote and run_scripts:
         from . import js_sandbox
         session = http_session or _shared_http_session()
         try:

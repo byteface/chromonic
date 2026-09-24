@@ -10,12 +10,15 @@ Chromonic owns hit-testing/layout/paint and adapts GLFW to Domonic through
 from __future__ import annotations
 
 import base64
+import logging
 import time
 from dataclasses import dataclass
 from typing import Callable
 
 from . import hittest, paint, tree
 from .native_browser import GLRenderer
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -87,16 +90,19 @@ class Interaction:
         if element is not None:
             if getattr(element, "tagName", "").lower() in {"input", "textarea", "select", "button"}:
                 self.focused_element = element
-            element.dispatchEvent(
-                MouseEvent(
-                    "click",
-                    {
-                        "bubbles": True,
-                        "clientX": x,
-                        "clientY": y,
-                    },
+            try:
+                element.dispatchEvent(
+                    MouseEvent(
+                        "click",
+                        {
+                            "bubbles": True,
+                            "clientX": x,
+                            "clientY": y,
+                        },
+                    )
                 )
-            )
+            except Exception:
+                _log.exception("chromonic: click handler failed")
         self.relayout()
         return element
 
@@ -116,15 +122,18 @@ class Interaction:
             return None
         if key == "Backspace" and getattr(element, "tagName", "").lower() in {"input", "textarea"}:
             element.value = getattr(element, "value", "")[:-1]
-        element.dispatchEvent(
-            KeyboardEvent(
-                "keydown",
-                {
-                    "bubbles": True,
-                    "key": key,
-                },
+        try:
+            element.dispatchEvent(
+                KeyboardEvent(
+                    "keydown",
+                    {
+                        "bubbles": True,
+                        "key": key,
+                    },
+                )
             )
-        )
+        except Exception:
+            _log.exception("chromonic: keydown handler failed")
         self.relayout()
         return element
 

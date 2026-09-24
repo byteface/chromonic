@@ -424,6 +424,159 @@ def text_line_runs(element, box, style):
                        font=font, text=line, element=element)
 
 
+def _numeric_attr(element, name: str, default: float) -> float:
+    raw = element.getAttribute(name) if hasattr(element, "getAttribute") else None
+    try:
+        return float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _paint_gauge_fill(canvas: "skia.Canvas", element, box, tag_name: str) -> None:
+    """<progress>/<meter>'s filled portion -- neither has real OS widget
+    chrome to fall back on, so this is chromonic's own flat-fill approximation."""
+    minimum = _numeric_attr(element, "min", 0.0)
+    maximum = _numeric_attr(element, "max", 1.0)
+    value = _numeric_attr(element, "value", minimum)
+    span = maximum - minimum
+    fraction = 0.0 if span <= 0 else max(0.0, min(1.0, (value - minimum) / span))
+    inset = box.border_top + 1.0
+    fill_color = skia.Color4f(0.2, 0.55, 0.2, 1) if tag_name == "progress" else skia.Color4f(0.25, 0.45, 0.75, 1)
+    width = max(0.0, (box.width - 2 * inset) * fraction)
+    height = max(0.0, box.height - 2 * inset)
+    if width > 0 and height > 0:
+        canvas.drawRect(
+            skia.Rect.MakeXYWH(box.x + inset, box.y + inset, width, height),
+            skia.Paint(Color4f=fill_color, AntiAlias=True),
+        )
+
+
+def _paint_range_slider(canvas: "skia.Canvas", element, box) -> None:
+    minimum = _numeric_attr(element, "min", 0.0)
+    maximum = _numeric_attr(element, "max", 100.0)
+    value = _numeric_attr(element, "value", (minimum + maximum) / 2.0)
+    span = maximum - minimum
+    fraction = 0.0 if span <= 0 else max(0.0, min(1.0, (value - minimum) / span))
+    track_y = box.y + box.height / 2.0
+    track_paint = skia.Paint(Color4f=skia.Color4f(0.7, 0.7, 0.7, 1), AntiAlias=True, Style=skia.Paint.kStroke_Style)
+    track_paint.setStrokeWidth(3.0)
+    thumb_radius = max(1.0, min(7.0, box.height / 2.0 - 1.0))
+    canvas.drawLine(box.x + thumb_radius, track_y, box.x + box.width - thumb_radius, track_y, track_paint)
+    thumb_x = box.x + thumb_radius + fraction * max(0.0, box.width - 2 * thumb_radius)
+    canvas.drawCircle(thumb_x, track_y, thumb_radius, skia.Paint(Color4f=skia.Color4f(0.2, 0.45, 0.85, 1), AntiAlias=True))
+
+
+def _paint_disclosure_triangle(canvas: "skia.Canvas", element, box) -> None:
+    """A <summary>'s marker -- real browsers give it a ::marker box outside
+    its content; chromonic instead reserves space via `summary`'s own
+    `padding-left` (ua_style.py) and paints directly into that padding."""
+    details = getattr(element, "parentElement", None)
+    is_open = bool(
+        details is not None
+        and (getattr(details, "tagName", "") or "").lower() == "details"
+        and getattr(details, "open", False)
+    )
+    size = 4.5
+    cx = box.x + box.border_left + 8.0
+    cy = box.y + box.height / 2.0
+    path = skia.Path()
+    if is_open:
+        path.moveTo(cx - size, cy - size / 2)
+        path.lineTo(cx + size, cy - size / 2)
+        path.lineTo(cx, cy + size / 2)
+    else:
+        path.moveTo(cx - size / 2, cy - size)
+        path.lineTo(cx - size / 2, cy + size)
+        path.lineTo(cx + size / 2, cy)
+    path.close()
+    canvas.drawPath(path, skia.Paint(Color4f=skia.Color4f(0.2, 0.2, 0.2, 1), AntiAlias=True))
+
+
+def _paint_listbox_rows(canvas: "skia.Canvas", element, box, style) -> None:
+    """`<select multiple>`/`size` -- every option as its own always-visible
+    row filling the box `builder.py` sized for exactly this many rows,
+    instead of the classic closed dropdown's single selected-option line."""
+    from . import tree as _tree
+    row_height = _tree.replaced_elements.LISTBOX_ROW_HEIGHT
+    font_size = _px(style["font_size"], 13.3333)
+    font = _font(font_size, family=style["font_family"])
+    ink = skia.Paint(Color4f=_color(style["color"]) or skia.Color4f(0, 0, 0, 1), AntiAlias=True)
+    for index, option in enumerate(element.options):
+        row_top = box.y + box.border_top + index * row_height
+        if row_top >= box.y + box.height:
+            break
+        if option.selected:
+            canvas.drawRect(
+                skia.Rect.MakeXYWH(box.x + box.border_left, row_top, box.client_width, row_height),
+                skia.Paint(Color=0xffcce4ff, AntiAlias=True),
+            )
+        canvas.drawString(option.textContent or '', box.x + box.border_left + 4.0,
+                           row_top + row_height - 5.0, font, ink)
+
+
+def _paint_form_control_decoration(canvas: "skia.Canvas", element, box, tag_name: str) -> None:
+    """Extra chromonic-painted decoration a form control needs beyond its
+    generic background/border/text (already painted above in `paint_element`):
+    a checkbox/radio's checked mark, a range slider's track+thumb, a color
+    swatch's fill, a progress/meter's gauge fill, a <summary>'s disclosure
+    triangle. None of these have real OS widget chrome to fall back on --
+    this is chromonic's own closest approximation of each."""
+    if tag_name == "input":
+        input_type = (getattr(element, "type", "") or "text").lower()
+        if input_type in ("checkbox", "radio") and getattr(element, "checked", False):
+            inset = box.border_top + 3.0
+            ink = skia.Paint(Color4f=skia.Color4f(0.13, 0.13, 0.13, 1), AntiAlias=True)
+            if input_type == "radio":
+                cx, cy = box.x + box.width / 2.0, box.y + box.height / 2.0
+                radius = max(0.0, min(box.width, box.height) / 2.0 - inset)
+                if radius > 0:
+                    canvas.drawCircle(cx, cy, radius, ink)
+            else:
+                w, h = max(0.0, box.width - 2 * inset), max(0.0, box.height - 2 * inset)
+                if w > 0 and h > 0:
+                    canvas.drawRect(skia.Rect.MakeXYWH(box.x + inset, box.y + inset, w, h), ink)
+        elif input_type == "range":
+            _paint_range_slider(canvas, element, box)
+        elif input_type == "color":
+            swatch = _color(getattr(element, "value", "") or "#000000") or skia.Color4f(0, 0, 0, 1)
+            inset = box.border_top + 2.0
+            w, h = max(0.0, box.width - 2 * inset), max(0.0, box.height - 2 * inset)
+            if w > 0 and h > 0:
+                canvas.drawRect(
+                    skia.Rect.MakeXYWH(box.x + inset, box.y + inset, w, h),
+                    skia.Paint(Color4f=swatch, AntiAlias=True),
+                )
+    elif tag_name in ("progress", "meter"):
+        _paint_gauge_fill(canvas, element, box, tag_name)
+    elif tag_name == "summary":
+        _paint_disclosure_triangle(canvas, element, box)
+
+
+def _paint_video(canvas: "skia.Canvas", element, box) -> None:
+    """The current decoded frame, same stretch-to-fill/no-object-fit
+    default as `_paint_image` -- see that function's own comment. No
+    frame yet (still starting up, no source, or ffmpeg/ffprobe missing):
+    paint nothing extra, leaving just the `video { background-color:
+    black }` UA default (ua_style.py) as the placeholder, the same way a
+    real player shows a black rect before its first frame."""
+    from . import video_backend
+    decoder = video_backend.decoder_for(element)
+    if decoder is None:
+        return
+    image = decoder.current_frame_image()
+    if image is None:
+        return
+    padding = getattr(element, "_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
+    pad_top, pad_right, pad_bottom, pad_left = padding
+    x = box.x + box.border_left + pad_left
+    y = box.y + box.border_top + pad_top
+    width = box.client_width - pad_left - pad_right
+    height = box.client_height - pad_top - pad_bottom
+    if width <= 0 or height <= 0:
+        return
+    canvas.drawImageRect(image, skia.Rect.MakeXYWH(x, y, width, height))
+
+
 def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
     box = element.__dict__.get("_layout_box") if box is None else box
     if box is None:
@@ -447,18 +600,58 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
     elif tag_name == "canvas":
         from . import canvas2d
         canvas2d.paint_element(canvas, element, box)
+    elif tag_name == "video":
+        _paint_video(canvas, element, box)
 
-    if box.border_top > 0:
+    is_radio = tag_name == "input" and (getattr(element, "type", "") or "").lower() == "radio"
+    if is_radio and box.border_top > 0:
+        # No general border-radius support to reach for here (paint.py
+        # doesn't track it at all yet) -- a radio's round *outer* edge is
+        # special-cased the same way its inner checked-mark already is
+        # (`_paint_form_control_decoration`), rather than a square border
+        # on what's supposed to read as a circle. Always uniform in
+        # practice (ua_style.py), so `box.border_top` alone is fine here.
         border_color = _color(style["border_top_color"]) or skia.Color4f(0, 0, 0, 1)
         paint = skia.Paint(Color4f=border_color, AntiAlias=True, Style=skia.Paint.kStroke_Style)
-        # a stroked rect straddles the path -- inset by half the border width
-        # so the stroke lands on the border box the layout actually computed.
         inset = box.border_top / 2.0
         paint.setStrokeWidth(box.border_top)
-        canvas.drawRect(
-            skia.Rect.MakeXYWH(box.x + inset, box.y + inset, box.width - box.border_top, box.height - box.border_top),
-            paint,
-        )
+        cx, cy = box.x + box.width / 2.0, box.y + box.height / 2.0
+        radius = max(0.0, min(box.width, box.height) / 2.0 - inset)
+        canvas.drawCircle(cx, cy, radius, paint)
+    elif not is_radio:
+        # Each side painted independently, in its own width/colour -- a
+        # single rect-stroke (this used to be one `drawRect` sized off
+        # `box.border_top` alone) can't represent a `border-bottom`-only
+        # box, or differing per-side widths/colours, at all: with every
+        # other side truly at 0 width, `box.border_top == 0` skipped
+        # painting anything, silently, even though 3 of the 4 sides were
+        # real declared borders. Corners aren't mitred (each edge is a
+        # plain stroked line, not a mitred quad) -- a real gap, just a
+        # smaller one than "renders nothing" was.
+        native = getattr(element, "_chromonic_native_style", None) or {}
+        top, right, bottom, left = native.get("border") or (box.border_top, 0.0, 0.0, box.border_left)
+        black = skia.Color4f(0, 0, 0, 1)
+        if top > 0:
+            paint = skia.Paint(Color4f=_color(style["border_top_color"]) or black, AntiAlias=True)
+            paint.setStrokeWidth(top)
+            canvas.drawLine(box.x, box.y + top / 2.0, box.x + box.width, box.y + top / 2.0, paint)
+        if right > 0:
+            paint = skia.Paint(Color4f=_color(style["border_right_color"]) or black, AntiAlias=True)
+            paint.setStrokeWidth(right)
+            x = box.x + box.width - right / 2.0
+            canvas.drawLine(x, box.y, x, box.y + box.height, paint)
+        if bottom > 0:
+            paint = skia.Paint(Color4f=_color(style["border_bottom_color"]) or black, AntiAlias=True)
+            paint.setStrokeWidth(bottom)
+            y = box.y + box.height - bottom / 2.0
+            canvas.drawLine(box.x, y, box.x + box.width, y, paint)
+        if left > 0:
+            paint = skia.Paint(Color4f=_color(style["border_left_color"]) or black, AntiAlias=True)
+            paint.setStrokeWidth(left)
+            canvas.drawLine(box.x + left / 2.0, box.y, box.x + left / 2.0, box.y + box.height, paint)
+
+    if tag_name in ("input", "progress", "meter", "summary"):
+        _paint_form_control_decoration(canvas, element, box, tag_name)
 
     # `<select>`'s `<option>` children are real DOM children but were never
     # given a layout box -- tree.py treats it as childless too (see its
@@ -466,16 +659,36 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
     # this element's own text (the "not children" branch below never runs)
     # and (b) recurse into `paint_tree` for each <option>, painting nothing
     # useful since none of them has a `get_layout_box()` to paint from.
+    is_listbox = tag_name == "select" and getattr(element, "_chromonic_listbox_rows", 0)
+    if is_listbox:
+        _paint_listbox_rows(canvas, element, box, style)
     has_layout_children = getattr(element, "_chromonic_has_layout_children", None)
     if has_layout_children is None:
         has_layout_children = tag_name != "select" and any(
             _is_element(child) for child in (element.childNodes or [])
         )
-    if not has_layout_children:
+    if not has_layout_children and not is_listbox:
         text_color = _color(style["color"]) or skia.Color4f(0, 0, 0, 1)
         paint_ = skia.Paint(Color4f=text_color, AntiAlias=True)
-        for run in text_line_runs(element, box, style):
-            canvas.drawString(run.text, run.x, run.baseline_y, run.font, paint_)
+        # `overflow: hidden`/`clip` (ua_style.py's default for input/
+        # textarea/select among others) must clip this element's own text
+        # to its padding edge, same as the fragments branch below already
+        # does -- otherwise a textarea with more lines than fit its height,
+        # or a line wider than its width, paints straight through the
+        # box's own border into whatever's next to/below it.
+        clips_own_text = style.get("overflow_x") in ("hidden", "clip") or style.get("overflow_y") in ("hidden", "clip")
+        if clips_own_text:
+            canvas.save()
+            canvas.clipRect(skia.Rect.MakeXYWH(
+                box.x + box.border_left, box.y + box.border_top,
+                box.client_width, box.client_height,
+            ))
+        try:
+            for run in text_line_runs(element, box, style):
+                canvas.drawString(run.text, run.x, run.baseline_y, run.font, paint_)
+        finally:
+            if clips_own_text:
+                canvas.restore()
 
     # Direct text nodes in mixed inline content (and any `::before`/
     # `::after` generated-content box, see `tree.py`'s `_PseudoElement`)
@@ -522,8 +735,15 @@ def paint_tree(canvas: "skia.Canvas", root_element) -> None:
     if getattr(root_element, "_chromonic_tag_name", None) == "select":
         return  # <option>s were never laid out (see paint_element) -- nothing to recurse into
     for child in (root_element.childNodes or []):
-        if _is_element(child):
-            paint_tree(canvas, child)
+        if not _is_element(child):
+            continue
+        # An open <dialog> is painted separately, centred over everything
+        # else (`native_browser.py`'s `draw_open_dialogs`) -- skipped here
+        # so it isn't also painted once more at its in-flow document
+        # position.
+        if (getattr(child, "_chromonic_tag_name", None) or "").lower() == "dialog":
+            continue
+        paint_tree(canvas, child)
     _paint_anonymous_boxes(canvas, root_element)
 
 
@@ -557,6 +777,11 @@ def build_display_list(root_element) -> list:
             walk_anonymous(anonymous)
 
     def walk(element):
+        # An open <dialog> paints separately, centred on top of everything
+        # else (`native_browser.py`'s `draw_open_dialogs`) -- excluded here,
+        # subtree included, so it isn't also painted at its in-flow position.
+        if (getattr(element, "_chromonic_tag_name", None) or "").lower() == "dialog":
+            return
         if element.__dict__.get("_layout_box") is not None:
             result.append(element)
         if getattr(element, "_chromonic_tag_name", None) == "select":

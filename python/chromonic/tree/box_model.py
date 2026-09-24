@@ -35,7 +35,7 @@ _USUALLY_INLINE_TAGS = frozenset({
 # `width`/`height` even at `display:inline` -- unlike an ordinary inline
 # element, whose box is purely a function of its content.
 _REPLACED_OR_CONTROL_TAGS = frozenset({
-    "img", "canvas", "svg", "svg:svg", "input", "textarea", "select", "button", "iframe",
+    "img", "canvas", "svg", "svg:svg", "input", "textarea", "select", "button", "iframe", "video",
 })
 
 

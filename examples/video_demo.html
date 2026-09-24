@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Chromonic video demo</title>
+<style>
+body { font-family: Arial; margin: 20px; max-width: 600px; }
+h1 { font-size: 20px; }
+p.hint { color: #777; font-size: 12px; }
+video { border: 2px solid #333; }
+</style>
+</head>
+<body>
+<h1>Chromonic &lt;video&gt;</h1>
+<p class="hint">A real video file, decoded frame by frame (ffmpeg) and composited
+into chromonic's own render tree (Skia) -- not a native player window floated
+on top. Click a video to play/pause. Sized from the file's own intrinsic
+480x270, same as an &lt;img&gt;.</p>
+<video src="sample_video.mp4" autoplay loop></video>
+<p class="hint">Two more at explicit CSS sizes, laid out like any other box --
+proving layout doesn't need to know img from video:</p>
+<video src="sample_video.mp4" autoplay loop style="width:200px;height:112px;"></video>
+<video src="sample_video.mp4" autoplay loop style="width:150px;height:84px;"></video>
+</body>
+</html>

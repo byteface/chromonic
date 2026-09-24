@@ -128,6 +128,7 @@ python chromonic/examples/ibrowse.py https://example.com/ --frames 2
 | Key | Action |
 | --- | --- |
 | `F5` / `Cmd+R` | Reload the current page |
+| `F7` | Toggle JavaScript on/off (**off by default** -- a page's own `<script>` is the biggest single source of interpreter slowdown right now; turn it on only for a page that needs it). Re-navigates to the current URL immediately so the change takes effect right away. Local files never run scripts regardless of this setting (see "Local files" below) |
 | `F8` | Toggle view-source: the page's raw fetched HTML, monospaced |
 | `F9` | Toggle author stylesheets on/off (page CSS off still keeps chromonic's own UA defaults, so a heading still looks like a heading -- useful for isolating a page's own styling from layout bugs) |
 | `F10` | Toggle the performance HUD (layout/frame timings, image cache stats) |
@@ -152,7 +153,8 @@ navigates to it, same as any other address. An `.html` file renders normally;
 an image (`.png`/`.jpg`/`.gif`/`.webp`/...) shows as an image, with its path
 in the address bar; anything else recognized as text shows as plain,
 monospaced text -- none of it is parsed as markup. Dropping several files at
-once opens the first and ignores the rest.
+once opens the first and ignores the rest. Its `<script>`s never run, unlike
+a real http(s) page's (`F7` above) -- not yet wired up either way.
 
 
 ## Web fonts

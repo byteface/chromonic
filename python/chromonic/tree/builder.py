@@ -951,6 +951,8 @@ def _build_replaced_leaf(tree, element, style, tag_name, *, projection) -> int:
         replaced_elements._apply_canvas_intrinsic_size(style, element)
     elif tag_name == "iframe":
         replaced_elements._apply_iframe_intrinsic_size(style, element)
+    elif tag_name == "video":
+        replaced_elements._apply_video_intrinsic_size(style, element)
     else:
         replaced_elements._apply_svg_intrinsic_size(style, element)
     element._chromonic_text_lines = []
@@ -968,9 +970,16 @@ def _build_replaced_leaf(tree, element, style, tag_name, *, projection) -> int:
 
 def _build_select_leaf(tree, element, style, *, projection) -> int:
     """Body of build()'s `tag_name == "select"` branch: a measured text leaf for its
-    selected option's display text, or an empty leaf."""
+    selected option's display text, or an empty leaf. `<select multiple>`/`size`
+    (a listbox, not a closed dropdown) overrides the height to fit every row
+    -- `paint.py`'s `_paint_listbox_rows` does the actual per-row painting;
+    this only has to reserve the right box."""
     element.__dict__.pop("_chromonic_inline_plan", None)
     element._chromonic_inline_fragments = []
+    rows = replaced_elements._listbox_row_count(element)
+    element._chromonic_listbox_rows = rows
+    if rows:
+        style["height"] = rows * replaced_elements.LISTBOX_ROW_HEIGHT
     text = replaced_elements._select_display_text(element)
     if text:
         measure_key = _measure_key(element._chromonic_paint_style, text)
@@ -1319,7 +1328,7 @@ def build(
         # same font-metrics math as `_empty_inline_strut_run`.
         # wpt/css/CSS2/mpc/padding-top-036.xht: was 784x0, Chrome's 0x18.
         node_id = _build_br_leaf(tree, element, style, projection=projection)
-    elif tag_name in ("img", "canvas", "svg", "svg:svg", "iframe"):
+    elif tag_name in ("img", "canvas", "svg", "svg:svg", "iframe", "video"):
         node_id = _build_replaced_leaf(tree, element, style, tag_name, projection=projection)
     elif tag_name == "select":
         node_id = _build_select_leaf(tree, element, style, projection=projection)

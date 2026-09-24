@@ -81,6 +81,43 @@ def _ancestor(element, predicate):
     return None
 
 
+def _ask_color(initial: str) -> "str | None":
+    """A real OS colour-picker dialog for `input[type=color]` -- `None` if
+    the user cancelled, or if `tkinter` (stdlib, but not every Python build
+    includes its Tcl/Tk dependency) isn't usable here at all."""
+    try:
+        import tkinter
+        from tkinter import colorchooser
+        root = tkinter.Tk()
+        root.withdraw()
+        try:
+            _rgb, hex_value = colorchooser.askcolor(color=initial, title="Choose a colour")
+        finally:
+            root.destroy()
+        return hex_value
+    except Exception:
+        _log.exception("chromonic: colour picker unavailable")
+        return None
+
+
+def _ask_open_file() -> "str | None":
+    """A real OS file-open dialog for `input[type=file]` -- `None` if the
+    user cancelled, or if `tkinter` isn't usable here at all."""
+    try:
+        import tkinter
+        from tkinter import filedialog
+        root = tkinter.Tk()
+        root.withdraw()
+        try:
+            path = filedialog.askopenfilename(title="Choose a file")
+        finally:
+            root.destroy()
+        return path or None
+    except Exception:
+        _log.exception("chromonic: file picker unavailable")
+        return None
+
+
 #: How far the pointer must move from its mouse-down position, in either
 #: axis, before a press-drag-release is treated as a text selection instead
 #: of a plain click -- keeps an ordinary link/button click (a press and
@@ -242,6 +279,21 @@ class View:
         self.caret = 0
         self.focused_element = None
         self.input_caret = 0
+        # Mirrors the address bar's own `select_anchor`/`caret` pair
+        # (`_selection_range`) for whichever form field is focused --
+        # `None` means no selection; see `_input_selection_range`.
+        self.input_select_anchor = None
+        # The <select> whose options popup is currently open, or None --
+        # `click()` intercepts every click while this is set (see its own
+        # early-return) since an open popup floats above the normal page
+        # and its option rows aren't real hit-testable layout boxes.
+        self.open_select = None
+        # The `input[type=range]` currently being dragged (mouse down on
+        # its thumb/track, not yet released), or None -- set/cleared by
+        # `WindowInput.on_mouse_button`, updated continuously from
+        # `on_cursor_pos` while held, mirroring `_mouse_down_pos`'s own
+        # press-drag-release shape for text selection.
+        self.dragging_range = None
         self.navigation_handler = None
         # Page text selection (independent of `select_anchor`/`caret` above,
         # which are the address bar's own). `_selectable_runs` (a property,
@@ -275,6 +327,12 @@ class View:
         self.dropped_files = []
         self.status = ''
         self.stylesheets_enabled = True
+        # Off by default -- a page's own <script> is the single biggest
+        # source of interpreter slowdown chromonic has right now (see
+        # `toggle_javascript`, bound to F7). Local files never run scripts
+        # regardless of this flag (`browser.py`'s `_load_local` hardcodes
+        # `run=False`); this only affects real http(s) navigation.
+        self.javascript_enabled = False
         self.view_source_open = False
         self.view_source_scroll_y = 0.0
         self.loading = False
@@ -330,8 +388,14 @@ class View:
             browser._validate_navigable(url)
             if self.navigation_handler is not None:
                 return self.navigation_handler(url, mode=mode, jump_index=jump_index, method=method, data=data)
-            page = (self.loader(url) if method == 'GET' and data is None
-                    else browser.load(url, method=method, data=data))
+            if method == 'GET' and data is None:
+                # `run_scripts` only goes to the real loader -- a caller's
+                # own custom `loader=` (tests, mostly) is a plain one-arg
+                # callable and would reject an unexpected kwarg.
+                page = (self.loader(url, run_scripts=self.javascript_enabled)
+                        if self.loader is browser.load else self.loader(url))
+            else:
+                page = browser.load(url, method=method, data=data, run_scripts=self.javascript_enabled)
             return self.commit_page(page, url, mode=mode, jump_index=jump_index)
         except BaseException as error:
             # `commit_page` (title/history/window-attach, on top of the
@@ -629,6 +693,7 @@ class View:
                 reuse_styles=reuse_styles,
                 viewport_height=self.viewport_height,
             )
+            self._center_open_dialogs(doc)
             self.content_height = max(
                 (
                     max(
@@ -724,6 +789,19 @@ class View:
         self._last_image_relayout = time.monotonic()
         self.request_relayout(delay=_IMAGE_RELAYOUT_INTERVAL, reuse_styles=True)
 
+    def poll_videos(self):
+        """Keep repainting while any `<video>` is playing -- a decoded
+        frame arrives off its own background thread (`video_backend.py`'s
+        `VideoDecoder`), so nothing else marks the view dirty for it."""
+        if self.page is None:
+            return
+        from . import video_backend
+        for video in self.page.document.getElementsByTagName('video'):
+            decoder = video_backend.decoder_for(video)
+            if decoder is not None and not decoder.paused:
+                self.dirty = True
+                return
+
     def resize(self, width, height):
         if width > 0 and height > 0 and (width, height) != (self.width, self.height):
             self.width, self.height = width, height
@@ -780,6 +858,73 @@ class View:
         if tag == 'input':
             return (element.getAttribute('type') or 'text').lower() in ('submit', 'image')
         return False
+
+    @staticmethod
+    def _toggle_control_ancestor(element):
+        return _ancestor(
+            element,
+            lambda node: str(getattr(node, 'tagName', '')).lower() == 'input'
+            and (node.getAttribute('type') or 'text').lower() in ('checkbox', 'radio'),
+        )
+
+    @staticmethod
+    def _summary_ancestor(element):
+        return _ancestor(
+            element,
+            lambda node: str(getattr(node, 'tagName', '')).lower() == 'summary',
+        )
+
+    @staticmethod
+    def _select_ancestor(element):
+        return _ancestor(
+            element,
+            lambda node: str(getattr(node, 'tagName', '')).lower() == 'select',
+        )
+
+    @staticmethod
+    def _range_ancestor(element):
+        return _ancestor(
+            element,
+            lambda node: str(getattr(node, 'tagName', '')).lower() == 'input'
+            and (node.getAttribute('type') or 'text').lower() == 'range',
+        )
+
+    @staticmethod
+    def _color_ancestor(element):
+        return _ancestor(
+            element,
+            lambda node: str(getattr(node, 'tagName', '')).lower() == 'input'
+            and (node.getAttribute('type') or 'text').lower() == 'color',
+        )
+
+    @staticmethod
+    def _video_ancestor(element):
+        return _ancestor(
+            element,
+            lambda node: str(getattr(node, 'tagName', '')).lower() == 'video',
+        )
+
+    @staticmethod
+    def _file_ancestor(element):
+        return _ancestor(
+            element,
+            lambda node: str(getattr(node, 'tagName', '')).lower() == 'input'
+            and (node.getAttribute('type') or 'text').lower() == 'file',
+        )
+
+    def _dispatch_change(self, element):
+        """<input>/<select>'s `input`+`change` events after a chromonic-
+        driven default action (checkbox toggle, popup pick, slider drag,
+        colour/file pick) changed its value -- guarded the same way
+        `_dispatch_field_event` already is, so a page's own broken
+        `change` listener degrades to a logged error instead of crashing
+        chromonic (see `click()`'s own dispatchEvent for the same fix)."""
+        from domonic.events import Event, InputEvent
+        try:
+            element.dispatchEvent(InputEvent('input', {'bubbles': True, 'cancelable': False}))
+            element.dispatchEvent(Event('change', {'bubbles': True, 'cancelable': False}))
+        except Exception:
+            _log.exception("chromonic: change handler failed for %s", self.url)
 
     @staticmethod
     def _collect_form_data(form):
@@ -839,6 +984,19 @@ class View:
             method = (submitter.getAttribute('formmethod') or method).strip().lower()
             action = submitter.getAttribute('formaction') or action
 
+        if method == 'dialog':
+            # HTML: a <form method=dialog> submit never navigates -- it just
+            # closes its nearest ancestor <dialog>, with the submitter's own
+            # `value` (if any) becoming `dialog.returnValue`. No JS required,
+            # unlike `showModal()` itself -- this is the one dialog action a
+            # page can wire up through pure HTML.
+            dialog = _ancestor(form, lambda node: str(getattr(node, 'tagName', '')).lower() == 'dialog')
+            if dialog is not None:
+                return_value = submitter.getAttribute('value') if submitter is not None else None
+                dialog.close(return_value or '')
+                self.relayout()
+            return True
+
         url = urllib.parse.urljoin(self.url, action)
         pairs = self._collect_form_data(form)
         if submitter is not None:
@@ -870,16 +1028,51 @@ class View:
             self.dirty = True
             return
 
+        if self.open_select is not None:
+            self._click_select_popup(x, y)
+            return
+
+        open_dialogs = self._find_open_dialogs(self.page.document.body) if self.page is not None else []
+        if open_dialogs:
+            # A modal dialog blocks interaction with the rest of the page --
+            # hit-test only inside its own (already re-centred) subtree, in
+            # the same raw window-space `_center_open_dialogs` wrote its box
+            # in (TOOLBAR-inclusive, not document/scroll space -- unlike
+            # every other element's `_layout_box`, so *no* `- TOOLBAR` here,
+            # matching how `draw_open_dialogs` paints it with no further
+            # translation either); a click elsewhere is simply absorbed,
+            # not routed to the page.
+            for dialog in open_dialogs:
+                target = hittest.hit_test(dialog, x, y)
+                if target is not None:
+                    from domonic.events import MouseEvent
+                    try:
+                        target.dispatchEvent(MouseEvent('click', {'bubbles': True, 'clientX': x, 'clientY': y}))
+                    except Exception:
+                        _log.exception("chromonic: click handler failed for %s", self.url)
+                    submitter = self._submit_control_ancestor(target)
+                    if submitter is not None:
+                        form = self._form_ancestor(submitter)
+                        if form is not None:
+                            self.submit_form(form, submitter=submitter)
+                    self.relayout()
+                    return
+            self.dirty = True
+            return
+
         self.editing = False
         self.select_anchor = None
         self.text_selection = None
         if self.page is None:
             return
 
-        document_y = y - TOOLBAR + self.scroll_y
-        element = hittest.hit_test(self.page.document.body, x, document_y)
+        element = self._hit_test_fixed(x, y)
+        if element is None:
+            document_y = y - TOOLBAR + self.scroll_y
+            element = hittest.hit_test(self.page.document.body, x, document_y)
         field = self._editable_ancestor(element)
         self.focused_element = field
+        self.input_select_anchor = None
         if field is not None:
             self.input_caret = len(str(getattr(field, 'value', '') or ''))
 
@@ -890,9 +1083,78 @@ class View:
         if element is not None:
             from domonic.events import MouseEvent
             event = MouseEvent('click', {'bubbles': True, 'clientX': x, 'clientY': y - TOOLBAR})
-            element.dispatchEvent(event)
+            try:
+                element.dispatchEvent(event)
+            except Exception:
+                _log.exception("chromonic: click handler failed for %s", self.url)
         if getattr(event, 'defaultPrevented', False):
             self.relayout()
+            return
+
+        toggle = self._toggle_control_ancestor(element)
+        if toggle is not None and toggle.getAttribute('disabled') is None:
+            was_checked = toggle.checked
+            toggle.checked = True if (toggle.type == 'radio' and not was_checked) else not was_checked
+            if toggle.checked != was_checked:
+                self._dispatch_change(toggle)
+            self.relayout()
+            return
+
+        summary = self._summary_ancestor(element)
+        if summary is not None:
+            details = getattr(summary, 'parentElement', None)
+            if details is not None and str(getattr(details, 'tagName', '')).lower() == 'details':
+                try:
+                    details.toggle()
+                except Exception:
+                    _log.exception("chromonic: details toggle handler failed for %s", self.url)
+                self.relayout()
+                return
+
+        video = self._video_ancestor(element)
+        if video is not None:
+            # No control-bar UI yet (see video_backend.py) -- click-to-
+            # toggle play/pause, the one interaction every video site's
+            # own custom player also binds to the video frame itself.
+            if video.paused:
+                video.play()
+            else:
+                video.pause()
+            self.dirty = True
+            return
+
+        select = self._select_ancestor(element)
+        if select is not None and select.getAttribute('disabled') is None:
+            if getattr(select, '_chromonic_listbox_rows', 0):
+                self._click_listbox_row(select, x, y)
+            else:
+                self.open_select = select
+                self.dirty = True
+            return
+
+        range_input = self._range_ancestor(element)
+        if range_input is not None and range_input.getAttribute('disabled') is None:
+            self._set_range_value_from_x(range_input, x)
+            self._dispatch_change(range_input)
+            self.relayout()
+            return
+
+        color_input = self._color_ancestor(element)
+        if color_input is not None and color_input.getAttribute('disabled') is None:
+            picked = _ask_color(getattr(color_input, 'value', None) or '#000000')
+            if picked is not None:
+                color_input.value = picked
+                self._dispatch_change(color_input)
+                self.relayout()
+            return
+
+        file_input = self._file_ancestor(element)
+        if file_input is not None and file_input.getAttribute('disabled') is None:
+            picked = _ask_open_file()
+            if picked is not None:
+                file_input.value = picked
+                self._dispatch_change(file_input)
+                self.relayout()
             return
 
         anchor = self._anchor_ancestor(element)
@@ -921,6 +1183,211 @@ class View:
 
         if element is not None:
             self.relayout()
+
+    def _select_popup_geometry(self, select):
+        """Shared by `draw_select_dropdown` (paint) and `_click_select_popup`
+        (hit-test) so what's clickable always matches exactly what's drawn --
+        `<option>`s are never given their own layout box (see `paint.py`'s
+        `paint_tree`), so this is the only geometry either one has."""
+        box = select.get_layout_box()
+        options = list(select.options)
+        font = paint._font(13.3333)
+        content_width = max((font.measureText(opt.textContent or '') for opt in options), default=0.0)
+        return {
+            'x': box.x,
+            'top': box.y + box.height,
+            'width': max(box.width, content_width + 12.0),
+            'row_height': 18.0,
+            'options': options,
+        }
+
+    def _click_select_popup(self, x, y):
+        select = self.open_select
+        self.open_select = None
+        geometry = self._select_popup_geometry(select)
+        options = geometry['options']
+        document_y = y - TOOLBAR + self.scroll_y
+        total_height = geometry['row_height'] * len(options)
+        inside = (geometry['x'] <= x <= geometry['x'] + geometry['width']
+                  and geometry['top'] <= document_y <= geometry['top'] + total_height)
+        if inside:
+            index = int((document_y - geometry['top']) // geometry['row_height'])
+            if 0 <= index < len(options):
+                try:
+                    select.selectIndex(index)
+                except Exception:
+                    _log.exception("chromonic: select change handler failed for %s", self.url)
+        self.relayout()
+        self.dirty = True
+
+    def _click_listbox_row(self, select, x, y):
+        """A `<select multiple>`/`size` row click -- unlike the closed
+        dropdown (`_click_select_popup`), this is an ordinary in-flow box,
+        so the row math is against its own normal (scroll-adjusted)
+        document-space layout box, not a separately tracked popup."""
+        box = select.get_layout_box()
+        if box is None:
+            return
+        row_height = tree.replaced_elements.LISTBOX_ROW_HEIGHT
+        document_y = y - TOOLBAR + self.scroll_y
+        index = int((document_y - box.y - box.border_top) // row_height)
+        options = list(select.options)
+        if 0 <= index < len(options):
+            option = options[index]
+            option.selected = (not option.selected) if select.hasAttribute('multiple') else True
+            self._dispatch_change(select)
+        self.relayout()
+
+    def _range_hit(self, x, y):
+        """The `input[type=range]` at raw window position (x, y), or None --
+        used by `WindowInput.on_mouse_button`'s PRESS handler to decide
+        whether this press starts a drag, before `click()`'s own (release-
+        time) hit-testing would otherwise run."""
+        if self.page is None or y < TOOLBAR:
+            return None
+        document_y = y - TOOLBAR + self.scroll_y
+        element = hittest.hit_test(self.page.document.body, x, document_y)
+        return self._range_ancestor(element)
+
+    def _set_range_value_from_x(self, range_input, x):
+        box = range_input.get_layout_box()
+        minimum = paint._numeric_attr(range_input, 'min', 0.0)
+        maximum = paint._numeric_attr(range_input, 'max', 100.0)
+        step = paint._numeric_attr(range_input, 'step', 1.0)
+        thumb_radius = max(1.0, min(7.0, box.height / 2.0 - 1.0))
+        span = max(1.0, box.width - 2 * thumb_radius)
+        fraction = max(0.0, min(1.0, (x - box.x - thumb_radius) / span))
+        value = minimum + fraction * (maximum - minimum)
+        if step > 0:
+            value = minimum + round((value - minimum) / step) * step
+        range_input.value = str(max(minimum, min(maximum, value)))
+
+    def draw_select_dropdown(self, canvas):
+        select = self.open_select
+        if select is None:
+            return
+        geometry = self._select_popup_geometry(select)
+        options = geometry['options']
+        if not options:
+            return
+        total_height = geometry['row_height'] * len(options)
+        rect = skia.Rect.MakeXYWH(geometry['x'], geometry['top'], geometry['width'], total_height)
+        canvas.drawRect(rect, skia.Paint(Color=skia.ColorWHITE, AntiAlias=True))
+        font = paint._font(13.3333)
+        ink = skia.Paint(Color=skia.ColorBLACK, AntiAlias=True)
+        for index, option in enumerate(options):
+            row_top = geometry['top'] + index * geometry['row_height']
+            if option.selected:
+                canvas.drawRect(
+                    skia.Rect.MakeXYWH(geometry['x'], row_top, geometry['width'], geometry['row_height']),
+                    skia.Paint(Color=0xffcce4ff, AntiAlias=True),
+                )
+            canvas.drawString(option.textContent or '', geometry['x'] + 4.0,
+                               row_top + geometry['row_height'] - 5.0, font, ink)
+        border = skia.Paint(Color=0xff767676, AntiAlias=True, Style=skia.Paint.kStroke_Style)
+        border.setStrokeWidth(1.0)
+        canvas.drawRect(rect, border)
+
+    def _hit_test_fixed(self, x, y):
+        """A `position:fixed` element's box is deliberately viewport-relative,
+        not document/scroll space -- correct for painting (`draw()` never
+        adjusts it for `scroll_y` either), but it means the ordinary
+        `document_y = y - TOOLBAR + scroll_y` hit-test `click()` otherwise
+        always uses is simply wrong for it once the page has been scrolled
+        at all: a real click at the fixed element's own constant on-screen
+        position stops landing inside its stored box, off by exactly
+        `scroll_y`. Confirmed directly -- a `position:fixed` footer became
+        permanently unclickable the moment the page scrolled. Tried first,
+        against every fixed element's own subtree in reverse document order
+        (later paints on top, same reasoning `hit_test`'s own sibling walk
+        already uses) with the raw, unadjusted `y - TOOLBAR`; `click()`
+        falls back to the normal scroll-adjusted whole-document test when
+        nothing fixed was hit."""
+        if self.page is None or y < TOOLBAR:
+            return None
+        fixed_elements = self._find_fixed_positioned(self.page.document.body)
+        for element in reversed(fixed_elements):
+            found = hittest.hit_test(element, x, y - TOOLBAR)
+            if found is not None:
+                return found
+        return None
+
+    @staticmethod
+    def _find_fixed_positioned(root):
+        found = []
+
+        def walk(node):
+            if getattr(node, 'nodeType', None) != 1:
+                return
+            # `_chromonic_native_style["position"]` can't tell fixed from
+            # absolute -- `style_bridge._position()` maps both to the same
+            # Taffy-level "absolute" string (Taffy has no native fixed
+            # concept; `positioning.py`'s own viewport-anchoring fixup hits
+            # the identical problem and resolves it the same way).
+            # `_chromonic_resolved_style`'s pre-mapping `LayoutStyle.position`
+            # still keeps fixed distinct.
+            resolved = getattr(node, '_chromonic_resolved_style', None)
+            position = getattr(resolved[1].position, 'value', resolved[1].position) if resolved is not None else None
+            if position == 'fixed':
+                found.append(node)
+                return  # its own subtree is reached by hit-testing *this* node directly, not walked again here
+            for child in (getattr(node, 'childNodes', None) or ()):
+                walk(child)
+
+        walk(root)
+        return found
+
+    @staticmethod
+    def _find_open_dialogs(root):
+        found = []
+
+        def walk(node):
+            if getattr(node, 'nodeType', None) != 1:
+                return
+            if str(getattr(node, 'tagName', '')).lower() == 'dialog' and getattr(node, 'open', False):
+                found.append(node)
+            for child in (getattr(node, 'childNodes', None) or ()):
+                walk(child)
+
+        walk(root)
+        return found
+
+    def _center_open_dialogs(self, doc):
+        """Re-centre every open <dialog> over the viewport, once per layout
+        pass -- `ua_style.py` gives `dialog` `position:fixed; left:0; top:0`
+        only so it gets a real shrink-to-fit box to measure here; the
+        correction below (reusing `tree.geometry`'s own post-layout box-move
+        primitive) is what actually places it. Applied once, right after
+        layout, not per paint frame: `draw_open_dialogs`/`click()`'s own
+        dialog hit-testing both read the same persisted box this writes,
+        so what's drawn and what's clickable never disagree."""
+        for dialog in self._find_open_dialogs(doc.body):
+            box = dialog.__dict__.get('_layout_box')
+            if box is None:
+                continue
+            target_x = (self.width - box.width) / 2.0
+            target_y = TOOLBAR + (self.viewport_height - box.height) / 2.0
+            dx, dy = target_x - box.x, target_y - box.y
+            if dx or dy:
+                tree.geometry._shift_subtree(dialog, dx, dy)
+
+    def draw_open_dialogs(self, canvas):
+        """Paint every open <dialog> centred on top of everything else,
+        behind a dimming backdrop -- screen space, called last in `draw()`,
+        deliberately outside the scrolled/clipped page region (see
+        `_center_open_dialogs`'s docstring for why its box is already
+        correct here with no further translation)."""
+        if self.page is None:
+            return
+        dialogs = self._find_open_dialogs(self.page.document.body)
+        if not dialogs:
+            return
+        canvas.drawRect(
+            skia.Rect.MakeXYWH(0, TOOLBAR, self.width, self.viewport_height),
+            skia.Paint(Color4f=skia.Color4f(0, 0, 0, 0.35), AntiAlias=True),
+        )
+        for dialog in dialogs:
+            paint.paint_tree(canvas, dialog)
 
     def begin_selection(self, x, y):
         """Mouse-down in the page area: record where a drag *might* start a
@@ -1084,6 +1551,13 @@ class View:
         except Exception:
             pass  # best-effort -- a page without a listener has nothing to lose
 
+    def _input_selection_range(self):
+        """`(start, end)` of the focused field's current selection, or
+        `None` -- same shape as the address bar's own `_selection_range`."""
+        if self.input_select_anchor is None or self.input_select_anchor == self.input_caret:
+            return None
+        return (min(self.input_select_anchor, self.input_caret), max(self.input_select_anchor, self.input_caret))
+
     def input_type_text(self, text):
         element = self.focused_element
         if element is None:
@@ -1092,6 +1566,12 @@ class View:
         if not text:
             return
         value = str(getattr(element, 'value', '') or '')
+        selection = self._input_selection_range()
+        if selection is not None:
+            start, end = selection
+            value = value[:start] + value[end:]
+            self.input_caret = start
+            self.input_select_anchor = None
         element.value = value[:self.input_caret] + text + value[self.input_caret:]
         self.input_caret += len(text)
         self._dispatch_field_event(element, 'input')
@@ -1106,8 +1586,17 @@ class View:
         if element is None:
             return
         value = str(getattr(element, 'value', '') or '')
+        selection = self._input_selection_range()
         changed = False
-        if key == 'backspace' and self.input_caret:
+        if key in ('backspace', 'delete') and selection is not None:
+            # Either key deletes an active selection outright -- same as a
+            # real text field, regardless of which edge the caret is on.
+            start, end = selection
+            element.value = value[:start] + value[end:]
+            self.input_caret = start
+            self.input_select_anchor = None
+            changed = True
+        elif key == 'backspace' and self.input_caret:
             element.value = value[:self.input_caret - 1] + value[self.input_caret:]
             self.input_caret -= 1
             changed = True
@@ -1115,14 +1604,23 @@ class View:
             element.value = value[:self.input_caret] + value[self.input_caret + 1:]
             changed = True
         elif key == 'left':
-            self.input_caret = max(0, self.input_caret - 1)
+            self.input_caret = selection[0] if selection is not None else max(0, self.input_caret - 1)
+            self.input_select_anchor = None
         elif key == 'right':
-            self.input_caret = min(len(value), self.input_caret + 1)
+            self.input_caret = selection[1] if selection is not None else min(len(value), self.input_caret + 1)
+            self.input_select_anchor = None
         elif key == 'home':
             self.input_caret = 0
+            self.input_select_anchor = None
         elif key == 'end':
             self.input_caret = len(value)
+            self.input_select_anchor = None
         elif key == 'enter' and str(getattr(element, 'tagName', '')).lower() == 'textarea':
+            if selection is not None:
+                start, end = selection
+                value = value[:start] + value[end:]
+                self.input_caret = start
+                self.input_select_anchor = None
             element.value = value[:self.input_caret] + '\n' + value[self.input_caret:]
             self.input_caret += 1
             changed = True
@@ -1297,11 +1795,53 @@ class View:
         italic = fonts.is_italic(style.get('font_style'))
         font = paint._font(font_size, bold=bold, italic=italic, family=style.get('font_family'))
         value = str(getattr(element, 'value', '') or '')
-        prefix = value[:self.input_caret]
-        if (element.getAttribute('type') or '').lower() == 'password':
-            prefix = '•' * len(prefix)
-        text_x = box.x + box.border_left + pad_left + font.measureText(prefix)
-        baseline_y = box.y + box.border_top + pad_top + font_size
+        is_password = (element.getAttribute('type') or '').lower() == 'password'
+        display_value = '•' * len(value) if is_password else value
+        line_height = element.__dict__.get('_chromonic_line_height') or font_size * 1.2
+        text_x0 = box.x + box.border_left + pad_left
+        baseline_y0 = box.y + box.border_top + pad_top + font_size
+
+        def line_col(index):
+            # A textarea's value can contain real newlines -- splitting on
+            # them and measuring only the current line is what makes both
+            # the selection highlight and the caret below track real,
+            # possibly-multi-line text instead of summing glyph advances
+            # straight across every line as if it were one. A single
+            # un-broken line that's word-wrapped by width alone (no `\n`)
+            # still measures across its full logical length -- a real,
+            # smaller remaining gap, not this fix's to close.
+            lines = display_value[:index].split('\n')
+            return len(lines) - 1, lines[-1]
+
+        selection = self._input_selection_range()
+        if selection is not None:
+            start, end = selection
+            highlight = skia.Paint(Color=0xffbfdbfe, AntiAlias=True)
+            ink = skia.Paint(Color=skia.ColorBLACK, AntiAlias=True)
+            start_line, _ = line_col(start)
+            end_line, _ = line_col(end)
+            value_lines = display_value.split('\n')
+            for line_index in range(start_line, end_line + 1):
+                line_text = value_lines[line_index]
+                run_x0 = text_x0 + (font.measureText(line_col(start)[1]) if line_index == start_line else 0.0)
+                col_end = line_col(end)[1] if line_index == end_line else line_text
+                run_x1 = text_x0 + font.measureText(col_end)
+                run_y = baseline_y0 + line_index * line_height
+                canvas.drawRect(
+                    skia.Rect.MakeLTRB(run_x0, run_y - font_size, max(run_x1, run_x0 + 2), run_y + 2),
+                    highlight,
+                )
+                # The highlight is opaque and paints after the page's own
+                # text (this whole method runs post-`paint_display_list`)
+                # -- redrawn on top here, same order the address bar's own
+                # identical-color highlight already uses, or the covered
+                # line(s) would just look blank.
+                canvas.drawString(line_text, text_x0, run_y, font, ink)
+            return  # a real text field shows the highlight, not also a caret
+
+        line_index, current_line = line_col(self.input_caret)
+        text_x = text_x0 + font.measureText(current_line)
+        baseline_y = baseline_y0 + line_index * line_height
         ink = skia.Paint(Color=skia.ColorBLACK, AntiAlias=True)
         canvas.drawLine(text_x, baseline_y - font_size, text_x, baseline_y + 2, ink)
 
@@ -1378,6 +1918,23 @@ class View:
                 sheet.disabled = not self.stylesheets_enabled
         self.status = 'Stylesheets: on' if self.stylesheets_enabled else 'Stylesheets: off'
         self.relayout()
+
+    def toggle_javascript(self):
+        """F7: flip whether a page's own <script>s run at all -- off by
+        default (`__init__`). Takes effect on the *next* load, since a
+        page's scripts run once, at load time; re-navigates to the current
+        URL immediately (same as F5) so the toggle is visible right away
+        instead of silently queued for the next click."""
+        self.javascript_enabled = not self.javascript_enabled
+        # After, not before: a successful `navigate()` clears `self.status`
+        # itself (`commit_page`, stale-error cleanup) and would wipe this
+        # message out immediately if it ran first. Only shown on success --
+        # a failed reload already left its own error in `self.status`,
+        # more useful than silently overwriting it here.
+        ok = self.navigate(self.url) if self.url else False
+        if ok:
+            self.status = 'JavaScript: on' if self.javascript_enabled else 'JavaScript: off'
+        self.dirty = True
 
     VIEW_SOURCE_LINE_HEIGHT = 16
 
@@ -1485,6 +2042,7 @@ class View:
             )
             self.draw_text_selection(canvas)
             self.draw_input_caret(canvas)
+            self.draw_select_dropdown(canvas)
             canvas.restore()
         canvas.drawRect(skia.Rect.MakeWH(self.width, TOOLBAR), skia.Paint(Color=0xffe2e8f0))
         canvas.drawRect(skia.Rect.MakeXYWH(60, 6, max(1, self.width - 120), 32),
@@ -1521,6 +2079,7 @@ class View:
         if self.console_open:
             self.draw_console(canvas)
         self.draw_perf_hud(canvas)
+        self.draw_open_dialogs(canvas)
         self.dirty = False
 
 
@@ -1584,8 +2143,19 @@ class Navigation:
     def request(self, url, *, mode='push', jump_index=None, method='GET', data=None):
         if self.pending is not None:
             self.pending[0].cancel()
-        loader = ((lambda: self.view.loader(url)) if method == 'GET' and data is None
-                  else (lambda: browser.load(url, method=method, data=data)))
+        # Captured now, not read inside the lambda -- `javascript_enabled`
+        # could be toggled again before this submitted request actually
+        # runs on the executor thread, and this request should keep using
+        # whatever was true when it was *made*, not whatever's true later.
+        run_scripts = self.view.javascript_enabled
+        if method == 'GET' and data is None:
+            # Same "only the real loader gets this kwarg" caveat as
+            # `View.navigate()` -- a caller's custom `loader=` (tests) is a
+            # plain one-arg callable and would reject it.
+            loader = ((lambda: self.view.loader(url, run_scripts=run_scripts))
+                      if self.view.loader is browser.load else (lambda: self.view.loader(url)))
+        else:
+            loader = lambda: browser.load(url, method=method, data=data, run_scripts=run_scripts)
         self.pending = (self.executor.submit(loader), url, mode, jump_index, time.perf_counter())
         self.view.address = url
         self.view.caret = len(url)
@@ -1747,7 +2317,9 @@ class WindowInput:
             or ((mods & g.MOD_SUPER) and key == g.KEY_RIGHT_BRACKET)
         )
 
-        if key == g.KEY_F8:
+        if key == g.KEY_F7:
+            self.view.toggle_javascript()
+        elif key == g.KEY_F8:
             self.view.toggle_view_source()
         elif key == g.KEY_F9:
             self.view.toggle_stylesheets()
@@ -1841,11 +2413,22 @@ class WindowInput:
     def _field_key(self, key, command):
         g = self.glfw
         edit_key = self._edit_key_name(key, include_enter=True)
-        if edit_key:
+        if command and key == g.KEY_A:
+            value = str(getattr(self.view.focused_element, 'value', '') or '')
+            self.view.input_select_anchor = 0
+            self.view.input_caret = len(value)
+        elif command and key == g.KEY_C:
+            selection = self.view._input_selection_range()
+            if selection is not None:
+                value = str(getattr(self.view.focused_element, 'value', '') or '')
+                start, end = selection
+                g.set_clipboard_string(self.window, value[start:end])
+        elif edit_key:
             self.view.input_edit_key(edit_key)
         elif command and key == g.KEY_V:
             self.view.input_type_text(_clipboard_text(g, self.window))
         elif key == g.KEY_ESCAPE:
+            self.view.input_select_anchor = None
             self.view.focused_element = None
 
     def on_char(self, _window, codepoint):
@@ -1873,8 +2456,24 @@ class WindowInput:
             if y < TOOLBAR:
                 self.view.click(x, y)
             elif not self.view.view_source_open:
-                self.view.begin_selection(x, y)
+                range_input = self.view._range_hit(x, y)
+                if range_input is not None and range_input.getAttribute('disabled') is None:
+                    # A drag, not a plain click -- handled entirely here and
+                    # in `on_cursor_pos`/the RELEASE branch below, bypassing
+                    # `click()`'s own click-to-jump entirely so a press that
+                    # turns into a drag doesn't also fire a spurious extra
+                    # jump to the press position first.
+                    self.view.dragging_range = range_input
+                    self.view._set_range_value_from_x(range_input, x)
+                    self.view.dirty = True
+                else:
+                    self.view.begin_selection(x, y)
         elif action == g.RELEASE:
+            if self.view.dragging_range is not None:
+                self.view._dispatch_change(self.view.dragging_range)
+                self.view.dragging_range = None
+                self.view.relayout()
+                return
             was_pending = self.view._mouse_down_pos is not None
             selected = self.view.end_selection()
             if was_pending and not selected:
@@ -1884,6 +2483,12 @@ class WindowInput:
         self.view.scroll(-dy * 40)
 
     def on_cursor_pos(self, _window, x, y):
+        if self.view.dragging_range is not None:
+            before = getattr(self.view.dragging_range, 'value', None)
+            self.view._set_range_value_from_x(self.view.dragging_range, x)
+            if self.view.dragging_range.value != before:
+                self.view.relayout()
+            return
         self.view.update_selection(x, y)
         kind = self.view.cursor_kind(x, y)
         if kind == self._last_cursor_kind:
@@ -1999,6 +2604,7 @@ def run(url='chromonic://home', *, width=1000, height=800, title='chromonic — 
 
                 navigation.poll()
                 view.poll_images()
+                view.poll_videos()
                 view.poll_deferred_work()
             except BaseException as error:
                 # `except Exception:` alone never actually catches a Rust

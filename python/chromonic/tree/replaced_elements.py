@@ -17,8 +17,14 @@ def _form_control_display_text(element) -> str:
     if tag_name == "textarea":
         return getattr(element, "value", "") or element.textContent or ""
     input_type = (element.getAttribute("type") or "text").lower()
-    if input_type in {"checkbox", "radio", "button", "submit", "reset", "file", "hidden"}:
-        return ""
+    if input_type in {"checkbox", "radio", "hidden", "color"}:
+        return ""  # colour has its own swatch fill (paint.py) -- no text on top of it
+    if input_type in {"submit", "reset", "button"}:
+        default = {"submit": "Submit", "reset": "Reset"}.get(input_type, "")
+        return element.getAttribute("value") or default
+    if input_type == "file":
+        value = getattr(element, "value", "") or ""
+        return value.rsplit("/", 1)[-1] if value else "Choose File"
     value = getattr(element, "value", "") or ""
     if value and input_type == "password":
         text = "•" * len(str(value))
@@ -27,6 +33,31 @@ def _form_control_display_text(element) -> str:
     style = element.__dict__.get("_chromonic_paint_style", {})
     return dom._apply_text_transform(text, style.get("text_transform"))
 
+
+
+#: Shared by `builder.py` (box height), `paint.py` (row painting), and
+#: `native_browser.py` (click row hit-testing) so all three always agree.
+LISTBOX_ROW_HEIGHT = 18.0
+
+
+def _listbox_row_count(element) -> int:
+    """0 means an ordinary closed dropdown (`_select_display_text`'s single
+    line); otherwise the number of always-visible option rows a real
+    `<select multiple>`/`size` attribute renders as -- HTML: `size` wins
+    when given (even without `multiple`); `multiple` alone with no `size`
+    defaults to 4."""
+    size = 0
+    size_attr = element.getAttribute("size")
+    if size_attr:
+        try:
+            size = int(size_attr)
+        except ValueError:
+            size = 0
+    if size > 1:
+        return size
+    if element.hasAttribute("multiple"):
+        return size if size > 0 else 4
+    return 0
 
 
 def _select_display_text(element) -> str:
@@ -263,6 +294,40 @@ def _resolve_replaced_percent_height(style: dict, element, height_attr: str) -> 
         return cb_height * float(height_attr[:-1]) / 100.0
     except ValueError:
         return None
+
+
+
+def _apply_video_intrinsic_size(style: dict, element) -> None:
+    """<video> is a replaced element sized from the decoded stream's own
+    dimensions (`video_backend.py`, via ffprobe) -- the same "auto axis
+    takes the intrinsic size, one auto axis scales by the intrinsic ratio"
+    shape `_apply_image_intrinsic_size` uses for <img>, just simplified:
+    doesn't yet handle a declared `aspect-ratio` override or a percentage
+    height against an indefinite containing block the way that function
+    does. No/undecodable source: `ua_style.py`'s 300x150 default (same as
+    canvas/iframe) stands, untouched."""
+    if style["width"] != "auto" and style["height"] != "auto":
+        return
+    from .. import video_backend
+    decoder = video_backend.decoder_for(element)
+    width_auto, height_auto = style["width"] == "auto", style["height"] == "auto"
+    if decoder is None or not decoder.ready:
+        # CSS Images 3 5.2's fallback when nothing intrinsic is known --
+        # 300x150, same UA default canvas/iframe use (there as a real CSS
+        # rule; done here in code since -- unlike those -- an auto axis
+        # here should still prefer the decoded size the moment it's ready).
+        if width_auto:
+            style["width"] = 300.0
+        if height_auto:
+            style["height"] = 150.0
+        return
+    intrinsic_ratio = decoder.width / decoder.height
+    if width_auto and height_auto:
+        style["width"], style["height"] = float(decoder.width), float(decoder.height)
+    elif width_auto and isinstance(style["height"], (int, float)):
+        style["width"] = style["height"] * intrinsic_ratio
+    elif height_auto and isinstance(style["width"], (int, float)):
+        style["height"] = style["width"] / intrinsic_ratio
 
 
 

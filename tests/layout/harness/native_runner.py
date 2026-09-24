@@ -167,7 +167,11 @@ def run(fixture: Path, output: Path, screenshot: Path, *, viewport=VIEWPORT, loa
     # (`/fonts/ahem.css`, common in the real web-platform-tests suite),
     # only a real HTTP(S) URL resolves those correctly; `browser.load()`
     # already fetches over HTTP(S) or the filesystem based on `_is_url()`.
-    page = browser.load(load_url if load_url is not None else str(fixture.resolve()))
+    # `run_scripts=False`: this harness measures static CSS/layout
+    # correctness against a Chrome screenshot -- see `browser.load`'s own
+    # docstring for why a fixture's own JS (`testharness.js` included)
+    # must not run here.
+    page = browser.load(load_url if load_url is not None else str(fixture.resolve()), run_scripts=False)
     registry = webfonts.registry(page.document.body)
     if registry is not None:
         for face in registry.faces:

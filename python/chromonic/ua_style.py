@@ -104,10 +104,22 @@ pre { white-space: pre; }
 small { font-size: 0.83em; }
 a { color: #0000ee; }
 hr { margin: 0.5em 0; border: 1px solid; height: 0; }
-button, input { display: inline-block; font: 13.3333px Arial; margin: 0; }
-button { padding: 1px 6px; border: 2px solid; box-sizing: border-box; text-align: center; }
-input { width: 145px; height: 15px; padding: 1px 2px; border: 2px solid; box-sizing: content-box; overflow: clip; }
+button, input, select, textarea { display: inline-block; font: 13.3333px Arial; margin: 0; color: black; background-color: white; }
+button { padding: 1px 6px; border: 1px solid #767676; box-sizing: border-box; text-align: center; }
+input { width: 145px; height: 15px; padding: 1px 2px; border: 1px solid #767676; box-sizing: content-box; overflow: clip; }
+select { padding: 1px 6px; border: 1px solid #767676; box-sizing: border-box; }
+textarea { width: 145px; height: 60px; padding: 2px; border: 1px solid #767676; box-sizing: border-box; overflow: clip; }
 iframe { display: inline-block; width: 300px; height: 150px; border: 2px solid; box-sizing: content-box; }
+video { display: inline-block; background-color: black; }
+svg { overflow: hidden; }
+input[type=checkbox], input[type=radio] { width: 13px; height: 13px; padding: 0; border: 1px solid #767676; box-sizing: border-box; vertical-align: middle; }
+input[type=color] { width: 40px; height: 22px; padding: 2px; }
+input[type=range] { width: 145px; height: 20px; padding: 0; border: 0; background-color: transparent; }
+input[type=file] { width: auto; padding: 1px 6px; }
+progress, meter { display: inline-block; width: 160px; height: 16px; border: 1px solid #767676; box-sizing: border-box; padding: 0; vertical-align: middle; }
+summary { display: block; padding: 0 0 0 16px; cursor: pointer; }
+dialog { display: none; position: fixed; left: 0; top: 0; margin: 0; padding: 1em; border: 1px solid #767676; color: black; background-color: white; }
+dialog[open] { display: block; }
 """.strip()
 
 STYLESHEET = f"@layer chromonic-ua {{\n{_RULES}\n}}"
