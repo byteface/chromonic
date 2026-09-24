@@ -146,22 +146,14 @@ def _table_rows(table_element, computed_cache) -> list:
     `<tbody>`/`<thead>`/`<tfoot>`). Stops at a nested table's own
     boundary -- its rows belong to it, not this one.
 
-    CSS 2.1 17.5.3: however many header/body/footer row-groups appear,
-    and in whatever source order, they're always *displayed* in a fixed
-    header-groups, then body-groups, then footer-groups order -- a
-    `<tfoot>` authored first (a common pattern, so its totals row can
-    reach the network before the body finishes loading) still renders
-    last. A row with no row-group ancestor at all counts as an (implicit)
-    body row, same as a `table-row-group`. Row order *within* each bucket,
-    and row-group order within `header`/`footer` (multiple of either is
-    non-conforming markup, but not fatal here), stays DOM order."""
+    CSS 2.1 17.5.3: header/body/footer row-groups always *display* in that
+    fixed order regardless of source order -- a `<tfoot>` authored first
+    still renders last. A row with no row-group ancestor counts as an
+    implicit body row. Order within each bucket stays DOM order."""
     buckets: dict[str, list] = {"header": [], "body": [], "footer": []}
-    # Only the *first* header group and the *first* footer group get their
-    # special placement -- any further `thead`/`tfoot` (or `table-header-
-    # group`/`table-footer-group` element) is laid out as an ordinary body
-    # group in source order, as Chrome does. Confirmed on border-spacing-
-    # applies-to-010.xht: two `display: table-footer-group` siblings
-    # rendered in source order in Chrome, not both hoisted to the end.
+    # Only the first header group and first footer group get special
+    # placement -- any further one is an ordinary body group in source
+    # order, as Chrome does -- border-spacing-applies-to-010.xht.
     claimed: set = set()
 
     def walk(node, kind: str):
@@ -176,16 +168,9 @@ def _table_rows(table_element, computed_cache) -> list:
                 continue
             if box_model._is_absolutely_positioned(child_style):
                 # CSS 2.1 9.7: an absolutely/fixed positioned element's
-                # `display` blockifies regardless of its specified value
-                # (`table-row`/`table-row-group`/etc. included) -- pulled
-                # entirely out of the table's own row/row-group structure,
-                # not even transparently walked into for nested rows the
-                # way an ordinary non-table wrapper is below. Confirmed
-                # directly on `top-applies-to-001.xht`: an absolutely
-                # positioned `display:table-row-group` element was still
-                # being placed as a real row-group here, landing it inside
-                # the table's normal flow (y=178) instead of at its own
-                # `top:0` offset (y=0).
+                # display blockifies regardless of its specified value --
+                # pulled entirely out of the row/row-group structure, not
+                # even walked transparently. top-applies-to-001.xht.
                 continue
             if tag == "tr" or _is_table_row_display(child_computed):
                 buckets[kind].append(child)
@@ -447,9 +432,8 @@ def _resolve_collapsed_table_borders(table_element, table_computed, rows, cells,
         if group is not None:
             computed = dom._describe(group, computed_cache)[0]
             if c == 0 or columns[c - 1][1] is not group:
-                # First column of this group: contribute the group's own
-                # left/right borders once, at the physical edges of its
-                # whole logical span.
+                # First column of this group: contribute its left/right
+                # borders once, at the physical edges of its whole span.
                 span_end = c + 1
                 while span_end < column_count and columns[span_end][1] is group:
                     span_end += 1
@@ -522,25 +506,20 @@ def _compute_table_column_widths(cells, computed_cache) -> dict:
             single_cells[id(cell)] = col_index
             if width is not None:
                 per_column[col_index] = max(per_column.get(col_index, 0.0), width)
-            # CSS 2.1 17.5.2.2's other half: a column can never be made
-            # narrower than its widest cell's *minimum* content width (its
-            # longest unbreakable word) plus that cell's own padding and
-            # borders -- the floor a table sits on when its container is
-            # too narrow (it overflows rather than squeezing cells below
-            # it, confirmed on collapsing-border-model-005.xht: a 34px
-            # min-content table in a 32px div is 34px wide in Chrome).
-            # `replaced_elements._measure_intrinsic_width` just built this cell in a scratch
-            # tree, so `_chromonic_native_style` carries its real resolved
-            # padding/borders (collapsed halves included).
+            # CSS 2.1 17.5.2.2: a column can't be narrower than its widest
+            # cell's minimum content width plus padding/borders -- the floor
+            # a table sits on when its container is too narrow, overflowing
+            # rather than squeezing -- collapsing-border-model-005.xht.
+            # `replaced_elements._measure_intrinsic_width` already built this cell in a scratch
+            # tree, so `_chromonic_native_style` carries its resolved edges.
             native = getattr(cell, "_chromonic_native_style", None) or {}
             edges = list(native.get("padding") or (0.0,) * 4) + list(native.get("border") or (0.0,) * 4)
             horizontal = box_model._numeric_edge(edges[1]) + box_model._numeric_edge(edges[3]) + box_model._numeric_edge(edges[5]) + box_model._numeric_edge(edges[7])
             minimum = (replaced_elements._measure_min_content_width(cell, computed_cache) or 0.0) + horizontal
             if width is not None:
-                # Never past the real (laid-out) max-content: the token
-                # measure knows nothing of a child's negative margin
-                # (table-height-algorithm-026.xht: a `margin-left: -10px`
-                # div's one word is 320px, the cell's content 310).
+                # Never past the real max-content -- the token measure
+                # doesn't know a child's negative margin, table-height-
+                # algorithm-026.xht.
                 minimum = min(minimum, width)
             per_column_min[col_index] = max(per_column_min.get(col_index, 0.0), minimum)
         else:
@@ -596,15 +575,12 @@ def _compute_fixed_column_widths(table_element, cells, column_count, columns, co
     layout-003a01..f08.xht (padding/border/`box-sizing` variants of one
     80px cell in a 400px table all resolving to a 200px column)."""
     widths: list = [None] * column_count
-    # A percentage (on a column or a first-row cell) resolves against the
-    # space the columns actually share: the table's content width less
-    # every inter-column gap (fixed-table-layout-017.xht: `40%` of a
-    # 422px table with 12px of borders and 2px spacing over 4 columns is
-    # 160px, i.e. 40% of 400).
+    # A percentage resolves against the table's content width less every
+    # inter-column gap -- fixed-table-layout-017.xht.
     percentage_base = max(0.0, content_width - spacing_h * max(0, column_count - 1))
     for c, (column, _group) in enumerate(columns):
-        # Only a `<col>`'s own width -- a column *group*'s is ignored in
-        # fixed layout (fixed-table-layout-013.xht/-014.xht).
+        # Only a <col>'s own width -- a column group's is ignored in fixed
+        # layout -- fixed-table-layout-013.xht/-014.xht.
         if column is None:
             continue
         width = style_bridge._len(dom._describe(column, computed_cache)[1].width)
@@ -662,27 +638,22 @@ _TABLE_INTERNAL_DISPLAYS = frozenset({
 
 
 def _fix_table_shrink_to_fit_width(tree_obj, node_map: dict) -> bool:
-    """CSS 2.1 17.5.2: an outer `display:table`/`inline-table` box with
-    `width:auto` is sized by shrink-to-fit (summed column widths), the
-    same as a float or `inline-block` -- not stretched to fill its
-    containing block the way an ordinary block is. Chromonic's table
-    root has no dedicated Taffy display mode of its own (plain "block",
-    same as any other box; only its `<tr>`-equivalent children switch to
-    a flex-row simulation -- see `build()`'s `is_table_row` handling), so
-    it reaches this point laid out full-width first, same starting point
-    `_fix_float_shrink_to_fit_width` corrects for floats -- reuses the
-    identical technique (a fresh, max-content `tree.compute()` for just
-    this subtree).
+    """CSS 2.1 17.5.2: an outer table/inline-table box with width:auto
+    shrink-to-fits like a float or inline-block, not stretched full-width
+    like an ordinary block. Chromonic's table root has no dedicated Taffy
+    display mode (plain "block"), so it reaches this point laid out
+    full-width first -- same starting point `_fix_float_shrink_to_fit_width`
+    corrects for floats, reusing the identical technique (a fresh
+    max-content `tree.compute()` for just this subtree).
 
-    Returns whether any subtree was actually shifted -- see `_fix_float_
-    shrink_to_fit_width`'s return value for why the caller needs this."""
+    Returns whether any subtree was actually shifted -- see
+    `_fix_float_shrink_to_fit_width`'s return value for why the caller needs this."""
     shifted = False
     by_id = {id(element): node_id for node_id, element in node_map.items()}
-    # Reversed: `node_map` is in Taffy node-creation order, which `build()`
-    # produces depth-first with children before their parent -- so a table
-    # nested inside another came first here, got shrunk, and was then
-    # overwritten by the *outer* table's own recompute (`geometry._write_boxes`
-    # covers the whole subtree). Outer first, inner last, keeps both.
+    # Reversed: node_map is in Taffy creation order (children before their
+    # parent), so a nested table got shrunk first and then overwritten by
+    # the outer table's own recompute (`geometry._write_boxes` covers the whole
+    # subtree) -- outer first, inner last, keeps both.
     for element in reversed(list(node_map.values())):
         if not dom._is_element(element):
             continue
@@ -698,23 +669,18 @@ def _fix_table_shrink_to_fit_width(tree_obj, node_map: dict) -> bool:
         max_content = getattr(element, "_chromonic_table_max_content_width", None)
         if max_content is not None:
             max_content = max(max_content, getattr(element, "_chromonic_table_caption_min_width", 0.0) or 0.0)
-            # The real CSS 2.1 17.5.2.2 max-content width, from the
-            # resolved columns (see the `is_table_root` branch of
-            # `build()`), laid out as a *definite* width so the row's
-            # cells land exactly on their bases -- captions never widen
-            # it (a wide caption wraps to the grid, caption-side-example-
-            # 001.xht). `available_width` is the containing-block width
-            # Taffy positions this root's own margins within.
+            # CSS 2.1 17.5.2.2 max-content width, from `_setup_table_root`'s resolved
+            # columns, laid out as a definite width so the row's cells land
+            # exactly on their bases -- captions never widen it (a wide
+            # caption wraps to the grid, caption-side-example-001.xht).
             new_width = min(box.width, max_content)
             grow = False
             if new_width >= box.width - 1e-6:
-                # Shrink-to-fit never grows a box past its available
-                # width -- but an `inline-table`, a flex item of the
-                # inline-content approximation, can come out of Taffy
-                # *narrower* than its columns, sized from its text alone
-                # (inline-table-001.xht: the table around a `width: 1in`
-                # cell at 66.6px, its text's width, not 96). With room in
-                # the containing block it takes its full max-content width.
+                # Shrink-to-fit never grows past its available width -- but
+                # an inline-table flex item can come out of Taffy narrower
+                # than its columns, sized from its text alone --
+                # inline-table-001.xht. With room in the containing block
+                # it takes its full max-content width.
                 parent = dom._layout_parent(element)
                 parent_box = parent.__dict__.get("_layout_box") if parent is not None and hasattr(parent, "__dict__") else None
                 room = None
@@ -762,23 +728,15 @@ def _is_inline_table_box(element) -> bool:
 
 def _distribute_table_extra_height_in(table) -> None:
     """CSS 2.1 17.5.3: when a table's specified height (a minimum -- see
-    `build()`'s table-root `min_height` handling) leaves surplus space
-    below its rows, that surplus is handed out to the rows, not left as
-    empty space inside the table box the way an ordinary block's `height`
-    would leave it. Taffy lays the rows out at their own content heights
-    inside the (already correctly tall) table box, so this stretches them
-    to fill it afterwards: each grown row's cells grow with it (a cell
-    always spans its row's full height), every later row and the row
-    groups' own boxes move/grow to match.
+    `build()`'s table-root min_height handling) leaves surplus below its
+    rows, the surplus is handed to the rows rather than left as empty
+    table-box space -- each grown row's cells grow with it, later rows and
+    row groups move/grow to match.
 
-    Which rows get the surplus follows Chrome: rows that have any real
-    content share it in proportion to their heights; only when every row
-    is empty is it split evenly between them all. Confirmed directly on
-    border-conflict-element-001.xht (`table { height: 2in }`, three rows
-    of empty bordered cells: each row 62.3px tall in Chrome, 5px here
-    before this pass). Cell *content* stays where Taffy put it -- top-
-    aligned; `vertical-align: middle` (Chrome's UA default for cells) is
-    a separate piece not yet built."""
+    Rows with real content share the surplus in proportion to height; only
+    when every row is empty is it split evenly -- matches Chrome,
+    border-conflict-element-001.xht. Cell content stays top-aligned where
+    Taffy put it; vertical-align:middle isn't built yet."""
     for element in (table,):  # one table per call; `continue` below means "done"
         box = element.__dict__.get("_layout_box")
         rows = [row for row in (getattr(element, "_chromonic_table_rows", None) or ())
@@ -786,10 +744,8 @@ def _distribute_table_extra_height_in(table) -> None:
         if box is None:
             continue
         if not rows:
-            # No rows at all, but a specified height: the (empty) grid is
-            # still that tall, below any captions (table-caption-margins-
-            # 001.xht: a 15px `display: table` holding only a caption is
-            # caption box plus 15px).
+            # No rows, but a specified height: the empty grid is still that
+            # tall, below any captions -- table-caption-margins-001.xht.
             specified = getattr(element, "_chromonic_table_specified_height", None)
             if specified is None:
                 continue
@@ -829,16 +785,13 @@ def _distribute_table_extra_height_in(table) -> None:
         last_box = rows[-1].__dict__["_layout_box"]
         rows_extent = (last_box.y + last_box.height) - first_box.y
         chrome_height = box.border_top + padding_top + border_bottom + padding_bottom
-        # Surplus already inside the box (a `min_height` Taffy honoured with
+        # Surplus already inside the box (a min_height Taffy honoured with
         # nothing but caption-free rows to fill it) ...
         extra = inner_bottom - (last_box.y + last_box.height)
         # ... or, with captions in the box, the specified height applies to
-        # the *grid* alone (CSS 2.1 17.4: captions sit outside the table
-        # box, in the wrapper) -- so the grid may need to grow past what
-        # the box currently holds, and the box with it. Confirmed on
-        # border-collapse-applies-to-015.xht: a 100px `display:table` with
-        # a 100px caption and one 10px row is 210px tall in Chrome (row
-        # stretched to the full 100), not 120.
+        # the grid alone (CSS 2.1 17.4: captions sit outside the table box)
+        # -- the grid may need to grow past what the box currently holds,
+        # and the box with it -- border-collapse-applies-to-015.xht.
         specified = getattr(element, "_chromonic_table_specified_height", None)
         if specified is not None:
             native = getattr(element, "_chromonic_native_style", None) or {}
@@ -851,22 +804,13 @@ def _distribute_table_extra_height_in(table) -> None:
             # The table's own box only: `_settle_table` propagates the
             # table's net growth to what follows it, once.
             geometry._grow_box_height(element, growth)
-        # CSS 2.1 17.5.3: a row (or any of its own cells) with a real
-        # specified height is not a candidate for the surplus at all --
-        # only rows left to their own auto/content height take a share
-        # of it. Found on `wpt/css/css-grid/grid-model/display-grid.html`'s
-        # own reference `<table>`: a `height:100%` table with one row's
-        # `td`s given an explicit `height:30px` and the other row left
-        # auto split the surplus 37.5/62.5 (proportional to *both* rows'
-        # current heights) instead of leaving the explicit row at its own
-        # 30px and handing the auto row the entire remainder (70).
+        # CSS 2.1 17.5.3: a row (or its cells) with a real specified height
+        # isn't a candidate for the surplus -- only auto/content-height rows
+        # share it. wpt/css/css-grid/grid-model/display-grid.html.
         def _has_specified_height(row) -> bool:
-            # A row's or cell's own declared `height` is converted to
-            # `min_height` (with `height` itself reset to `auto`) back in
-            # `build()`'s `is_table_row`/`is_table_cell` branches, per CSS
-            # 2.1 17.5.3's "specified height is a minimum" -- so the
-            # signal to read here is `min_height`, not `height` (which is
-            # always `"auto"` on a table row/cell by this point).
+            # A row's/cell's declared height is converted to min_height
+            # (height reset to auto) in `_setup_table_row_or_cell` per CSS
+            # 2.1 17.5.3 -- so min_height is the signal to read here.
             row_native = getattr(row, "_chromonic_native_style", None) or {}
             if isinstance(row_native.get("min_height"), (int, float)) and row_native["min_height"] > 0.0:
                 return True
@@ -884,9 +828,8 @@ def _distribute_table_extra_height_in(table) -> None:
         seen_ancestors: set = set()
         group_growth: dict = {}
         for row in rows:
-            # A row group's (or any wrapper's) own box starts where its
-            # first row does: moved by the shift accumulated before that
-            # row, grown by everything its rows gain.
+            # A row group's box starts where its first row does: moved by
+            # the shift accumulated before that row, grown by its rows' gains.
             ancestor = dom._layout_parent(row)
             while ancestor is not None and ancestor is not element:
                 if id(ancestor) not in seen_ancestors:
@@ -962,15 +905,10 @@ def _layout_children(element):
 
 def _table_cell_baseline(cell, box, padding) -> "float | None":
     """CSS 2.1 17.5.3: a cell's baseline is that of its first in-flow line
-    box (or first in-flow row); with neither, it's synthesized from the
-    bottom of the cell's content -- the content's own extent, not the
-    cell box Taffy already stretched to its row (empty-cells-applies-to-
-    008.xht: a cell holding a 16px rowless table beside an 18px text
-    cell puts the row's baseline at 16, making the row 20px, not 22).
-    `None` for a cell with nothing in it at all: it has no baseline and
-    takes no part in the row's alignment (table-vertical-align-baseline-
-    008.xht: an inline-table whose one cell is empty aligns on its
-    bottom edge, not on that cell's top)."""
+    box (or row); with neither, synthesized from the content's own extent,
+    not the cell box Taffy stretched to its row --
+    empty-cells-applies-to-008.xht. `None` for an empty cell: no baseline,
+    no part in row alignment -- table-vertical-align-baseline-008.xht."""
     baseline = box_model._first_baseline(cell)
     if baseline is not None:
         return baseline
@@ -1006,28 +944,21 @@ def _table_row_baseline(row, row_box) -> float:
         return max(aligned)
     if lowest is not None:
         return lowest
-    # A row with no cells at all: its baseline is its top, as Chrome has
-    # it (empty-cells-applies-to-011.xht: a 16px cell-less `table-row`
-    # wrapped into an anonymous cell sits with its top on the row's
-    # baseline, 14px down, and the row is 30px tall).
+    # A row with no cells at all: its baseline is its top, matching Chrome
+    # -- empty-cells-applies-to-011.xht.
     return row_box.y
 
 
 
 def _align_table_cell_baselines_in(table) -> None:
-    """CSS 2.1 17.5.4: every cell in a row whose `vertical-align` is
-    `baseline` -- or any other value but `top`/`middle`/`bottom` (`sub`,
-    `super`, `text-top`, a length...), which all mean `baseline` for a
-    cell -- has its content pushed down so its first baseline meets the
-    row's baseline, the lowest of theirs; a cell with no line box
-    contributes its bottom content edge. A cell pushed past its row's
-    height makes the row (and its table) taller. Runs before the
-    `middle`/`bottom` alignment and the surplus-height distribution, both
-    of which need the rows' final heights. Confirmed on table-vertical-
-    align-baseline-001.xht (three baseline cells with 40/20/0px top
-    padding: their text lines share one baseline in Chrome) and
-    table-height-algorithm-019.xht (`vertical-align: sub` on three cells
-    of 10/20/30pt text)."""
+    """CSS 2.1 17.5.4: every cell whose vertical-align means baseline for a
+    cell (baseline itself, or anything but top/middle/bottom) has its
+    content pushed down to meet the row's lowest baseline; a cell with no
+    line box contributes its bottom content edge. A cell pushed past its
+    row's height makes the row (and table) taller. Runs before
+    middle/bottom alignment and surplus-height distribution, which need
+    final row heights. table-vertical-align-baseline-001.xht,
+    table-height-algorithm-019.xht."""
     for element in (table,):
         for row in getattr(element, "_chromonic_table_rows", None) or ():
             entries = []
@@ -1075,28 +1006,22 @@ def _align_table_cell_baselines_in(table) -> None:
 
 
 def _settle_table(table) -> None:
-    """Settle `table`'s vertical geometry -- baseline-align its cells,
-    hand any specified-height surplus to its rows, then place `middle`/
-    `bottom` cell content -- once per Taffy result (`geometry._write_boxes` resets
-    the mark when it rewrites the table), and only then carry the
-    table's net growth to what follows it, exactly once per layout pass:
-    a second settle after a shrink-to-fit recompute finds the ancestors
-    and later siblings already moved. Called from the table pipeline for
-    every table, innermost first, and on demand by `box_model._first_baseline`:
-    an `inline-table`'s baseline is read by the flex-row alignment
-    before the table pipeline runs, and must see settled rows
-    (table-vertical-align-baseline-008.xht: its one empty cell is 0px
-    tall until the table's 100px height is distributed)."""
+    """Settle `table`'s vertical geometry -- baseline-align cells, hand
+    specified-height surplus to rows, place middle/bottom cell content --
+    once per Taffy result (`geometry._write_boxes` resets the mark), then carry
+    the table's net growth to what follows it exactly once per pass (a
+    second settle after a shrink-to-fit recompute finds ancestors/siblings
+    already moved). Called innermost-table-first from the table pipeline,
+    and on demand by `box_model._first_baseline`: an inline-table's baseline is read
+    by flex-row alignment before the table pipeline runs, and must see
+    settled rows -- table-vertical-align-baseline-008.xht."""
     if table.__dict__.get("_chromonic_table_settled"):
         return
     table.__dict__["_chromonic_table_settled"] = True
     before = table.__dict__.get("_layout_box")
-    # Rowspans first, collapsing after: a `visibility: collapse` row is
-    # laid out like any other -- it takes its share of a spanning cell's
-    # height (row-visibility-003.xht: a two-line `rowspan=2` cell over a
-    # visible and a collapsed row leaves the visible row one line tall,
-    # the second line vanishing with the collapsed row) -- and only then
-    # is flattened to nothing.
+    # Rowspans first, collapsing after: a visibility:collapse row still
+    # takes its share of a spanning cell's height before being flattened --
+    # row-visibility-003.xht.
     _settle_rowspan_cells_in(table)
     _settle_collapsed_cells_in(table)
     _collapse_rows_in(table)
@@ -1158,12 +1083,10 @@ def _resize_table_row(table, row, delta: float, exclude=frozenset()) -> None:
 
 def _settle_collapsed_cells_in(table) -> None:
     """CSS 2.1 17.5.5, after layout: every row item laid out at a
-    `visibility: collapse` column's real width (a cell, a colspan across
-    one, a rowspan placeholder -- see `build()`'s cell branch) is
-    narrowed by the collapsed width, and everything after it in the row
-    moved up by that plus the lost border-spacing gap. The items were
-    built with `flex-shrink: 0`, so their Taffy positions are exactly the
-    uncollapsed ones this works from."""
+    visibility:collapse column's real width is narrowed by the collapsed
+    width, everything after it in the row moved up by that plus the lost
+    border-spacing gap. Items were built with flex-shrink:0, so their
+    Taffy positions are exactly the uncollapsed ones this works from."""
     if not getattr(table, "_chromonic_table_collapsed_columns", None):
         return
     rtl = getattr(table, "_chromonic_table_rtl", False)
@@ -1185,9 +1108,7 @@ def _settle_collapsed_cells_in(table) -> None:
         moved = 0.0
         for item, box, (pre_move, shrink, shift), is_cell in items:
             # The gap before this item's own collapsed first column goes
-            # with it: the item moves up by it (column-visibility-003.xht:
-            # the collapsed cell sits flush against its neighbour at
-            # 268px, not 270).
+            # with it -- column-visibility-003.xht.
             moved += pre_move
             if moved:
                 dx = moved if rtl else -moved
@@ -1206,9 +1127,8 @@ def _settle_collapsed_cells_in(table) -> None:
         lost = max(lost, moved)
     if lost <= 0.01:
         return
-    # The rows, their groups and the table box (an auto-width one) give
-    # up the same width (column-visibility-004.xht: four 100px columns,
-    # one collapsed, make a 308px table -- three columns and four gaps).
+    # Rows, their groups, and an auto-width table box all give up the
+    # same width -- column-visibility-004.xht.
 
     def narrow(element, amount: float) -> None:
         box = element.__dict__.get("_layout_box")
@@ -1270,19 +1190,14 @@ def _spanning_cells(table) -> "tuple[list, list]":
 
 
 def _settle_rowspan_cells_in(table) -> None:
-    """CSS 2.1 17.5.3 for `rowspan`: a spanning cell's height is spread
-    over the rows it spans, not loaded onto the first. Taffy, seeing it
-    as one item of its first row, stretched that row (and every cell in
-    it) to the spanning cell's whole content height -- so first the row
-    is brought back to what its *other* cells and its own `height` need,
-    then, where the spanned rows together still can't hold the cell,
-    the shortfall is dealt out to them in proportion to their heights
-    (equally when they're all empty). The cell's own box is fitted to
-    its rows last, by `_cover_spanned_rows_in`, once every row height is
-    final. Confirmed on table-height-algorithm-010.xht (a ten-line
-    `rowspan=10` cell over ten `height: 1em` rows: the table is exactly
-    ten rows tall) and -018.xht (a `height: 200px` table's two rows,
-    97px each, under a spanning cell)."""
+    """CSS 2.1 17.5.3 for rowspan: a spanning cell's height is spread over
+    the rows it spans, not loaded onto the first. Taffy stretched the first
+    row (and its cells) to the spanning cell's whole content height, so
+    first the row is brought back to what its other cells/own height need,
+    then any remaining shortfall is dealt to the spanned rows in
+    proportion to height (equally if all empty). The cell's own box is
+    fitted last, by `_cover_spanned_rows_in`, once row heights are final.
+    table-height-algorithm-010.xht, -018.xht."""
     rows, spanning = _spanning_cells(table)
     if not spanning:
         return
@@ -1353,26 +1268,18 @@ def _settle_tables(node_map: dict) -> None:
 
 
 def _align_table_cell_content_in(table) -> None:
-    """CSS 2.1 17.5.4: a cell's `vertical-align` positions its *content*
-    within the cell box, whose height is always the full row height --
-    `middle` centres it, `bottom` sinks it to the bottom; `top` and
-    `baseline` (the latter approximated as top: every cell in these
-    fixtures' rows shares one font, so their first baselines already
-    line up) leave it where Taffy put it. Chrome's UA stylesheet makes
-    `middle` the default for every `<td>`/`<th>` (`ua_style.py`), so this
-    fires for essentially every real table whose rows are taller than
-    some cell's own content -- confirmed on border-conflict-style-001.xht
-    (`height: 3em` cells, one line of text each: Chrome's text sits 15px
-    lower than the content-box top).
+    """CSS 2.1 17.5.4: a cell's vertical-align positions its content within
+    the (full-row-height) cell box -- middle centres it, bottom sinks it;
+    top/baseline (baseline approximated as top) leave it where Taffy put
+    it. Chrome's UA default is middle for td/th (`ua_style.py`), so this
+    fires for most real tables -- border-conflict-style-001.xht.
 
-    Runs after `_distribute_table_extra_height`, once every row's height
-    is final. A text-only cell gets `_chromonic_content_offset_y`, which
-    `paint.py`/the harness add when placing its lines; a cell holding
-    block children has each child's subtree shifted for real. A cell with
-    mixed inline content (its own `_InlineFormattingPlan` fragments,
-    shared between it and its inline descendants) is left top-aligned for
-    now -- shifting those shared fragment lists safely needs the same
-    re-publish machinery the shrink-to-fit passes use."""
+    Runs after `_distribute_table_extra_height_in`, once row heights are final.
+    A text-only cell gets `_chromonic_content_offset_y` (paint.py/the
+    harness apply it); a cell with block children has each child's subtree
+    shifted for real. Mixed inline content is left top-aligned for now --
+    shifting shared `_InlineFormattingPlan` fragment lists safely needs the
+    shrink-to-fit passes' re-publish machinery."""
     for element in (table,):
         for row in getattr(element, "_chromonic_table_rows", None) or ():
             for cell in getattr(row, "_chromonic_table_cells", None) or ():
@@ -1424,11 +1331,9 @@ def _enforce_fixed_column_boxes(node_map: dict) -> None:
         spacing_h = getattr(element, "_chromonic_border_spacing", (0.0, 0.0))[0]
         columns = getattr(element, "_chromonic_table_columns_max", None)
         if not columns:
-            # A percentage-width fixed table: its content width was
-            # unknown at build time, so the exact CSS 2.1 17.5.2.1 column
-            # algorithm runs here instead, against the box Taffy gave it
-            # (fixed-table-layout-023.xht: `width: 80%`). Styles were all
-            # resolved during the build -- reused, not recomputed.
+            # A percentage-width fixed table: content width was unknown at
+            # build time, so the exact CSS 2.1 17.5.2.1 algorithm runs here
+            # against the box Taffy gave it -- fixed-table-layout-023.xht.
             box = element.__dict__.get("_layout_box")
             grid_columns = getattr(element, "_chromonic_table_columns", None) or []
             if box is None or not grid_columns:
@@ -1518,15 +1423,12 @@ def _column_elements(table_element) -> list:
 
 
 def _publish_table_column_boxes(node_map: dict) -> None:
-    """CSS 2.1 17.2.1 says a `table-column`/`table-column-group` box "is
-    not rendered" -- it has no box of its own in the visual tree (and no
-    Taffy node here; `dom._NON_RENDERING_TAGS`). Chrome still answers
-    `getBoundingClientRect()` for a `<col>`/`<colgroup>` with the grid
-    area its columns cover: the union of those columns' cells across
-    every row (confirmed on basic-css-table-001.xht: a two-column group
-    reports the two columns' full width and all three rows' height).
-    Published here, after every row/cell box is final, purely so the
-    element reports that same rect -- nothing paints it."""
+    """CSS 2.1 17.2.1: a table-column/-group box "is not rendered" -- no
+    Taffy node (`dom._NON_RENDERING_TAGS`), but Chrome still answers
+    getBoundingClientRect() with the union of its columns' cells across
+    every row -- basic-css-table-001.xht. Published here, after every
+    row/cell box is final, purely so the element reports that rect --
+    nothing paints it."""
     for element in list(node_map.values()):
         if not getattr(element, "_chromonic_is_table_root", False):
             continue
@@ -1546,12 +1448,9 @@ def _publish_table_column_boxes(node_map: dict) -> None:
                 ranges[id(owner)] = (min(first, index), max(last, index), owner)
 
         def publish_empty(owner) -> None:
-            # A column with no cell in it at all: Chrome reports its own
-            # specified width (if any) and no height, at the table box's
-            # origin (separated-border-model-006.xht: two cell-less
-            # `<col>`s in a spaced table sit at the table's own corner;
-            # empty-cells-applies-to-012.xht: a `width: 1em` column in a
-            # rowless anonymous table reports 16px wide).
+            # A cell-less column: Chrome reports its specified width (if
+            # any) and no height, at the table box's origin --
+            # separated-border-model-006.xht, empty-cells-applies-to-012.xht.
             width = 0.0
             try:
                 specified = style_bridge._len(dom._describe(owner, {})[1].width)
@@ -1563,10 +1462,9 @@ def _publish_table_column_boxes(node_map: dict) -> None:
                 x=table_box.x, y=table_box.y, width=width, height=0.0,
                 client_width=width, client_height=0.0, border_top=0.0, border_left=0.0)
 
-        # Column elements past the grid's last column (separated-border-
-        # model-006.xht: four `<col>`s over two columns of cells) have no
-        # column of their own at all -- reported empty, like any cell-less
-        # column.
+        # Column elements past the grid's last column have no column of
+        # their own -- reported empty, like any cell-less column --
+        # separated-border-model-006.xht.
         for owner in _column_elements(element):
             if id(owner) not in ranges:
                 publish_empty(owner)
@@ -1576,11 +1474,10 @@ def _publish_table_column_boxes(node_map: dict) -> None:
             continue
         top = min(row.__dict__["_layout_box"].y for row in rows)
         bottom = max(row.__dict__["_layout_box"].y + row.__dict__["_layout_box"].height for row in rows)
-        # Column edges from every cell edge that lands on a grid line: a
-        # column's left edge is where some cell starts in it, or failing
-        # that just past the previous column's right edge (a column under
-        # the middle of a colspan has no cell of its own starting there);
-        # likewise its right edge.
+        # Column edges from every cell edge landing on a grid line: a
+        # column's left edge is where some cell starts, or failing that
+        # just past the previous column's right edge (a colspan-covered
+        # column has no cell edge of its own); likewise its right edge.
         spacing_h = getattr(element, "_chromonic_border_spacing", (0.0, 0.0))[0]
         column_count = len(columns)
         starts: dict = {}
@@ -1618,10 +1515,9 @@ def _publish_table_column_boxes(node_map: dict) -> None:
                 publish_empty(owner)
                 continue
             width = max(0.0, right - left)
-            # Chrome reports a zero-width column as an entirely empty
-            # rect -- no height either (fixed-table-layout-014.xht), and
-            # at the table box's own top (column-visibility-003.xht's
-            # collapsed column: y 50, the table's, not the rows' 52).
+            # A zero-width column reports an entirely empty rect (no
+            # height either, fixed-table-layout-014.xht), at the table
+            # box's own top, not the rows' -- column-visibility-003.xht.
             height = max(0.0, bottom - top) if width > 0.0 else 0.0
             owner.__dict__["_layout_box"] = LayoutBox(
                 x=left, y=top if width > 0.0 else table_box.y, width=width, height=height,
