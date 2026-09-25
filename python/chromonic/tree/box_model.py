@@ -40,6 +40,22 @@ _REPLACED_OR_CONTROL_TAGS = frozenset({
 
 
 
+_LEGACY_TEXT_ALIGN = {
+    "-webkit-center": "center", "-moz-center": "center",
+    "-webkit-right": "right", "-moz-right": "right",
+    "-webkit-left": "left", "-moz-left": "left",
+}
+
+
+def _text_align(value) -> str:
+    """A computed `text-align` for text: the legacy `-webkit-center` family
+    (HTML's `<center>` and `align=` attributes) aligns text exactly like
+    `center`/`right`/`left`; the extra it does -- also aligning narrower
+    child blocks -- is Taffy's block layout (`style["text_align"]`)."""
+    text = (value or "").strip().lower()
+    return _LEGACY_TEXT_ALIGN.get(text, text)
+
+
 def _ua_stylesheet_applied(element) -> bool:
     """Whether ua_style.apply() ran on element's document -- cached per
     document (checked once per element, on the hot build() path)."""
@@ -150,14 +166,13 @@ def _first_baseline(element) -> "float | None":
     if getattr(element, "_chromonic_is_table_root", False):
         # CSS 2.1 17.5.3/10.8.1: a table's baseline is its first row's. A
         # caption sits outside the table box (17.4) and never counts --
-        # table-height-algorithm-031.xht. Rows must be settled first
-        # (`table_layout._settle_table`).
-        table_layout._settle_table(element)
-        for row in getattr(element, "_chromonic_table_rows", None) or ():
-            row_box = row.__dict__.get("_layout_box")
-            if row_box is not None:
-                return table_layout._table_row_baseline(row, row_box)
-        return None
+        # table-height-algorithm-031.xht. The table algorithm
+        # (`table_formatting`) records it relative to the content box.
+        offset = element.__dict__.get("_chromonic_table_baseline_offset")
+        if offset is None:
+            return None
+        padding = element.__dict__.get("_chromonic_padding", (0.0,) * 4)
+        return box.y + box.border_top + padding[0] + offset
     def line_baseline(owner, top, line_height):
         paint = getattr(owner, "_chromonic_paint_style", None) or getattr(element, "_chromonic_paint_style", None) or {}
         font_size = _fontmetrics.parse_length(paint.get("font_size"), default=16.0)

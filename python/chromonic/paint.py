@@ -391,6 +391,11 @@ def text_line_runs(element, box, style):
     # down inside the (row-height) box -- see `tree._align_table_cell_content`.
     content_offset_y = float(getattr(element, "_chromonic_content_offset_y", 0.0) or 0.0)
     line_widths = getattr(element, "_chromonic_text_line_widths", [])
+    # Lines shortened by floats start further right / lower (`tree`'s
+    # `_make_measure`); None means x=0 and `line_height` apart.
+    line_xs = getattr(element, "_chromonic_text_line_x", None) or []
+    line_ys = getattr(element, "_chromonic_text_line_y", None) or []
+    line_avail = getattr(element, "_chromonic_text_line_avail", None) or []
     content_width = box.client_width - pad_left - pad_right
     align = (style.get("text_align") or "").strip().lower()
     # CSS Text 3 `text-align-last`: a block's own final formatted line uses
@@ -412,14 +417,16 @@ def text_line_runs(element, box, style):
         if not line:
             continue
         line_align = align_last if (index == len(lines) - 1 and align_last != "auto") else align
-        line_x = text_x
+        line_x = text_x + (line_xs[index] if index < len(line_xs) else 0.0)
+        line_room = line_avail[index] if index < len(line_avail) else content_width
         width = line_widths[index] if index < len(line_widths) else font.measureText(line)
         if line_align == "center":
-            line_x += max(0.0, (content_width - width) / 2.0)
+            line_x += max(0.0, (line_room - width) / 2.0)
         elif line_align in ("right", "end"):
-            line_x += max(0.0, content_width - width)
+            line_x += max(0.0, line_room - width)
         # a simple top-aligned baseline per line, line_height apart
-        baseline_y = box.y + box.border_top + pad_top + content_offset_y + font_size + index * line_height
+        line_top = line_ys[index] if index < len(line_ys) else index * line_height
+        baseline_y = box.y + box.border_top + pad_top + content_offset_y + font_size + line_top
         yield TextRun(x=line_x, baseline_y=baseline_y, width=width, height=line_height,
                        font=font, text=line, element=element)
 

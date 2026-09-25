@@ -9,59 +9,6 @@ from . import box_model, dom, flex_grid, geometry, inline_finalize
 
 
 
-def _fix_absolute_shrink_to_fit_extent(node_map: dict) -> None:
-    """CSS 2.1 10.3.7 rule 3/5: an absolutely positioned box with
-    width:auto and left or right auto is shrink-to-fit, as wide as its
-    content's preferred width. Taffy sizes the flex-container
-    approximation from the children's raw max-content instead --
-    absolute-non-replaced-width-017..020.xht. After layout the items'
-    real extent is known, so the box narrows to it when narrower."""
-    for element in list(node_map.values()):
-        if not dom._is_element(element):
-            continue
-        style = getattr(element, "_chromonic_native_style", None)
-        box = element.__dict__.get("_layout_box")
-        if style is None or box is None or style.get("position") != "absolute" or style.get("width") != "auto":
-            continue
-        inset = style.get("inset") or ()
-        if len(inset) != 4 or (inset[3] != "auto" and inset[1] != "auto"):
-            continue
-        members = (element.__dict__.get("_chromonic_flex_row_members")
-                   or element.__dict__.get("_chromonic_float_flow_children") or [])
-        if not members or style.get("display") != "flex":
-            continue
-        padding = element.__dict__.get("_chromonic_padding", (0.0,) * 4)
-        content_left = box.x + box.border_left + padding[3]
-        right_edge = None
-        for member in members:
-            member_box = member.__dict__.get("_layout_box") if hasattr(member, "__dict__") else None
-            if member_box is None:
-                continue
-            member_native = member.__dict__.get("_chromonic_native_style") or {}
-            if member_native.get("position") in ("absolute", "fixed"):
-                continue
-            margin = member_native.get("margin") or (0.0,) * 4
-            edge = member_box.x + member_box.width + box_model._numeric_edge(margin[1])
-            right_edge = edge if right_edge is None else max(right_edge, edge)
-        if right_edge is None:
-            continue
-        content_width = box.client_width - padding[1] - padding[3]
-        extent = right_edge - content_left
-        if extent >= content_width - 0.5 or extent < 0:
-            continue
-        new_width = box.width - (content_width - extent)
-        dx = 0.0
-        if inset[3] == "auto" and inset[1] != "auto":
-            dx = box.width - new_width  # anchored on the right: the box's left edge moves in
-        element.__dict__["_layout_box"] = dataclasses.replace(
-            box, x=box.x + dx, width=new_width, client_width=box.client_width - (content_width - extent))
-        if dx:
-            for member in members:
-                if hasattr(member, "__dict__") and member.__dict__.get("_layout_box") is not None:
-                    geometry._shift_subtree(member, dx, 0.0) if dom._is_element(member) else geometry._shift_box(member, dx, 0.0)
-
-
-
 def _fix_relative_rtl_insets(node_map: dict) -> None:
     """CSS 2.1 9.4.3: a position:relative box with both left and right set
     is over-constrained -- left wins in an ltr containing block, right in
@@ -533,140 +480,6 @@ def _fix_absolute_width_against_containing_block(node_map: dict) -> None:
 
 
 
-def _fix_absolute_height_against_containing_block(node_map: dict) -> None:
-    """CSS 2.1 10.6.4: the vertical counterpart to
-    `_fix_absolute_width_against_containing_block` -- a position:absolute box
-    with height:auto and both top/bottom definite has its height solved
-    from the constraint equation, then clamped by 10.7's min/max-height,
-    with any auto margin re-absorbing the freed slack. Unlike the width
-    version, 10.6.4 carves out no direction-based zero-one-side exception
-    for a negative remainder -- always an equal split, matching
-    `_fix_absolute_vertical_auto_margins`. Taffy doesn't solve this, leaving
-    height:auto at whatever content measured.
-
-    Deliberately as narrow as `_fix_absolute_width_against_containing_block`:
-    only overwrites height/y, children shifted but not relaid out."""
-    for element in list(node_map.values()):
-        if not dom._is_element(element):
-            continue
-        style = getattr(element, "_chromonic_native_style", None)
-        box = element.__dict__.get("_layout_box")
-        if style is None or box is None or style.get("position") != "absolute":
-            continue
-        if style.get("height") != "auto":
-            continue
-        inset = style.get("inset")
-        if not inset:
-            continue
-        top, bottom = inset[0], inset[2]
-        if top == "auto" or bottom == "auto":
-            continue  # under-constrained differently -- not this equation
-        containing = _find_containing_block_ancestor(element)
-        if containing is None:
-            continue  # root-anchored -- not handled here
-        cb_box = containing.__dict__.get("_layout_box")
-        if cb_box is None:
-            continue
-        cb_height = cb_box.client_height
-        cb_content_y = cb_box.y + cb_box.border_top
-        margin = style.get("margin") or (0.0, 0.0, 0.0, 0.0)
-        margin_top_raw, margin_bottom_raw = margin[0], margin[2]
-        mt = _resolve_inset(margin_top_raw, cb_height)
-        mb = _resolve_inset(margin_bottom_raw, cb_height)
-        top_v = _resolve_inset(top, cb_height) or 0.0
-        bottom_v = _resolve_inset(bottom, cb_height) or 0.0
-        # CSS Position 3 abspos-auto-size + CSS Sizing 4 aspect-ratio: when
-        # both width and height are auto and every inset is definite, height
-        # is the ratio-dependent axis (the mirrored one-inset-auto case
-        # makes width ratio-dependent instead, already correct via the
-        # insets equation below). `_fix_absolute_width_against_containing_block`
-        # runs first, so box.width here is already the inset-stretched value.
-        ratio = style.get("aspect_ratio")
-        ratio_derived = (isinstance(ratio, (int, float)) and ratio > 0
-                         and inset[3] != "auto" and inset[1] != "auto")
-        if ratio_derived:
-            new_height = max(0.0, box.width / ratio)
-        else:
-            new_height = max(0.0, cb_height - top_v - (mt or 0.0) - bottom_v - (mb or 0.0))
-        max_height_v = _resolve_inset(style.get("max_height"), cb_height)
-        min_height_v = _resolve_inset(style.get("min_height"), cb_height)
-        clamped = ratio_derived
-        if max_height_v is not None and new_height > max_height_v:
-            new_height, clamped = max_height_v, True
-        elif min_height_v is not None and new_height < min_height_v:
-            new_height, clamped = min_height_v, True
-        new_y = box.y
-        if clamped:
-            remaining = cb_height - top_v - new_height - bottom_v
-            cmt, cmb = mt, mb
-            if cmt is None and cmb is None:
-                cmt = cmb = remaining / 2.0
-            elif cmt is None:
-                cmt = remaining - cmb
-            elif cmb is None:
-                cmb = remaining - cmt
-            new_y = cb_content_y + top_v + cmt
-        if abs(new_height - box.height) <= 1e-6 and abs(new_y - box.y) <= 1e-6:
-            continue
-        border_and_padding = box.height - box.client_height
-        element.__dict__["_layout_box"] = LayoutBox(
-            x=box.x, y=box.y, width=box.width, height=new_height,
-            client_width=box.client_width, client_height=max(0.0, new_height - border_and_padding),
-            border_top=box.border_top, border_left=box.border_left,
-        )
-        dy = new_y - box.y
-        if abs(dy) > 1e-6:
-            geometry._shift_subtree(element, 0.0, dy)
-
-
-
-def _publish_used_horizontal_margins(node_map: dict) -> None:
-    """CSS 2.1 10.3.3: an in-flow block's auto margin-left/margin-right
-    resolves during layout, but Taffy never hands that value back to
-    Python (LayoutBox defaults both to 0) -- domonic's getComputedStyle()
-    reads _layout_box.margin_left/_right for a declared auto, so this
-    derives them from the box's position relative to its parent's
-    content-box edges.
-
-    Narrow, matching 10.3.3's scope: only ordinary in-flow block boxes,
-    excluded when floated/out-of-flow or the parent is flex/grid. Pure
-    reporting -- never moves a box."""
-    for element in list(node_map.values()):
-        if not dom._is_element(element):
-            continue
-        box = element.__dict__.get("_layout_box")
-        if box is None:
-            continue
-        resolved = getattr(element, "_chromonic_resolved_style", None)
-        if resolved is None:
-            continue
-        computed, style_obj = resolved
-        if box_model._is_floated(computed) or box_model._is_absolutely_positioned(style_obj):
-            continue
-        if box_model._is_inline_level(element, style_obj):
-            continue
-        parent = getattr(element, "parentNode", None)
-        if parent is None or not dom._is_element(parent):
-            continue
-        parent_box = parent.__dict__.get("_layout_box")
-        parent_resolved = getattr(parent, "_chromonic_resolved_style", None)
-        if parent_box is None or parent_resolved is None:
-            continue
-        parent_display = parent_resolved[1].display
-        parent_display = getattr(parent_display, "value", parent_display)
-        if parent_display in ("flex", "inline-flex", "grid", "inline-grid"):
-            continue
-        parent_padding = parent.__dict__.get("_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
-        content_left = parent_box.x + parent_box.border_left + parent_padding[3]
-        content_right = parent_box.x + parent_box.border_left + parent_box.client_width - parent_padding[1]
-        margin_left = box.x - content_left
-        margin_right = content_right - (box.x + box.width)
-        element.__dict__["_layout_box"] = dataclasses.replace(
-            box, margin_left=margin_left, margin_right=margin_right,
-        )
-
-
-
 def _fix_absolute_static_position_fallback(node_map: dict) -> None:
     """CSS 2.1 10.3.7/10.6.4: an absolutely-positioned box with all-auto
     insets falls back to its static position -- where it would land as
@@ -730,9 +543,18 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
         # built as a Taffy node at all. `_InlineFormattingPlan.measure()`/
         # `.publish()` compute this directly and stash it here --
         # wpt/css/CSS2/positioning/abspos-007.xht.
+        if element.__dict__.get("_chromonic_static_anchored"):
+            # `src/lib.rs` already placed it at its static position (a
+            # placeholder left in its static parent's flow).
+            continue
         inline_static_position = getattr(element, "_chromonic_static_position", None)
-        if inline_static_position is not None:
-            static_x, static_y = inline_static_position
+        if inline_static_position is not None and inline_static_position[0] is not None:
+            # The recorded position is the hypothetical box's margin edge;
+            # its own margin still pushes the border box in from there
+            # (line-height-201.html: `margin-left: 50px` on an abspos div).
+            own_margin = style.get("margin") or (0.0,) * 4
+            static_x = inline_static_position[0] + box_model._numeric_edge(own_margin[3])
+            static_y = inline_static_position[1] + box_model._numeric_edge(own_margin[0])
         else:
             parent = getattr(element, "parentElement", None)
             parent_box = parent.__dict__.get("_layout_box") if parent is not None else None
@@ -806,6 +628,11 @@ def _fix_absolute_static_position_fallback(node_map: dict) -> None:
                 else:
                     sibling_margin_bottom = box_model._numeric_edge((sibling_style.get("margin") or (0.0,) * 4)[2])
                     static_y = sibling_box.y + sibling_box.height + max(sibling_margin_bottom, own_margin_top)
+            if inline_static_position is not None:
+                # A block-level box escaped from an inline formatting
+                # context: that context already knows the line it would
+                # follow; only x comes from the block rule above.
+                static_y = inline_static_position[1] + own_margin_top
         dx = (static_x - box.x) if needs_x else 0.0
         dy = (static_y - box.y) if needs_y else 0.0
         if abs(dx) > 1e-6 or abs(dy) > 1e-6:

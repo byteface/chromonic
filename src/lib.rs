@@ -1,4 +1,5 @@
-//! chromonic_native -- a thin PyO3 binding onto the Taffy layout engine, plus
+//! chromonic_native -- a PyO3 binding onto the Taffy layout algorithms (block,
+//! flex, grid) driven from chromonic's own node tree, plus
 //! (see `layout_text` below) Parley for real text layout.
 //!
 //! This crate knows nothing about domonic or CSS text. Python
@@ -20,7 +21,15 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use taffy::prelude::*;
 use taffy::geometry::Point;
 use taffy::style::{CheapCloneStr, Contain, Overflow};
-use taffy::{compute_leaf_layout, AlignContent, AlignItems, TaffyError};
+use taffy::util::{MaybeMath, MaybeResolve, ResolveOrZero};
+use taffy::{
+    compute_block_layout, compute_cached_layout, compute_flexbox_layout, compute_grid_layout,
+    compute_hidden_layout, compute_leaf_layout, compute_root_layout, AlignContent, AlignItems, Baselines,
+    BlockContext, BlockFormattingContext, BoxSizing, Cache, CacheTree, Clear, Float, Layout,
+    LayoutBlockContainer, LayoutFlexboxContainer, LayoutGridContainer, LayoutInput, LayoutOutput,
+    LayoutPartialTree, Line, NodeId, Position, RequestedAxis, RunMode, SizingMode, TraversePartialTree,
+    TraverseTree,
+};
 
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontStyle as ParleyFontStyle,
@@ -32,20 +41,26 @@ use std::cell::RefCell;
 // -- Python value -> Taffy value ---------------------------------------------
 
 /// A length-like Python value: `float` (px), `("pct", frac)`, `("fr", n)`,
-/// or the string `"auto"`.
+/// the string `"auto"`, or a CSS Sizing 3 keyword (`"min-content"`,
+/// `"max-content"`, `"fit-content"`, `"stretch"`) -- sizes only.
 enum RawLen {
     Px(f32),
     Pct(f32),
     Fr(f32),
     Auto,
+    Sizing(Dimension),
 }
 
 fn read_raw_len(value: &Bound<PyAny>) -> PyResult<RawLen> {
     if let Ok(text) = value.extract::<String>() {
-        if text == "auto" {
-            return Ok(RawLen::Auto);
-        }
-        return Err(PyValueError::new_err(format!("unrecognised length keyword: {text:?}")));
+        return Ok(match text.as_str() {
+            "min-content" => RawLen::Sizing(Dimension::min_content()),
+            "max-content" => RawLen::Sizing(Dimension::max_content()),
+            "fit-content" => RawLen::Sizing(Dimension::fit_content()),
+            "stretch" => RawLen::Sizing(Dimension::stretch()),
+            // An unknown keyword is an invalid declaration: initial value.
+            _ => RawLen::Auto,
+        });
     }
     if let Ok(px) = value.extract::<f32>() {
         return Ok(RawLen::Px(px));
@@ -69,6 +84,7 @@ fn dimension(value: &Bound<PyAny>) -> PyResult<Dimension> {
         RawLen::Px(px) => length(px),
         RawLen::Pct(frac) => percent(frac),
         RawLen::Auto => auto(),
+        RawLen::Sizing(keyword) => keyword,
         RawLen::Fr(_) => return Err(PyValueError::new_err("fr is only valid for grid track sizes")),
     })
 }
@@ -77,7 +93,7 @@ fn length_percentage(value: &Bound<PyAny>) -> PyResult<LengthPercentage> {
     Ok(match read_raw_len(value)? {
         RawLen::Px(px) => length(px),
         RawLen::Pct(frac) => percent(frac),
-        RawLen::Auto => LengthPercentage::ZERO, // padding/border/gap have no "auto"
+        RawLen::Auto | RawLen::Sizing(_) => LengthPercentage::ZERO, // padding/border/gap have no "auto"
         RawLen::Fr(_) => return Err(PyValueError::new_err("fr is not valid here")),
     })
 }
@@ -86,7 +102,7 @@ fn length_percentage_auto(value: &Bound<PyAny>) -> PyResult<LengthPercentageAuto
     Ok(match read_raw_len(value)? {
         RawLen::Px(px) => length(px),
         RawLen::Pct(frac) => percent(frac),
-        RawLen::Auto => auto(),
+        RawLen::Auto | RawLen::Sizing(_) => auto(),
         RawLen::Fr(_) => return Err(PyValueError::new_err("fr is not valid here")),
     })
 }
@@ -380,43 +396,46 @@ fn parse_grid_placement(value: Option<Bound<PyAny>>) -> PyResult<Line<GridPlacem
     }
 }
 
+/// An unrecognised keyword (an author typo, or a value this level of CSS
+/// doesn't define) is an invalid declaration, which CSS ignores: the
+/// property keeps its initial value rather than failing the whole page.
 fn parse_style(dict: &Bound<PyDict>) -> PyResult<Style> {
     let display = match get_str(dict, "display", "block")?.as_str() {
         "block" => Display::Block,
         "flex" => Display::Flex,
         "grid" => Display::Grid,
         "none" => Display::None,
-        other => return Err(PyValueError::new_err(format!("unrecognised display: {other:?}"))),
+        _ => Display::Block,
     };
     let position = match get_str(dict, "position", "relative")?.as_str() {
         "relative" => Position::Relative,
         "absolute" => Position::Absolute,
-        other => return Err(PyValueError::new_err(format!("unrecognised position: {other:?}"))),
+        _ => Position::Relative,
     };
     let box_sizing = match get_str(dict, "box_sizing", "border-box")?.as_str() {
         "border-box" => BoxSizing::BorderBox,
         "content-box" => BoxSizing::ContentBox,
-        other => return Err(PyValueError::new_err(format!("unrecognised box-sizing: {other:?}"))),
+        _ => BoxSizing::BorderBox,
     };
     let flex_direction = match get_str(dict, "flex_direction", "row")?.as_str() {
         "row" => FlexDirection::Row,
         "column" => FlexDirection::Column,
         "row-reverse" => FlexDirection::RowReverse,
         "column-reverse" => FlexDirection::ColumnReverse,
-        other => return Err(PyValueError::new_err(format!("unrecognised flex-direction: {other:?}"))),
+        _ => FlexDirection::Row,
     };
     let flex_wrap = match get_str(dict, "flex_wrap", "nowrap")?.as_str() {
         "nowrap" => FlexWrap::NoWrap,
         "wrap" => FlexWrap::Wrap,
         "wrap-reverse" => FlexWrap::WrapReverse,
-        other => return Err(PyValueError::new_err(format!("unrecognised flex-wrap: {other:?}"))),
+        _ => FlexWrap::NoWrap,
     };
     let grid_auto_flow = match get_str(dict, "grid_auto_flow", "row")?.as_str() {
         "row" => GridAutoFlow::Row,
         "column" => GridAutoFlow::Column,
         "row-dense" => GridAutoFlow::RowDense,
         "column-dense" => GridAutoFlow::ColumnDense,
-        other => return Err(PyValueError::new_err(format!("unrecognised grid-auto-flow: {other:?}"))),
+        _ => GridAutoFlow::Row,
     };
 
     let grid_template_columns = match get(dict, "grid_template_columns") {
@@ -442,10 +461,33 @@ fn parse_style(dict: &Bound<PyDict>) -> PyResult<Style> {
         Some(v) => v.cast::<PyList>()?.iter().map(|item| track_sizing_function(&item)).collect::<PyResult<Vec<_>>>()?,
     };
 
+    let float = match get_str(dict, "float", "none")?.as_str() {
+        "left" => Float::Left,
+        "right" => Float::Right,
+        _ => Float::None,
+    };
+    let clear = match get_str(dict, "clear", "none")?.as_str() {
+        "left" => Clear::Left,
+        "right" => Clear::Right,
+        "both" => Clear::Both,
+        _ => Clear::None,
+    };
+
     Ok(Style {
         display,
         position,
         box_sizing,
+        float,
+        clear,
+        text_align: match get_str(dict, "text_align", "auto")?.as_str() {
+            "legacy-center" => taffy::TextAlign::LegacyCenter,
+            "legacy-right" => taffy::TextAlign::LegacyRight,
+            "legacy-left" => taffy::TextAlign::LegacyLeft,
+            _ => taffy::TextAlign::Auto,
+        },
+        // A table is sized by its own algorithm, never stretched by a
+        // block parent (CSS 2.1 17.5.2: its used width is shrink-to-fit).
+        item_is_table: get_bool(dict, "is_table", false)?,
         overflow: get_overflow(dict)?,
         contain: get_contain(dict)?,
         size: Size { width: get_size(dict, "width")?, height: get_size(dict, "height")? },
@@ -513,93 +555,309 @@ fn get_min_max(dict: &Bound<PyDict>, key: &str) -> PyResult<LengthPercentageAuto
 }
 
 // -- the tree -----------------------------------------------------------
+//
+// chromonic's own node store implementing Taffy's `LayoutPartialTree` family
+// of traits (the `custom_tree_vec.rs` pattern from Taffy's own examples)
+// rather than the batteries-included `TaffyTree`. The built-in tree can only
+// dispatch on `Display`; owning the dispatch is what lets a node kind Taffy
+// has no algorithm for -- an inline formatting context -- lay out its own
+// children (atomic inline boxes, floats) from *inside* the layout recursion,
+// with Taffy's block formatting context (`BlockContext`: floats, clearance,
+// margin struts) handed in, instead of being approximated as a flex row and
+// repaired after the fact.
+//
+// Node ids handed to Python pack a slot index (low 32 bits) with a per-slot
+// generation (high 32 bits), so an id that outlives its node fails
+// validation instead of silently aliasing onto whatever reused the slot --
+// the same guarantee `TaffyTree`'s slotmap keys gave.
 
-type MeasureCallback = Option<Py<PyAny>>;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NodeKind {
+    /// Dispatch on `Style.display`, exactly as `TaffyTree` does.
+    Auto,
+    /// An inline formatting context: `compute_inline_layout`.
+    Inline,
+    /// A table grid: `compute_table_layout`.
+    Table,
+}
+
+struct Node {
+    style: Style,
+    kind: NodeKind,
+    children: Vec<u64>,
+    parent: Option<usize>,
+    measure: Option<Py<PyAny>>,
+    cache: Cache,
+    layout: Layout,
+    generation: u32,
+    alive: bool,
+    /// For an absolutely positioned box laid out as a child of its
+    /// containing block: the zero-size placeholder left where the box would
+    /// sit in normal flow, and whether that flow is right-to-left. Its
+    /// position is the box's static position (CSS 2.1 10.3.7/10.6.4).
+    anchor: Option<(u64, bool)>,
+}
+
+impl Node {
+    fn dead(generation: u32) -> Self {
+        Node {
+            style: Style::default(),
+            kind: NodeKind::Auto,
+            children: Vec::new(),
+            parent: None,
+            measure: None,
+            cache: Cache::new(),
+            layout: Layout::with_order(0),
+            generation,
+            alive: false,
+            anchor: None,
+        }
+    }
+}
+
+fn pack(index: usize, generation: u32) -> u64 {
+    ((generation as u64) << 32) | (index as u64 & 0xFFFF_FFFF)
+}
+
+fn index_of(id: NodeId) -> usize {
+    (u64::from(id) & 0xFFFF_FFFF) as usize
+}
 
 // `taffy::Style` carries a raw pointer for calc()-expression handles (a
-// feature we don't use), which makes `TaffyTree` not automatically Send/Sync.
+// feature we don't use), which makes it not automatically Send/Sync.
 // `unsendable` is PyO3's standard escape hatch for a Rust type that a Python
-// extension only ever touches from the thread that created it -- true here,
-// there's no threading in this POC.
+// extension only ever touches from the thread that created it -- true here.
 #[pyclass(unsendable)]
 struct Tree {
-    inner: TaffyTree<MeasureCallback>,
+    nodes: Vec<Node>,
+    free: Vec<usize>,
+}
+
+impl Tree {
+    fn resolve(&self, id: u64) -> PyResult<usize> {
+        let index = (id & 0xFFFF_FFFF) as usize;
+        let generation = (id >> 32) as u32;
+        match self.nodes.get(index) {
+            Some(node) if node.alive && node.generation == generation => Ok(index),
+            _ => Err(PyRuntimeError::new_err(format!("unknown or stale layout node id {id}"))),
+        }
+    }
+
+    fn alloc(&mut self, style: Style, kind: NodeKind, children: Vec<u64>, measure: Option<Py<PyAny>>) -> u64 {
+        let index = match self.free.pop() {
+            Some(index) => index,
+            None => {
+                self.nodes.push(Node::dead(0));
+                self.nodes.len() - 1
+            }
+        };
+        for child in &children {
+            self.nodes[index_of(NodeId::from(*child))].parent = Some(index);
+        }
+        let node = &mut self.nodes[index];
+        node.style = style;
+        node.kind = kind;
+        node.children = children;
+        node.parent = None;
+        node.measure = measure;
+        node.cache = Cache::new();
+        node.layout = Layout::with_order(0);
+        node.anchor = None;
+        node.alive = true;
+        pack(index, node.generation)
+    }
+
+    fn validate_children(&self, children: &[u64]) -> PyResult<()> {
+        for child in children {
+            self.resolve(*child)?;
+        }
+        Ok(())
+    }
+
+    /// Move every anchored absolutely positioned box whose insets are auto
+    /// on an axis to its static position on that axis: where its anchor
+    /// (a zero-size placeholder laid out in normal flow) ended up. Walks in
+    /// tree order so an anchor is always placed before the box it anchors
+    /// (anchors sit in the flow content, positioned boxes after it).
+    fn resolve_static_anchors(&mut self, root: usize) {
+        let mut absolute: Vec<Option<(f32, f32)>> = vec![None; self.nodes.len()];
+        let mut stack: Vec<(usize, f32, f32)> = vec![(root, 0.0, 0.0)];
+        while let Some((index, parent_x, parent_y)) = stack.pop() {
+            if let Some((anchor, rtl)) = self.nodes[index].anchor {
+                if let Some(anchor_pos) = self.resolve(anchor).ok().and_then(|a| absolute[a]) {
+                    let node = &mut self.nodes[index];
+                    let inset = node.style.inset;
+                    let margin = node.layout.margin;
+                    if inset.left.is_auto() && inset.right.is_auto() {
+                        let x = if rtl {
+                            anchor_pos.0 - node.layout.size.width - margin.right
+                        } else {
+                            anchor_pos.0 + margin.left
+                        };
+                        node.layout.location.x = x - parent_x;
+                    }
+                    if inset.top.is_auto() && inset.bottom.is_auto() {
+                        node.layout.location.y = anchor_pos.1 + margin.top - parent_y;
+                    }
+                }
+            }
+            let node = &self.nodes[index];
+            let x = parent_x + node.layout.location.x;
+            let y = parent_y + node.layout.location.y;
+            absolute[index] = Some((x, y));
+            for child in node.children.iter().rev() {
+                stack.push((index_of(NodeId::from(*child)), x, y));
+            }
+        }
+    }
+
+    fn collect_absolute(&self, index: usize, parent_x: f32, parent_y: f32, out: &Bound<PyDict>) -> PyResult<()> {
+        let node = &self.nodes[index];
+        let layout = &node.layout;
+        let x = parent_x + layout.location.x;
+        let y = parent_y + layout.location.y;
+        let tuple = (
+            (x, y, layout.size.width, layout.size.height),
+            (layout.border.top, layout.border.right, layout.border.bottom, layout.border.left),
+            (layout.padding.top, layout.padding.right, layout.padding.bottom, layout.padding.left),
+            (layout.margin.top, layout.margin.right, layout.margin.bottom, layout.margin.left),
+        );
+        out.set_item(pack(index, node.generation), tuple)?;
+        for child in &node.children {
+            self.collect_absolute(index_of(NodeId::from(*child)), x, y, out)?;
+        }
+        Ok(())
+    }
 }
 
 #[pymethods]
 impl Tree {
     #[new]
     fn new() -> Self {
-        let mut inner = TaffyTree::new();
-        // Browsers retain CSS subpixel geometry and only rasterize at paint.
-        // Taffy's default rounding loses half-pixel collapsed borders and
-        // fractional grid tracks before geometry reaches the DOM APIs.
-        inner.disable_rounding();
-        Tree { inner }
+        Tree { nodes: Vec::new(), free: Vec::new() }
     }
 
     /// A leaf node with no measure callback (a plain box: nothing to
     /// intrinsically size, e.g. an empty `<div>`).
     fn new_leaf(&mut self, style: &Bound<PyDict>) -> PyResult<u64> {
         let style = parse_style(style)?;
-        let id = self.inner.new_leaf_with_context(style, None).map_err(to_py_err)?;
-        Ok(id.into())
+        Ok(self.alloc(style, NodeKind::Auto, Vec::new(), None))
     }
 
     /// A text leaf: `measure` is called during layout as
-    /// `measure(available_width, available_height) -> (width, height)`,
-    /// both `float | None` in, both `float` out.
+    /// `measure(available_width, available_height, known_width, known_height)`
+    /// returning `(width, height)` or `(width, height, baseline)` -- the
+    /// baseline (distance from the content box's top to the first
+    /// baseline, or None) lets flex/grid `align-items: baseline` and an
+    /// enclosing inline formatting context see the real one.
     fn new_text_leaf(&mut self, style: &Bound<PyDict>, measure: Py<PyAny>) -> PyResult<u64> {
         let style = parse_style(style)?;
-        let id = self.inner.new_leaf_with_context(style, Some(measure)).map_err(to_py_err)?;
-        Ok(id.into())
+        Ok(self.alloc(style, NodeKind::Auto, Vec::new(), Some(measure)))
     }
 
     fn new_with_children(&mut self, style: &Bound<PyDict>, children: Vec<u64>) -> PyResult<u64> {
         let style = parse_style(style)?;
-        let child_ids: Vec<NodeId> = children.into_iter().map(NodeId::from).collect();
-        let id = self.inner.new_with_children(style, &child_ids).map_err(to_py_err)?;
-        Ok(id.into())
+        self.validate_children(&children)?;
+        Ok(self.alloc(style, NodeKind::Auto, children, None))
+    }
+
+    /// An inline formatting context node: `measure` lays out this node's
+    /// lines (see `compute_inline_layout`); `children` are the atomic
+    /// inline-level boxes (inline-block, replaced, inline-table, floats)
+    /// that flow inside those lines, in `measure`'s item order.
+    fn new_inline(&mut self, style: &Bound<PyDict>, measure: Py<PyAny>, children: Vec<u64>) -> PyResult<u64> {
+        let style = parse_style(style)?;
+        self.validate_children(&children)?;
+        Ok(self.alloc(style, NodeKind::Inline, children, Some(measure)))
+    }
+
+    /// A table box: `measure` runs the table algorithm (see
+    /// `compute_table_layout`); `children` are its captions and row groups
+    /// or rows, whose own children are the cells the algorithm places.
+    fn new_table(&mut self, style: &Bound<PyDict>, measure: Py<PyAny>, children: Vec<u64>) -> PyResult<u64> {
+        let style = parse_style(style)?;
+        self.validate_children(&children)?;
+        Ok(self.alloc(style, NodeKind::Table, children, Some(measure)))
     }
 
     fn set_style(&mut self, node: u64, style: &Bound<PyDict>) -> PyResult<()> {
-        let style = parse_style(style)?;
-        self.inner.set_style(NodeId::from(node), style).map_err(to_py_err)
+        let index = self.resolve(node)?;
+        self.nodes[index].style = parse_style(style)?;
+        Ok(())
     }
 
     /// Update retained-node insets in one Python crossing. Animation paths
     /// use this when every other style field and the tree topology are stable.
     fn set_insets(&mut self, updates: Vec<(u64, f32, f32, f32, f32)>) -> PyResult<()> {
         for (node, top, right, bottom, left) in updates {
-            let node = NodeId::from(node);
-            let mut style = self.inner.style(node).map_err(to_py_err)?.clone();
-            style.inset = Rect {
+            let index = self.resolve(node)?;
+            self.nodes[index].style.inset = Rect {
                 top: length(top),
                 right: length(right),
                 bottom: length(bottom),
                 left: length(left),
             };
-            self.inner.set_style(node, style).map_err(to_py_err)?;
         }
         Ok(())
     }
 
     fn set_children(&mut self, node: u64, children: Vec<u64>) -> PyResult<()> {
-        let child_ids: Vec<NodeId> = children.into_iter().map(NodeId::from).collect();
-        self.inner.set_children(NodeId::from(node), &child_ids).map_err(to_py_err)
+        let index = self.resolve(node)?;
+        self.validate_children(&children)?;
+        let old = std::mem::take(&mut self.nodes[index].children);
+        for child in old {
+            let child_index = index_of(NodeId::from(child));
+            if self.nodes[child_index].parent == Some(index) {
+                self.nodes[child_index].parent = None;
+            }
+        }
+        for child in &children {
+            self.nodes[index_of(NodeId::from(*child))].parent = Some(index);
+        }
+        self.nodes[index].children = children;
+        Ok(())
+    }
+
+    /// Link an absolutely positioned box (built as a child of its containing
+    /// block) to the placeholder marking its static position; None unlinks.
+    #[pyo3(signature = (node, anchor, rtl=false))]
+    fn set_static_anchor(&mut self, node: u64, anchor: Option<u64>, rtl: bool) -> PyResult<()> {
+        let index = self.resolve(node)?;
+        if let Some(anchor) = anchor {
+            self.resolve(anchor)?;
+        }
+        self.nodes[index].anchor = anchor.map(|a| (a, rtl));
+        Ok(())
     }
 
     fn set_measure(&mut self, node: u64, measure: Option<Py<PyAny>>) -> PyResult<()> {
-        self.inner.set_node_context(NodeId::from(node), Some(measure)).map_err(to_py_err)
+        let index = self.resolve(node)?;
+        self.nodes[index].measure = measure;
+        Ok(())
     }
 
+    /// Drop a node. An id that is already gone is a no-op: the caller's
+    /// intent is only ever "make sure this node is no longer in the tree".
     fn remove(&mut self, node: u64) -> PyResult<()> {
-        self.inner.remove(NodeId::from(node)).map(|_| ()).map_err(to_py_err)
+        let Ok(index) = self.resolve(node) else { return Ok(()) };
+        if let Some(parent) = self.nodes[index].parent {
+            self.nodes[parent].children.retain(|child| index_of(NodeId::from(*child)) != index);
+        }
+        for child in std::mem::take(&mut self.nodes[index].children) {
+            let child_index = index_of(NodeId::from(child));
+            if self.nodes[child_index].parent == Some(index) {
+                self.nodes[child_index].parent = None;
+            }
+        }
+        let generation = self.nodes[index].generation.wrapping_add(1);
+        self.nodes[index] = Node::dead(generation);
+        self.free.push(index);
+        Ok(())
     }
 
-    /// Run layout, then return `{node_id: (x, y, width, height, border_top,
-    /// border_right, border_bottom, border_left, padding_top, padding_right,
-    /// padding_bottom, padding_left)}` for every node, in **absolute**
+    /// Run layout, then return `{node_id: ((x, y, width, height), (border
+    /// top, right, bottom, left), (padding ...), (used margin ...))}` for
+    /// every node, in **absolute**
     /// page coordinates (Taffy itself only stores parent-relative
     /// `location`; this walks the tree accumulating the offset once so
     /// Python never has to).
@@ -610,57 +868,873 @@ impl Tree {
         available_width: Option<f32>,
         available_height: Option<f32>,
     ) -> PyResult<Py<PyDict>> {
-        let root_id = NodeId::from(root);
+        let root_index = self.resolve(root)?;
+        // Every compute is a full relayout. A cached PerformLayout result
+        // for a block subtree would skip re-placing that subtree's floats
+        // into the (fresh) block formatting context its siblings lay out
+        // against, so a retained tree must not carry results across
+        // computes. Style resolution, not Taffy, dominates relayout cost.
+        for node in self.nodes.iter_mut() {
+            if node.alive {
+                node.cache.clear();
+            }
+        }
         let available = Size {
             width: available_width.map(AvailableSpace::Definite).unwrap_or(AvailableSpace::MaxContent),
             height: available_height.map(AvailableSpace::Definite).unwrap_or(AvailableSpace::MaxContent),
         };
-
-        self.inner
-            .compute_layout_with_measure(root_id, available, |inputs, _node_id, node_context, style| {
-                compute_leaf_layout(inputs, style, |_, _| 0.0, |known_dimensions, available_space| {
-                    measure_via_python(py, known_dimensions, available_space, node_context.and_then(|c| c.as_ref()))
-                })
-            })
-            .map_err(to_py_err)?;
-
+        {
+            let mut view = TreeView { tree: self, py };
+            compute_root_layout(&mut view, NodeId::from(root), available);
+        }
+        self.resolve_static_anchors(root_index);
         let out = PyDict::new(py);
-        self.collect_absolute(py, root_id, 0.0, 0.0, &out)?;
+        self.collect_absolute(root_index, 0.0, 0.0, &out)?;
         Ok(out.into())
     }
 }
 
-impl Tree {
-    fn collect_absolute(&self, py: Python<'_>, node: NodeId, parent_x: f32, parent_y: f32, out: &Bound<PyDict>) -> PyResult<()> {
-        let layout = self.inner.layout(node).map_err(to_py_err)?;
-        let x = parent_x + layout.location.x;
-        let y = parent_y + layout.location.y;
-        let tuple = (
-            x, y, layout.size.width, layout.size.height,
-            layout.border.top, layout.border.right, layout.border.bottom, layout.border.left,
-            layout.padding.top, layout.padding.right, layout.padding.bottom, layout.padding.left,
-        );
-        out.set_item(u64::from(node), tuple)?;
-        let children: Vec<NodeId> = self.inner.child_ids(node).collect();
-        for child in children {
-            self.collect_absolute(py, child, x, y, out)?;
-        }
-        let _ = py;
-        Ok(())
+/// The `Tree` plus the GIL token layout runs under -- what Taffy's traits
+/// are implemented on (mirrors `TaffyView` inside `TaffyTree`).
+struct TreeView<'a> {
+    tree: &'a mut Tree,
+    py: Python<'a>,
+}
+
+struct ChildIter<'a>(std::slice::Iter<'a, u64>);
+
+impl Iterator for ChildIter<'_> {
+    type Item = NodeId;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().copied().map(NodeId::from)
     }
 }
 
+impl TraversePartialTree for TreeView<'_> {
+    type ChildIter<'a>
+        = ChildIter<'a>
+    where
+        Self: 'a;
+
+    fn child_ids(&self, node_id: NodeId) -> Self::ChildIter<'_> {
+        ChildIter(self.tree.nodes[index_of(node_id)].children.iter())
+    }
+
+    fn child_count(&self, node_id: NodeId) -> usize {
+        self.tree.nodes[index_of(node_id)].children.len()
+    }
+
+    fn get_child_id(&self, node_id: NodeId, index: usize) -> NodeId {
+        NodeId::from(self.tree.nodes[index_of(node_id)].children[index])
+    }
+}
+
+impl TraverseTree for TreeView<'_> {}
+
+impl LayoutPartialTree for TreeView<'_> {
+    type CustomIdent = String;
+    type CoreContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    fn get_core_container_style(&self, node_id: NodeId) -> Self::CoreContainerStyle<'_> {
+        &self.tree.nodes[index_of(node_id)].style
+    }
+
+    fn set_unrounded_layout(&mut self, node_id: NodeId, layout: &Layout) {
+        self.tree.nodes[index_of(node_id)].layout = *layout;
+    }
+
+    fn resolve_calc_value(&self, _val: *const (), _basis: f32) -> f32 {
+        0.0
+    }
+
+    fn compute_child_layout(&mut self, node_id: NodeId, inputs: LayoutInput) -> LayoutOutput {
+        self.dispatch(node_id, inputs, None)
+    }
+}
+
+impl CacheTree for TreeView<'_> {
+    fn cache_get(&mut self, node_id: NodeId, inputs: &LayoutInput) -> Option<LayoutOutput> {
+        self.tree.nodes[index_of(node_id)].cache.get(inputs)
+    }
+
+    fn cache_store(&mut self, node_id: NodeId, inputs: &LayoutInput, layout_output: LayoutOutput) {
+        self.tree.nodes[index_of(node_id)].cache.store(inputs, layout_output)
+    }
+
+    fn cache_clear(&mut self, node_id: NodeId) {
+        self.tree.nodes[index_of(node_id)].cache.clear();
+    }
+}
+
+impl LayoutBlockContainer for TreeView<'_> {
+    type BlockContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+    type BlockItemStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    fn get_block_container_style(&self, node_id: NodeId) -> Self::BlockContainerStyle<'_> {
+        &self.tree.nodes[index_of(node_id)].style
+    }
+
+    fn get_block_child_style(&self, child_node_id: NodeId) -> Self::BlockItemStyle<'_> {
+        &self.tree.nodes[index_of(child_node_id)].style
+    }
+
+    fn compute_block_child_layout(
+        &mut self,
+        node_id: NodeId,
+        inputs: LayoutInput,
+        block_ctx: Option<&mut BlockContext<'_>>,
+    ) -> LayoutOutput {
+        self.dispatch(node_id, inputs, block_ctx)
+    }
+}
+
+impl LayoutFlexboxContainer for TreeView<'_> {
+    type FlexboxContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+    type FlexboxItemStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    fn get_flexbox_container_style(&self, node_id: NodeId) -> Self::FlexboxContainerStyle<'_> {
+        &self.tree.nodes[index_of(node_id)].style
+    }
+
+    fn get_flexbox_child_style(&self, child_node_id: NodeId) -> Self::FlexboxItemStyle<'_> {
+        &self.tree.nodes[index_of(child_node_id)].style
+    }
+}
+
+impl LayoutGridContainer for TreeView<'_> {
+    type GridContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+    type GridItemStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    fn get_grid_container_style(&self, node_id: NodeId) -> Self::GridContainerStyle<'_> {
+        &self.tree.nodes[index_of(node_id)].style
+    }
+
+    fn get_grid_child_style(&self, child_node_id: NodeId) -> Self::GridItemStyle<'_> {
+        &self.tree.nodes[index_of(child_node_id)].style
+    }
+}
+
+impl TreeView<'_> {
+    /// Same dispatch `TaffyTree` performs, plus the `Inline` node kind. A
+    /// same-BFC block child arrives here with its parent's `BlockContext`
+    /// (via `compute_block_child_layout`); any other route passes `None`.
+    fn dispatch(
+        &mut self,
+        node_id: NodeId,
+        inputs: LayoutInput,
+        block_ctx: Option<&mut BlockContext<'_>>,
+    ) -> LayoutOutput {
+        if inputs.run_mode == RunMode::PerformHiddenLayout {
+            return compute_hidden_layout(self, node_id);
+        }
+        compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
+            let node = &tree.tree.nodes[index_of(node_id)];
+            let (display, kind, has_children) = (node.style.display, node.kind, !node.children.is_empty());
+            match (kind, display, has_children) {
+                (_, Display::None, _) => compute_hidden_layout(tree, node_id),
+                (NodeKind::Inline, _, _) => tree.compute_inline_layout(node_id, inputs, block_ctx),
+                (NodeKind::Table, _, _) => tree.compute_table_layout(node_id, inputs),
+                (_, Display::Block, true) => compute_block_layout(tree, node_id, inputs, block_ctx),
+                (_, Display::Flex, true) => compute_flexbox_layout(tree, node_id, inputs),
+                (_, Display::Grid, true) => compute_grid_layout(tree, node_id, inputs),
+                (_, _, true) => compute_block_layout(tree, node_id, inputs, None),
+                (_, _, false) => tree.compute_leaf(node_id, inputs),
+            }
+        })
+    }
+
+    /// A table (CSS 2.1 17.5). The Python table algorithm (`measure`) runs
+    /// as a short conversation, each call handed every answer so far in
+    /// `responses` (a dict keyed by the keys it chose):
+    ///
+    ///   measure(available_width, available_height, known_width, known_height, responses)
+    ///     -> ("intrinsic", [(key, node), ...])
+    ///          min-content and max-content border-box widths of each node:
+    ///          responses[key] = (min, max)
+    ///     -> ("layout", [(key, node, width, height_or_None), ...])
+    ///          each node laid out at that border-box size:
+    ///          responses[key] = (width, height, first_baseline, last_baseline)
+    ///     -> ("done", width, height, first_baseline, placements)
+    ///          content size and baseline, and every captions/row-group/
+    ///          row/cell box as (node, x, y, width, height, content_offset)
+    ///          relative to this node's content box. A node whose parent is
+    ///          also placed is converted to parent-relative coordinates.
+    ///          content_offset >= 0 lays the node out at that size and moves
+    ///          its content down by the offset (a cell's vertical-align);
+    ///          a negative offset only positions and sizes the box (a row
+    ///          or row group, whose children are placed separately).
+    fn compute_table_layout(&mut self, node_id: NodeId, inputs: LayoutInput) -> LayoutOutput {
+        let py = self.py;
+        let index = index_of(node_id);
+        let (style, measure) = {
+            let node = &self.tree.nodes[index];
+            (node.style.clone(), node.measure.as_ref().map(|m| m.clone_ref(py)))
+        };
+        let own = OwnBox::resolve(&style, &inputs);
+        if let Some(output) = own.short_circuit(inputs.run_mode) {
+            return output;
+        }
+        let Some(measure) = measure else {
+            return own.finish(&style, Size::ZERO, None, None);
+        };
+        let perform = inputs.run_mode == RunMode::PerformLayout;
+        let content = own.content_available;
+        let cb_width = content.width.into_option();
+        let width_arg: Option<f32> = match content.width {
+            AvailableSpace::Definite(v) => Some(v),
+            AvailableSpace::MinContent => Some(-1.0),
+            AvailableSpace::MaxContent => None,
+        };
+        let height_arg = content.height.into_option();
+        let known = if perform { Size::NONE } else { inputs.known_dimensions };
+        // The parent (a stretching flex/grid container) or the style fixes
+        // the width: the grid fills it rather than shrinking to fit.
+        let fills_width = own.known_dimensions.width.is_some() || own.node_size.width.is_some();
+        let child_inputs = |run_mode: RunMode, known: Size<Option<f32>>, width: AvailableSpace| LayoutInput {
+            run_mode,
+            sizing_mode: SizingMode::InherentSize,
+            axis: RequestedAxis::Both,
+            known_dimensions: known,
+            known_dimensions_are_definite: Size { width: true, height: true },
+            parent_size: Size { width: cb_width, height: content.height.into_option() },
+            available_space: Size { width, height: AvailableSpace::MaxContent },
+            vertical_margins_are_collapsible: Line::FALSE,
+        };
+        let responses = PyDict::new(py);
+        let mut result: Option<(f32, f32, Option<f32>, Vec<(u64, f32, f32, f32, f32, f32)>)> = None;
+        for _ in 0..16 {
+            let args = (width_arg, height_arg, known.width, known.height, responses.clone(), fills_width);
+            let Ok(reply) = measure.call1(py, args) else { break };
+            let reply = reply.bind(py);
+            if let Ok((tag, requests)) = reply.extract::<(String, Vec<(Py<PyAny>, u64)>)>() {
+                if tag != "intrinsic" {
+                    break;
+                }
+                for (key, node) in requests {
+                    let Ok(child) = self.tree.resolve(node) else { continue };
+                    let child = NodeId::from(pack(child, self.tree.nodes[child].generation));
+                    let min = self
+                        .compute_child_layout(child, child_inputs(RunMode::ComputeSize, Size::NONE, AvailableSpace::MinContent))
+                        .size
+                        .width;
+                    let max = self
+                        .compute_child_layout(child, child_inputs(RunMode::ComputeSize, Size::NONE, AvailableSpace::MaxContent))
+                        .size
+                        .width;
+                    let _ = responses.set_item(key, (min, max));
+                }
+                continue;
+            }
+            if let Ok((tag, requests)) = reply.extract::<(String, Vec<(Py<PyAny>, u64, f32, Option<f32>)>)>() {
+                if tag != "layout" {
+                    break;
+                }
+                for (key, node, width, height) in requests {
+                    let Ok(child) = self.tree.resolve(node) else { continue };
+                    let child = NodeId::from(pack(child, self.tree.nodes[child].generation));
+                    let output = self.compute_child_layout(
+                        child,
+                        child_inputs(RunMode::PerformLayout, Size { width: Some(width), height }, AvailableSpace::Definite(width)),
+                    );
+                    let _ = responses.set_item(
+                        key,
+                        (output.size.width, output.size.height, output.baselines.first, output.baselines.last),
+                    );
+                }
+                continue;
+            }
+            if let Ok((tag, w, h, baseline, placements)) =
+                reply.extract::<(String, f32, f32, Option<f32>, Vec<(u64, f32, f32, f32, f32, f32)>)>()
+            {
+                if tag == "done" {
+                    result = Some((w, h, baseline, placements));
+                }
+            }
+            break;
+        }
+        let Some((width, height, baseline, placements)) = result else {
+            return own.finish(&style, Size::ZERO, None, None);
+        };
+        if perform {
+            let inset = Point { x: own.padding_border.left, y: own.padding_border.top };
+            // table-content-relative position of every placed node
+            let mut placed: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
+            for (order, (node, x, y, w, h, offset)) in placements.iter().enumerate() {
+                let Ok(child) = self.tree.resolve(*node) else { continue };
+                let child_id = NodeId::from(pack(child, self.tree.nodes[child].generation));
+                let (px, py_) = match self.tree.nodes[child].parent.and_then(|p| placed.get(&p)) {
+                    Some(&(px, py_)) => (px, py_),
+                    None => (-inset.x, -inset.y),
+                };
+                placed.insert(child, (*x, *y));
+                let mut layout = if *offset >= 0.0 {
+                    let output = self.compute_child_layout(
+                        child_id,
+                        child_inputs(
+                            RunMode::PerformLayout,
+                            Size { width: Some(*w), height: Some(*h) },
+                            AvailableSpace::Definite(*w),
+                        ),
+                    );
+                    let _ = output;
+                    if *offset > 0.0 {
+                        let kids = self.tree.nodes[child].children.clone();
+                        for kid in kids {
+                            let k = index_of(NodeId::from(kid));
+                            self.tree.nodes[k].layout.location.y += *offset;
+                        }
+                    }
+                    self.tree.nodes[child].layout
+                } else {
+                    let child_style = &self.tree.nodes[child].style;
+                    let mut layout = Layout::with_order(order as u32);
+                    layout.padding = child_style.padding.resolve_or_zero(cb_width, |_, _| 0.0);
+                    layout.border = child_style.border.resolve_or_zero(cb_width, |_, _| 0.0);
+                    layout
+                };
+                layout.order = order as u32;
+                layout.location = Point { x: x - px, y: y - py_ };
+                layout.size = Size { width: *w, height: *h };
+                self.set_unrounded_layout(child_id, &layout);
+            }
+        }
+        own.finish(&style, Size { width, height }, baseline, baseline)
+    }
+
+    /// A leaf: Taffy's own leaf sizing around the Python measure callback,
+    /// plus the first baseline the callback may report.
+    fn compute_leaf(&mut self, node_id: NodeId, inputs: LayoutInput) -> LayoutOutput {
+        let py = self.py;
+        let node = &self.tree.nodes[index_of(node_id)];
+        let mut baselines = Baselines::NONE;
+        let mut output = compute_leaf_layout(inputs, &node.style, |_, _| 0.0, |known_dimensions, available_space| {
+            let (size, measured_baselines) = measure_via_python(py, known_dimensions, available_space, node.measure.as_ref());
+            baselines = measured_baselines;
+            size
+        });
+        if baselines.first.is_some() || baselines.last.is_some() {
+            let inset_top = node.style.padding.top.resolve_or_zero(inputs.parent_size.width, |_, _| 0.0)
+                + node.style.border.top.resolve_or_zero(inputs.parent_size.width, |_, _| 0.0);
+            output.baselines.first = baselines.first.map(|b| b + inset_top);
+            output.baselines.last = baselines.last.map(|b| b + inset_top);
+        }
+        output
+    }
+
+    /// An inline formatting context (CSS 2.1 9.4.2): the block container's
+    /// lines, laid by the Python plan (`measure`), with this node's
+    /// children -- the atomic inline-level boxes (inline-block, replaced,
+    /// inline-table) and floats mixed into those lines -- sized here by
+    /// their own formatting context first and positioned afterwards.
+    ///
+    /// Protocol with the Python side, per measure:
+    ///   measure(available_width, available_height, known_width, known_height,
+    ///           atomics, bands, placed_floats, owns_bfc)
+    /// where `atomics[k] = (k, width, height, baseline, mt, mr, mb, ml,
+    /// float)` is child k's border-box size after shrink-to-fit sizing
+    /// (CSS 2.1 10.3.9) plus its margins and float side; `bands` is the
+    /// float-free horizontal space per vertical range, content-box
+    /// relative `(top, bottom, left, width)` (None when this node's width
+    /// is indefinite, i.e. an intrinsic-size probe); `placed_floats` is
+    /// every float already placed this measure as `(k, x, y)` margin-box
+    /// positions. The plan returns either `("float", k, y)` -- place
+    /// child k's float no higher than content-box `y`, then call again
+    /// (the lines restart against the updated bands) -- or the final
+    /// `(width, height, baseline, [(k, x, y), ...])`: content size, first
+    /// baseline, and each non-float atomic's border-box position.
+    ///
+    /// Floats go through Taffy's own float context: the parent block's
+    /// `BlockContext` when this node is a same-BFC block child (so later
+    /// siblings flow around them and a BFC root's auto height includes
+    /// them), or a private one when this node is itself the root of its
+    /// block formatting context.
+    fn compute_inline_layout(
+        &mut self,
+        node_id: NodeId,
+        inputs: LayoutInput,
+        mut block_ctx: Option<&mut BlockContext<'_>>,
+    ) -> LayoutOutput {
+        let py = self.py;
+        let index = index_of(node_id);
+        let (style, measure, children) = {
+            let node = &self.tree.nodes[index];
+            (node.style.clone(), node.measure.as_ref().map(|m| m.clone_ref(py)), node.children.clone())
+        };
+        let Some(measure) = measure else {
+            return compute_leaf_layout(inputs, &style, |_, _| 0.0, |_, _| Size::ZERO);
+        };
+        let own = OwnBox::resolve(&style, &inputs);
+        if let Some(output) = own.short_circuit(inputs.run_mode) {
+            return output;
+        }
+        let LayoutInput { known_dimensions, run_mode, .. } = inputs;
+        let OwnBox { padding_border, content_available, .. } = own;
+        let calc = |_: *const (), _: f32| 0.0;
+        let inset_left = padding_border.left;
+        let inset_top = padding_border.top;
+        let cb_width = content_available.width.into_option();
+        let perform = run_mode == RunMode::PerformLayout;
+
+        // -- size every atomic child in its own formatting context --
+        let child_inputs = |run_mode: RunMode, known: Size<Option<f32>>, available: Size<AvailableSpace>| LayoutInput {
+            run_mode,
+            sizing_mode: SizingMode::InherentSize,
+            axis: RequestedAxis::Both,
+            known_dimensions: known,
+            known_dimensions_are_definite: Size { width: true, height: true },
+            // CSS 2.1 10.5: a percentage height resolves against the
+            // containing block's height when that is definite
+            // (block-formatting-contexts-008.xht: a `height: 50%` float).
+            parent_size: Size { width: cb_width, height: content_available.height.into_option() },
+            available_space: available,
+            vertical_margins_are_collapsible: Line::FALSE,
+        };
+        let mut atomics: Vec<AtomicChild> = Vec::with_capacity(children.len());
+        for child in &children {
+            let child_id = NodeId::from(*child);
+            let (child_margin, child_padding, child_border, float, clear) = {
+                let child_style = &self.tree.nodes[index_of(child_id)].style;
+                (
+                    child_style.margin.resolve_or_zero(cb_width, calc),
+                    child_style.padding.resolve_or_zero(cb_width, calc),
+                    child_style.border.resolve_or_zero(cb_width, calc),
+                    child_style.float,
+                    child_style.clear,
+                )
+            };
+            let max_content = self
+                .compute_child_layout(
+                    child_id,
+                    child_inputs(
+                        RunMode::ComputeSize,
+                        Size::NONE,
+                        Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent },
+                    ),
+                )
+                .size
+                .width;
+            let min_content = self
+                .compute_child_layout(
+                    child_id,
+                    child_inputs(
+                        RunMode::ComputeSize,
+                        Size::NONE,
+                        Size { width: AvailableSpace::MinContent, height: AvailableSpace::MaxContent },
+                    ),
+                )
+                .size
+                .width;
+            // CSS 2.1 10.3.9/10.3.5 shrink-to-fit: min(max(min-content,
+            // available), max-content), the available width being the
+            // containing block's, not the remaining line space.
+            let available_width = match content_available.width {
+                AvailableSpace::Definite(width) => (width - child_margin.horizontal_axis_sum()).max(0.0),
+                AvailableSpace::MinContent => 0.0,
+                AvailableSpace::MaxContent => f32::INFINITY,
+            };
+            let used_width = max_content.min(available_width.max(min_content));
+            let output = self.compute_child_layout(
+                child_id,
+                child_inputs(
+                    if perform { RunMode::PerformLayout } else { RunMode::ComputeSize },
+                    Size { width: Some(used_width), height: None },
+                    Size { width: AvailableSpace::Definite(used_width), height: AvailableSpace::MaxContent },
+                ),
+            );
+            atomics.push(AtomicChild {
+                id: child_id,
+                size: output.size,
+                // CSS 2.1 10.8.1: an inline-block sits on its *last* line
+                // box's baseline (first when that's all that's known).
+                baseline: output.baselines.last.or(output.baselines.first),
+                margin: child_margin,
+                padding: child_padding,
+                border: child_border,
+                float,
+                clear,
+            });
+        }
+
+        // -- lay the lines against a float context: the parent block's when
+        // this node is a same-BFC block child, else a private one --
+        let definite_width = matches!(content_available.width, AvailableSpace::Definite(_));
+        let owns_bfc = block_ctx.is_none();
+        let probe = InlineProbe {
+            py,
+            measure: &measure,
+            atomics: &atomics,
+            inset_left,
+            inset_top,
+            content_width: cb_width.unwrap_or(0.0),
+            width_arg: match content_available.width {
+                AvailableSpace::Definite(v) => Some(v),
+                AvailableSpace::MinContent => Some(-1.0),
+                AvailableSpace::MaxContent => None,
+            },
+            height_arg: match content_available.height {
+                AvailableSpace::Definite(v) => Some(v),
+                _ => None,
+            },
+            known: if perform { Size::NONE } else { known_dimensions },
+            owns_bfc,
+            definite_width,
+        };
+        let lines = match block_ctx.as_deref_mut() {
+            Some(ctx) => {
+                // Floats' containing block is this node's content box, not
+                // its border box (all Taffy's own nested-block handling
+                // tracks -- see block.rs's "TODO: handle nested blocks
+                // with different widths").
+                ctx.apply_content_box_inset([padding_border.left, padding_border.right]);
+                probe.lay_lines(Some(ctx))
+            }
+            None if definite_width => {
+                let mut local_bfc = BlockFormattingContext::new();
+                let mut ctx = local_bfc.root_block_context();
+                ctx.set_width(cb_width.unwrap_or(0.0) + padding_border.horizontal_axis_sum());
+                ctx.apply_content_box_inset([padding_border.left, padding_border.right]);
+                probe.lay_lines(Some(&mut ctx))
+            }
+            None => probe.lay_lines(None),
+        };
+        let InlineLines { measured, baseline, last_baseline, placements, placed_floats } = lines;
+
+        // -- position the children --
+        if perform {
+            for (k, x, y) in &placements {
+                if let Some(atomic) = atomics.get(*k) {
+                    let layout = atomic.layout(*k as u32, inset_left + x, inset_top + y);
+                    self.set_unrounded_layout(atomic.id, &layout);
+                }
+            }
+            for (k, x, y) in &placed_floats {
+                if let Some(atomic) = atomics.get(*k) {
+                    let layout = atomic.layout(
+                        *k as u32,
+                        inset_left + x + atomic.margin.left,
+                        inset_top + y + atomic.margin.top,
+                    );
+                    self.set_unrounded_layout(atomic.id, &layout);
+                }
+            }
+        }
+
+        // -- this node's size --
+        own.finish(&style, measured, baseline, last_baseline)
+    }
+}
+
+/// A custom node's own box, resolved from its style and layout inputs
+/// exactly as Taffy's leaf algorithm does: its size when the style or the
+/// parent fixes it, its min/max clamps, its padding and border, and the
+/// space its content is laid out in.
+struct OwnBox {
+    known_dimensions: Size<Option<f32>>,
+    node_size: Size<Option<f32>>,
+    node_min_size: Size<Option<f32>>,
+    node_max_size: Size<Option<f32>>,
+    padding: Rect<f32>,
+    padding_border: Rect<f32>,
+    prevents_collapse_through: bool,
+    content_available: Size<AvailableSpace>,
+}
+
+impl OwnBox {
+    fn resolve(style: &Style, inputs: &LayoutInput) -> OwnBox {
+        let LayoutInput { known_dimensions, parent_size, available_space, sizing_mode, .. } = *inputs;
+        let calc = |_: *const (), _: f32| 0.0;
+        let margin = style.margin.resolve_or_zero(parent_size.width, calc);
+        let padding = style.padding.resolve_or_zero(parent_size.width, calc);
+        let border = style.border.resolve_or_zero(parent_size.width, calc);
+        let padding_border = padding + border;
+        let pb_sum = padding_border.sum_axes();
+        let box_sizing_adjustment = if style.box_sizing == BoxSizing::ContentBox { pb_sum } else { Size::ZERO };
+        let (node_size, node_min_size, node_max_size) = match sizing_mode {
+            SizingMode::ContentSize => (known_dimensions, Size::NONE, Size::NONE),
+            SizingMode::InherentSize => {
+                let aspect_ratio = style.aspect_ratio;
+                let style_size = style
+                    .size
+                    .maybe_resolve(parent_size, calc)
+                    .maybe_apply_aspect_ratio(aspect_ratio)
+                    .maybe_add(box_sizing_adjustment);
+                let style_min = style
+                    .min_size
+                    .maybe_resolve(parent_size, calc)
+                    .maybe_apply_aspect_ratio(aspect_ratio)
+                    .maybe_add(box_sizing_adjustment);
+                let style_max = style.max_size.maybe_resolve(parent_size, calc).maybe_add(box_sizing_adjustment);
+                (known_dimensions.or(style_size), style_min, style_max)
+            }
+        };
+        let prevents_collapse_through = style.overflow.x.is_scroll_container()
+            || style.overflow.y.is_scroll_container()
+            || style.position == Position::Absolute
+            || style.contain.establishes_independent_formatting_context()
+            || padding.top > 0.0
+            || padding.bottom > 0.0
+            || border.top > 0.0
+            || border.bottom > 0.0
+            || matches!(node_size.height, Some(h) if h > 0.0)
+            || matches!(node_min_size.height, Some(h) if h > 0.0);
+        let content_available = Size {
+            width: known_dimensions
+                .width
+                .map(AvailableSpace::from)
+                .unwrap_or(available_space.width)
+                .maybe_sub(margin.horizontal_axis_sum())
+                .maybe_set(known_dimensions.width)
+                .maybe_set(node_size.width)
+                .map_definite_value(|size| {
+                    size.maybe_clamp(node_min_size.width, node_max_size.width) - padding_border.horizontal_axis_sum()
+                }),
+            height: known_dimensions
+                .height
+                .map(AvailableSpace::from)
+                .unwrap_or(available_space.height)
+                .maybe_sub(margin.vertical_axis_sum())
+                .maybe_set(known_dimensions.height)
+                .maybe_set(node_size.height)
+                .map_definite_value(|size| {
+                    size.maybe_clamp(node_min_size.height, node_max_size.height) - padding_border.vertical_axis_sum()
+                }),
+        };
+        OwnBox {
+            known_dimensions, node_size, node_min_size, node_max_size, padding, padding_border,
+            prevents_collapse_through, content_available,
+        }
+    }
+
+    /// Taffy's early answer for a size-only request whose size is fixed.
+    fn short_circuit(&self, run_mode: RunMode) -> Option<LayoutOutput> {
+        if run_mode == RunMode::ComputeSize && self.prevents_collapse_through {
+            if let Size { width: Some(width), height: Some(height) } = self.node_size {
+                let size = Size { width, height }
+                    .maybe_clamp(self.node_min_size, self.node_max_size)
+                    .maybe_max(self.padding_border.sum_axes().map(Some));
+                return Some(LayoutOutput::from_outer_size(size));
+            }
+        }
+        None
+    }
+
+    /// The node's output for content of `measured` size with the given
+    /// content-box-relative baselines.
+    fn finish(&self, style: &Style, measured: Size<f32>, first: Option<f32>, last: Option<f32>) -> LayoutOutput {
+        let clamped = self
+            .known_dimensions
+            .or(self.node_size)
+            .unwrap_or(measured + self.padding_border.sum_axes())
+            .maybe_clamp(self.node_min_size, self.node_max_size);
+        let size = Size {
+            width: clamped.width,
+            height: clamped.height.max(style.aspect_ratio.map(|ratio| clamped.width / ratio).unwrap_or(0.0)),
+        }
+        .maybe_max(self.padding_border.sum_axes().map(Some));
+        let top = self.padding_border.top;
+        let mut output = LayoutOutput::from_sizes_and_baselines(
+            size,
+            Rect {
+                left: 0.0,
+                right: self.padding.left + measured.width,
+                top: 0.0,
+                bottom: self.padding.top + measured.height,
+            },
+            Baselines { first: first.map(|b| b + top), last: last.map(|b| b + top) },
+        );
+        output.margins_can_collapse_through =
+            !self.prevents_collapse_through && size.height == 0.0 && measured.height == 0.0;
+        output
+    }
+}
+
+/// The inputs one inline-formatting-context measure hands the Python plan.
+struct InlineProbe<'a> {
+    py: Python<'a>,
+    measure: &'a Py<PyAny>,
+    atomics: &'a [AtomicChild],
+    inset_left: f32,
+    inset_top: f32,
+    content_width: f32,
+    width_arg: Option<f32>,
+    height_arg: Option<f32>,
+    known: Size<Option<f32>>,
+    owns_bfc: bool,
+    definite_width: bool,
+}
+
+/// What the plan decided: content size, first baseline, each non-float
+/// atomic's border-box position and each float's margin-box position, all
+/// content-box relative.
+struct InlineLines {
+    measured: Size<f32>,
+    baseline: Option<f32>,
+    last_baseline: Option<f32>,
+    placements: Vec<(usize, f32, f32)>,
+    placed_floats: Vec<(usize, f32, f32)>,
+}
+
+impl InlineProbe<'_> {
+    fn lay_lines(&self, mut ctx: Option<&mut BlockContext<'_>>) -> InlineLines {
+        let py = self.py;
+        let atomics_py: Vec<(usize, f32, f32, Option<f32>, f32, f32, f32, f32, &str)> = self
+            .atomics
+            .iter()
+            .enumerate()
+            .map(|(k, a)| {
+                (
+                    k, a.size.width, a.size.height, a.baseline,
+                    a.margin.top, a.margin.right, a.margin.bottom, a.margin.left,
+                    match a.float { Float::Left => "left", Float::Right => "right", Float::None => "" },
+                )
+            })
+            .collect();
+        let mut lines = InlineLines {
+            measured: Size::ZERO,
+            baseline: None,
+            last_baseline: None,
+            placements: Vec::new(),
+            placed_floats: Vec::new(),
+        };
+        for _ in 0..(self.atomics.len() + 2) {
+            let bands: Option<Vec<(f32, f32, f32, f32)>> = match (ctx.as_deref(), self.definite_width) {
+                (Some(ctx), true) => Some(content_bands(ctx, self.inset_left, self.inset_top, self.content_width)),
+                _ => None,
+            };
+            let args = (
+                self.width_arg, self.height_arg, self.known.width, self.known.height,
+                atomics_py.clone(), bands, lines.placed_floats.clone(), self.owns_bfc,
+            );
+            let Ok(result) = self.measure.call1(py, args) else { break };
+            let result = result.bind(py);
+            if let Ok((tag, k, y)) = result.extract::<(String, usize, f32)>() {
+                if tag == "float" && k < self.atomics.len() {
+                    let atomic = &self.atomics[k];
+                    let placed = match (ctx.as_deref_mut(), atomic.float.float_direction()) {
+                        (Some(ctx), Some(direction)) => {
+                            let margin_box = atomic.size + atomic.margin.sum_axes();
+                            let pos = ctx.place_floated_box(
+                                margin_box, y + self.inset_top, direction, atomic.clear, false,
+                            );
+                            (k, pos.x - self.inset_left, pos.y - self.inset_top)
+                        }
+                        _ => (k, 0.0, y),
+                    };
+                    lines.placed_floats.push(placed);
+                    continue;
+                }
+                break;
+            }
+            if let Ok((w, h, first, last, p)) =
+                result.extract::<(f32, f32, Option<f32>, Option<f32>, Vec<(usize, f32, f32)>)>()
+            {
+                lines.measured = Size { width: w, height: h };
+                lines.baseline = first;
+                lines.last_baseline = last;
+                lines.placements = p;
+            }
+            break;
+        }
+        lines
+    }
+}
+
+/// One atomic inline-level child of an inline formatting context, sized by
+/// its own formatting context before the lines are laid.
+struct AtomicChild {
+    id: NodeId,
+    size: Size<f32>,
+    baseline: Option<f32>,
+    margin: Rect<f32>,
+    padding: Rect<f32>,
+    border: Rect<f32>,
+    float: Float,
+    clear: Clear,
+}
+
+impl AtomicChild {
+    fn layout(&self, order: u32, x: f32, y: f32) -> Layout {
+        let mut layout = Layout::with_order(order);
+        layout.location = Point { x, y };
+        layout.size = self.size;
+        layout.border = self.border;
+        layout.padding = self.padding;
+        layout.margin = self.margin;
+        layout
+    }
+}
+
+/// The float-free horizontal space of an inline formatting context, band
+/// by band down the page: `(top, bottom, left, width)` in the node's
+/// content-box coordinates, the last band open-ended. A content slot only
+/// says where it starts, so each band's bottom is the next float segment's
+/// top (walked with the slot's `after` cursor), the last one ending where
+/// every float does (`cleared_threshold(Both)`).
+fn content_bands(ctx: &BlockContext<'_>, inset_left: f32, inset_top: f32, content_width: f32) -> Vec<(f32, f32, f32, f32)> {
+    let mut bands = Vec::new();
+    let floats_bottom = ctx.cleared_threshold(Clear::Both).map(|bottom| bottom - inset_top);
+    let mut y = inset_top;
+    let mut after: Option<usize> = None;
+    for _ in 0..512 {
+        let slot = ctx.find_content_slot(y, Clear::None, after);
+        let top = (slot.y - inset_top).max(bands.last().map(|band: &(f32, f32, f32, f32)| band.1).unwrap_or(0.0));
+        let left = (slot.x - inset_left).max(0.0);
+        let right = ((slot.x + slot.width) - inset_left).min(content_width);
+        let width = (right - left).max(0.0);
+        let Some(segment_id) = slot.segment_id else {
+            bands.push((top, f32::INFINITY, left, width));
+            break;
+        };
+        let next = ctx.find_content_slot(slot.y, Clear::None, Some(segment_id));
+        let bottom = match next.segment_id {
+            Some(_) => next.y - inset_top,
+            None => floats_bottom.unwrap_or(f32::INFINITY),
+        }
+        .max(top);
+        bands.push((top, bottom, left, width));
+        if !bottom.is_finite() {
+            break;
+        }
+        y = bottom + inset_top;
+        after = Some(segment_id);
+    }
+    bands
+}
+
+/// Call the Python measure callback. Returns the measured content size and
+/// the first baseline (content-box relative) when the callback reports one.
 fn measure_via_python(
     py: Python<'_>,
     known_dimensions: taffy::geometry::Size<Option<f32>>,
     available_space: taffy::geometry::Size<AvailableSpace>,
     callback: Option<&Py<PyAny>>,
-) -> taffy::geometry::Size<f32> {
+) -> (taffy::geometry::Size<f32>, Baselines) {
     if let (Some(w), Some(h)) = (known_dimensions.width, known_dimensions.height) {
-        return taffy::geometry::Size { width: w, height: h };
+        return (taffy::geometry::Size { width: w, height: h }, Baselines::NONE);
     }
     let Some(callback) = callback else {
-        return taffy::geometry::Size::ZERO;
+        return (taffy::geometry::Size::ZERO, Baselines::NONE);
     };
     // Width: a `MinContent` request (Taffy sizing a flex item's automatic
     // minimum, `min-width: auto`, or a `min-content` track) is passed as
@@ -685,17 +1759,29 @@ fn measure_via_python(
     // gets, but a replaced leaf (an `<img>` flex item) must only adopt a
     // *known* size, never the available space it is merely offered.
     let result = callback.call1(py, (width_arg, height_arg, known_dimensions.width, known_dimensions.height));
-    match result.and_then(|r| r.extract::<(f32, f32)>(py)) {
-        Ok((w, h)) => taffy::geometry::Size {
+    let Ok(result) = result else {
+        return (taffy::geometry::Size::ZERO, Baselines::NONE);
+    };
+    let (w, h, baselines) = if let Ok((w, h, first, last, _placements)) =
+        result.extract::<(f32, f32, Option<f32>, Option<f32>, Vec<(usize, f32, f32)>)>(py)
+    {
+        (w, h, Baselines { first, last })
+    } else if let Ok((w, h, first, last)) = result.extract::<(f32, f32, Option<f32>, Option<f32>)>(py) {
+        (w, h, Baselines { first, last })
+    } else if let Ok((w, h, first)) = result.extract::<(f32, f32, Option<f32>)>(py) {
+        (w, h, Baselines::from_first(first))
+    } else if let Ok((w, h)) = result.extract::<(f32, f32)>(py) {
+        (w, h, Baselines::NONE)
+    } else {
+        return (taffy::geometry::Size::ZERO, Baselines::NONE);
+    };
+    (
+        taffy::geometry::Size {
             width: known_dimensions.width.unwrap_or(w),
             height: known_dimensions.height.unwrap_or(h),
         },
-        Err(_) => taffy::geometry::Size::ZERO,
-    }
-}
-
-fn to_py_err(err: TaffyError) -> PyErr {
-    PyRuntimeError::new_err(err.to_string())
+        baselines,
+    )
 }
 
 // -- Parley: real text layout ------------------------------------------------

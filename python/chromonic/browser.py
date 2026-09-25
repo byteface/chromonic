@@ -290,7 +290,8 @@ def _apply_presentational_attributes(document) -> None:
             hint(element, "vertical-align", valign if valign in valigns else "inherit")
             align = attribute(element, "align")
             if align in aligns:
-                hint(element, "text-align", align)
+                # HTML rendering 15.3.3: also aligns child blocks (legacy).
+                hint(element, "text-align", f"-webkit-{align}" if align != "justify" else align)
             elif tag == "th":
                 hint(element, "text-align", "center")
             if element.getAttribute("nowrap") is not None:

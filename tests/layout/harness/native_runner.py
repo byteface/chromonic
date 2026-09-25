@@ -100,6 +100,11 @@ def _own_fragments(element, rect):
         y = (rect.y + element.get_layout_box().border_top + padding[0]
              + float(getattr(element, "_chromonic_content_offset_y", 0.0) or 0.0))
         widths = getattr(element, "_chromonic_text_line_widths", [])
+        # Lines shortened by floats start further right / lower (see
+        # `tree._make_measure`); absent, lines stack `line_height` apart from x=0.
+        line_xs = getattr(element, "_chromonic_text_line_x", None) or []
+        line_ys = getattr(element, "_chromonic_text_line_y", None) or []
+        line_avail = getattr(element, "_chromonic_text_line_avail", None) or []
         for index, text in enumerate(lines):
             # Chrome's probe (`chrome_runner._instrument`) skips any text
             # node whose `textContent.trim()` is empty -- JS `trim()` strips
@@ -128,9 +133,12 @@ def _own_fragments(element, rect):
             ascent, descent, _normal = fonts.text_metrics(family, font_size, weight >= 600, italic)
             fragment_height = ascent + descent
             text_top = math.floor((line_height - fragment_height) / 2)
-            content_width = element.get_layout_box().client_width - padding[1] - padding[3]
+            content_width = line_avail[index] if index < len(line_avail) else (
+                element.get_layout_box().client_width - padding[1] - padding[3])
+            line_x = line_xs[index] if index < len(line_xs) else 0.0
+            line_top = line_ys[index] if index < len(line_ys) else index * line_height
             computed_style = getattr(element, "_chromonic_computed_style", None)
-            text_align = getattr(computed_style, "textAlign", "start")
+            text_align = tree.box_model._text_align(getattr(computed_style, "textAlign", "start"))
             # CSS Text 3 `text-align-last`: the element's own final line uses
             # this instead, unless it's `auto` (same as `text-align`, except
             # `justify` -- whose last line is never itself justified).
@@ -148,15 +156,15 @@ def _own_fragments(element, rect):
             align_offset = ((content_width - width) / 2 if text_align == "center"
                             else content_width - width if text_align in ("right", "end") else 0.0)
             text_rects.append(_rect_dict(
-                rect.x + element.get_layout_box().border_left + padding[3] + align_offset,
-                y + index * line_height + text_top, width, fragment_height,
+                rect.x + element.get_layout_box().border_left + padding[3] + line_x + align_offset,
+                y + line_top + text_top, width, fragment_height,
             ) | {"text": text})
             # DOM Range includes a zero-width rectangle for a preserved line
             # break in addition to the glyph rectangle preceding it.
             if text.endswith('\n') and paint_style.get("white_space") in ("pre", "pre-wrap", "break-spaces"):
                 text_rects.append(_rect_dict(
-                    rect.x + element.get_layout_box().border_left + padding[3] + align_offset + width,
-                    y + index * line_height + text_top, 0, fragment_height,
+                    rect.x + element.get_layout_box().border_left + padding[3] + line_x + align_offset + width,
+                    y + line_top + text_top, 0, fragment_height,
                 ) | {"text": "\n"})
     return {"element": element_rects, "text": text_rects}
 

@@ -11,7 +11,6 @@ from . import box_model, builder, dom, flex_grid, inline_formatting, positioning
 
 
 
-
 def _form_control_display_text(element) -> str:
     tag_name = (getattr(element, "tagName", "") or "").lower()
     if tag_name == "textarea":
@@ -223,13 +222,30 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
     elif (height_auto or width_auto) and intrinsic_ratio:
         # width/height isn't a plain pixel length on either side (most
         # commonly a percentage) -- its resolved pixel value isn't known
-        # until Taffy lays out the box, so this function (which runs once,
-        # before Taffy sees the tree) can't precompute the scaled auto side.
-        # Taffy's native aspect_ratio support picks it up after resolving
-        # whichever side has a real value. Confirmed on bbc.com: every
-        # `<img style="width:100%">` measured a real width but a literal 0
-        # height without this -- nothing handled percentage width/height at all.
-        style["aspect_ratio"] = intrinsic_ratio
+        # until Taffy lays out the box. The measure callback sees that
+        # resolved, min/max-clamped size (CSS 2.1 10.4) and derives the
+        # auto side from the ratio -- max-width-109.xht (`width:200%;
+        # max-width:100px` must give a 100px-tall square). A style
+        # aspect ratio would not do: Taffy applies it before clamping.
+        ratio = intrinsic_ratio
+        natural = (intrinsic_width, intrinsic_height) if has_complete_pair else (default_width, default_height)
+
+        def measure(available_width, available_height, known_width=None, known_height=None,
+                    ratio=ratio, natural=natural, width_auto=width_auto, height_auto=height_auto):
+            width = known_width if known_width is not None else (
+                available_width if available_width is not None and available_width >= 0 else None)
+            height = known_height if known_height is not None else (
+                available_height if available_height is not None and available_height >= 0 else None)
+            # The side the author specified drives the other through the
+            # ratio (CSS 2.1 10.3.2/10.6.2); `available_*` for an auto side
+            # is only offered space, never a size to adopt.
+            if not width_auto and width is not None:
+                return (width, width / ratio)
+            if not height_auto and height is not None:
+                return (height * ratio, height)
+            return natural
+
+        element.__dict__["_chromonic_img_measure"] = (measure, ("img-ratio-measure", src, ratio, natural))
     if isinstance(style["width"], (int, float)):
         # A resolved replaced-element width (intrinsic, ratio-derived, or
         # the 300px UA default) is never subject to flex-shrink -- it's
@@ -443,215 +459,8 @@ def _apply_svg_intrinsic_size(style: dict, element) -> None:
 
 
 
-_INTRINSIC_WIDTH_KEYWORDS = ("min-content", "max-content", "fit-content")
-
-_measuring_intrinsic_depth = 0
-
-
-
 def _numeric_or_zero(value) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
-
-
-
-def _resolve_intrinsic_width_keyword(element, computed, style_obj, computed_cache) -> "float | None":
-    """CSS Sizing 3: width: min-content|max-content|fit-content (and
-    -webkit-/-moz- spellings) on a block-level box, resolved to a
-    Taffy-usable content-box width before the box is built -- Taffy's
-    Dimension has no intrinsic keywords (style_bridge._len dropped them to
-    auto, so inline-size:min-content on align-items-baseline-row-horz.html's
-    flex container filled the whole body). max-content (and, approximated,
-    fit-content) is the scratch-tree measurement `_measure_intrinsic_width`
-    already does for table cells; min-content is the longest unbreakable
-    token, or for a single-line flex row the sum of its items' min-content
-    margin boxes. `None` leaves the width alone. Re-entrancy from the
-    scratch measurement is guarded so the measured copy lays out as plain auto."""
-    global _measuring_intrinsic_depth
-    if _measuring_intrinsic_depth:
-        return None
-    raw = (getattr(computed, "width", "") or "").strip().lower()
-    for prefix in ("-webkit-", "-moz-"):
-        if raw.startswith(prefix):
-            raw = raw[len(prefix):]
-    if raw not in _INTRINSIC_WIDTH_KEYWORDS:
-        return None
-    display = getattr(style_obj.display, "value", "")
-    if display == "inline" or not dom._renders(style_obj):
-        return None
-    _measuring_intrinsic_depth += 1
-    try:
-        if raw == "min-content":
-            content = _min_content_width(element, computed_cache)
-            if content is None:
-                return None
-            border_box = None
-        else:
-            border_box = _measure_intrinsic_width(element, computed_cache)
-            if border_box is None:
-                return None
-            content = None
-    finally:
-        _measuring_intrinsic_depth -= 1
-    native = style_bridge.to_dict(style_obj)
-    padding = native.get("padding") or (0.0,) * 4
-    border = native.get("border") or (0.0,) * 4
-    horizontal = (_numeric_or_zero(padding[1]) + _numeric_or_zero(padding[3])
-                  + _numeric_or_zero(border[1]) + _numeric_or_zero(border[3]))
-    if content is None:
-        content = max(0.0, border_box - horizontal)
-    return content + horizontal if native.get("box_sizing") == "border-box" else content
-
-
-
-def _min_content_width(element, computed_cache) -> "float | None":
-    computed, style_obj = dom._describe(element, computed_cache)
-    direction = (getattr(computed, "flexDirection", "row") or "row").strip().lower()
-    wrap = (getattr(computed, "flexWrap", "nowrap") or "nowrap").strip().lower()
-    if (getattr(style_obj.display, "value", "") in flex_grid._FLEX_DISPLAYS
-            and direction in ("row", "row-reverse") and wrap == "nowrap"):
-        total = 0.0
-        for child in dom._child_nodes(element):
-            if not dom._is_element(child):
-                continue  # an anonymous text item: not measured here (rare in a sized row)
-            child_computed, child_style = dom._describe(child, computed_cache)
-            if not dom._renders(child_style) or box_model._is_absolutely_positioned(child_style):
-                continue
-            native = style_bridge.to_dict(child_style)
-            padding = native.get("padding") or (0.0,) * 4
-            border = native.get("border") or (0.0,) * 4
-            margin = native.get("margin") or (0.0,) * 4
-            edges = (_numeric_or_zero(padding[1]) + _numeric_or_zero(padding[3])
-                     + _numeric_or_zero(border[1]) + _numeric_or_zero(border[3]))
-            width = native.get("width")
-            if isinstance(width, (int, float)):
-                outer = float(width) + (0.0 if native.get("box_sizing") == "border-box" else edges)
-            else:
-                outer = (_min_content_width(child, computed_cache) or 0.0) + edges
-            total += outer + _numeric_or_zero(margin[1]) + _numeric_or_zero(margin[3])
-        return total
-    return _measure_min_content_width(element, computed_cache)
-
-
-
-def _measure_intrinsic_width(element, computed_cache) -> "float | None":
-    """The natural (max-content) width `element` would take with no line
-    wrapping -- computed in a disposable Taffy tree so real layout does the
-    measuring rather than a hand-rolled approximation. `None` on any
-    failure; caller falls back to today's behaviour."""
-    scratch = Tree()
-    try:
-        root_id = builder.build(scratch, element, {}, computed_cache=computed_cache, reuse_styles=False)
-        boxes = scratch.compute(root_id, None, None)
-        box = boxes.get(root_id)
-        return float(box[2]) if box is not None else None
-    except Exception:
-        return None
-
-
-
-def _measure_min_content_width(element, computed_cache) -> "float | None":
-    """The width of `element`'s longest unbreakable token (its longest
-    whitespace-separated word, measured in its own font) -- CSS 2.1
-    17.5.2.2's real "minimum content width" for auto table-layout column
-    sizing: the smallest a column can be made without breaking a word
-    mid-token. Deliberately not `_measure_intrinsic_width`'s max-content --
-    a wildly too-wide floor for a colspan'd cell holding a whole wrapping
-    sentence. Found on en.wikipedia.org's Python-article infobox: a
-    colspan'd cell listing dozens of comma-separated names measured over
-    1200px unwrapped, forcing the column absurdly wide instead of
-    wrapping across lines like Chrome.
-
-    A plain per-token font-metrics measurement (not a real Taffy layout
-    pass) -- deliberately minimal: doesn't account for a nested element's
-    own different font, only `element`'s own (that nested element's
-    content still counts via `dom._rendering_text_content`, in the outer font)."""
-    text = dom._rendering_text_content(element).strip()
-    if not text:
-        return None
-    dom._describe(element, computed_cache)
-    widest = 0.0
-
-    def measure(owner, token: str) -> float:
-        paint_style = owner._chromonic_paint_style
-        font_size = _fontmetrics.parse_length(paint_style["font_size"], default=16.0)
-        family = "" if paint_style["font_family"] == "none" else paint_style["font_family"]
-        weight = inline_formatting._parse_font_weight(paint_style["font_weight"])
-        italic = fonts.is_italic(paint_style["font_style"])
-        return layout_text(token, family, font_size, font_weight=weight, italic=italic)[0]
-
-    # Only CSS white space separates tokens -- str.split() would also break
-    # at U+00A0, never a break opportunity -- caption-side-001.xht. Each
-    # text node is measured in its own element's font --
-    # table-margin-003.xht; a word running across an element boundary is
-    # read as two, which only ever under-measures slightly.
-    # A word runs on across text-node and element boundaries (the XHTML
-    # parser hands "Filler&nbsp;Text" over as three text nodes; <b>bo</b>ld
-    # is one word) and only ends at CSS white space or a <br>: its width is
-    # the sum of its pieces, each measured in its own font.
-    word: list = []
-
-    def flush():
-        nonlocal widest
-        if word:
-            widest = max(widest, sum(measure(owner, piece) for owner, piece in word))
-            word.clear()
-
-    def walk(node, owner):
-        node_type = getattr(node, "nodeType", None)
-        if node_type == dom.TEXT_NODE:
-            raw = getattr(node, "textContent", None) or getattr(node, "data", "") or ""
-            for part in re.split(r"([ \t\n\r\f]+)", raw):
-                if not part:
-                    continue
-                if part[0] in " \t\n\r\f":
-                    flush()
-                else:
-                    word.append((owner, part))
-            return
-        if node_type != dom.ELEMENT_NODE:
-            return
-        tag = (getattr(node, "tagName", "") or "").lower()
-        if tag in dom._NON_RENDERING_TAGS:
-            return
-        if tag == "br":
-            flush()
-            return
-        try:
-            dom._describe(node, computed_cache)
-            child_owner = node if getattr(node, "_chromonic_paint_style", None) else owner
-        except Exception:
-            child_owner = owner
-        for child in dom._child_nodes(node):
-            walk(child, child_owner)
-
-    child_nodes = getattr(element, "childNodes", None)
-    if not child_nodes:
-        for token in re.split(r"[ \t\n\r\f]+", text):
-            if token:
-                widest = max(widest, measure(element, token))
-        return widest
-    for child in child_nodes:
-        walk(child, element)
-    flush()
-    return widest
-
-
-
-def _apply_button_intrinsic_width(style: dict, element) -> None:
-    if style["width"] != "auto":
-        return
-    text = dom._own_text(element)
-    paint_style = element._chromonic_paint_style
-    font_size = _fontmetrics.parse_length(paint_style["font_size"], default=13.3333)
-    width, _height, _lines = layout_text(
-        text, paint_style["font_family"], font_size,
-        font_weight=inline_formatting._parse_font_weight(paint_style["font_weight"]),
-        italic=fonts.is_italic(paint_style["font_style"]),
-    )
-    horizontal = sum(float(value) for value in (style["padding"][1], style["padding"][3],
-                                                 style["border"][1], style["border"][3])
-                     if not isinstance(value, tuple) and value != "auto")
-    style["width"] = width + horizontal
 
 
 

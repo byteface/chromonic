@@ -242,7 +242,7 @@ _DOM_FLAGS_META_RE = re.compile(
 # nor domonic can execute that script, so these need the same skip
 # `_requires_dom_scripting` already gives `flags="dom"` fixtures.
 _SCRIPTED_LAYOUT_MUTATION_RE = re.compile(
-    r"<script\b[\s\S]*?(?:\.style\.\w+\s*=|checkLayout\s*\("
+    r"<script\b[\s\S]*?(?:\.style\.\w+\s*=|\.style\s*=|checkLayout\s*\("
     r"|\.removeChild\s*\(|\.appendChild\s*\(|\.insertBefore\s*\("
     r"|\.replaceChild\s*\(|\.remove\s*\(\s*\))[\s\S]*?</script>",
     re.I,
@@ -269,7 +269,7 @@ def _requires_dom_scripting(source: str) -> bool:
     )
 
 
-def run_folder(folder, output, base_url, tolerance, chrome=None, limit=None, start=0):
+def run_folder(folder, output, base_url, tolerance, chrome=None, limit=None, start=0, reuse_chrome=True):
     folder = folder.resolve()
     wpt_root = find_wpt_root(folder)
 
@@ -359,14 +359,33 @@ def run_folder(folder, output, base_url, tolerance, chrome=None, limit=None, sta
             # Native browser needs to fetch the throwaway copy over HTTP.
             temp_path.write_text(tagged, encoding="utf-8")
 
-            chrome_result = chrome_runner.run(
-                fixture,
-                artifact_dir,
-                artifact_dir / "chrome.png",
-                chrome=chrome,
-                base_url=url,
-                source_override=tagged,
-            )
+            chrome_json = artifact_dir / "chrome.json"
+            stored = None
+            if reuse_chrome and chrome_json.exists() and chrome_json.stat().st_mtime >= fixture.stat().st_mtime:
+                try:
+                    stored = json.loads(chrome_json.read_text(encoding="utf-8"))
+                except ValueError:
+                    stored = None
+                # Only a baseline for the very same tagging is reusable: an
+                # older tagger numbered elements differently.
+                if stored is not None and set(stored.get("elements", {})) != set(
+                        re.findall(r'id="(__chromonic_wpt_\d+)"', tagged)):
+                    stored = None
+            if stored is not None:
+                # Chrome's geometry for an unchanged fixture is a stable
+                # baseline: reuse the stored one instead of relaunching
+                # Chrome (the slow half of every run). `--fresh-chrome`
+                # forces a new capture.
+                chrome_result = stored
+            else:
+                chrome_result = chrome_runner.run(
+                    fixture,
+                    artifact_dir,
+                    artifact_dir / "chrome.png",
+                    chrome=chrome,
+                    base_url=url,
+                    source_override=tagged,
+                )
 
             native_result = native_runner.run(
                 fixture,
@@ -521,6 +540,12 @@ def main(argv=None):
     )
 
     parser.add_argument(
+        "--fresh-chrome",
+        action="store_true",
+        help="Relaunch Chrome for every fixture instead of reusing a stored chrome.json baseline",
+    )
+
+    parser.add_argument(
         "--start",
         type=int,
         default=0,
@@ -555,6 +580,7 @@ def main(argv=None):
         chrome=args.chrome,
         limit=args.limit,
         start=args.start,
+        reuse_chrome=not args.fresh_chrome,
     )
 
     print()

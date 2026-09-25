@@ -12,7 +12,7 @@ from . import box_model, dom
 def _write_boxes(boxes, node_map):
     """Publish native geometry back onto the authoritative Domonic nodes."""
     for node_id, box in boxes.items():
-        x, y, w, h, bt, br, bb, bl, pt, pr, pb, pl = box
+        (x, y, w, h), (bt, br, bb, bl), (pt, pr, pb, pl), (mt, mr, mb, ml) = box
         element = node_map[node_id]
         state = element.__dict__
         # Same private-state assignment domonic's set_layout_box wrappers
@@ -22,11 +22,14 @@ def _write_boxes(boxes, node_map):
             client_width=w - bl - br,
             client_height=h - bt - bb,
             border_top=bt, border_left=bl,
+            # Taffy's used margins (auto resolved) -- what getComputedStyle()
+            # reports for a declared `auto` (CSS 2.1 10.3.3).
+            margin_top=mt, margin_right=mr, margin_bottom=mb, margin_left=ml,
         )
         state["_chromonic_padding"] = (pt, pr, pb, pl)
-        # Fresh Taffy geometry undoes any row heights _settle_table
-        # distributed inside this table -- it must run again.
-        state.pop("_chromonic_table_settled", None)
+        # Fresh geometry no longer carries the position:relative-inline
+        # offset `_apply_inline_rel_offset` applied to this box.
+        state.pop("_chromonic_inline_rel_offset", None)
 
 
 
@@ -44,7 +47,7 @@ def _grow_and_reflow(element, delta: float, *, stop_at=None, grow_self: bool = T
     growth up through each auto-height ancestor with its later siblings
     likewise -- stopping at the first ancestor with a non-auto height.
     `stop_at` names an ancestor that still grows but propagates no
-    further (`_settle_table` hands a table's net growth on, exactly once).
+    further.
     `grow_self=False` propagates a growth already applied to element's
     own box."""
     if grow_self:

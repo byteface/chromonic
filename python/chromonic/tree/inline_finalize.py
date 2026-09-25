@@ -11,215 +11,6 @@ from . import anonymous_boxes, box_model, dom, flex_grid, geometry, inline_forma
 
 
 
-def _apply_linebox_strut_height(node_map: dict) -> None:
-    """CSS 2.1 10.8: a line box's height always includes its own "strut"
-    (an invisible zero-width inline box using the line's font/line-height)
-    even when the only real content is a single atomic inline-level box
-    with no text. Taffy has no concept of a line box, so such a block's
-    `height:auto` comes out exactly as tall as its tallest child.
-
-    Deliberately conservative: only a `height:auto` block whose in-flow
-    children are all atomic inline-level boxes at default `vertical-align:
-    baseline`, with no text of their own, is corrected."""
-    for element in node_map.values():
-        if not dom._is_element(element):
-            continue
-        if getattr(element, "_chromonic_inline_plan", None) is not None:
-            continue  # real text already measured a correct line box
-        native = getattr(element, "_chromonic_native_style", None)
-        if native is None:
-            continue
-        # A fixed-height container still places its atomics on each line's
-        # baseline -- flex-wrap-002.html; only the container's own growth
-        # below is reserved for height:auto.
-        height_auto = native.get("height") == "auto"
-        resolved = getattr(element, "_chromonic_resolved_style", None)
-        if resolved is not None and getattr(resolved[1].display, "value", "") in (
-                flex_grid._FLEX_DISPLAYS + ("grid", "inline-grid")):
-            # A real flex/grid container has no line box: its inline-block
-            # children are flex/grid items -- flex-direction-column.html.
-            continue
-        box = element.__dict__.get("_layout_box")
-        if box is None:
-            continue
-        child_nodes = dom._child_nodes(element)
-        if any(getattr(node, "nodeType", None) == dom.TEXT_NODE
-               and dom._collapsed_text_node(node).strip() for node in child_nodes):
-            continue  # real text present -- not this function's scope
-        children = [node for node in child_nodes if dom._is_element(node)]
-        if not children:
-            continue
-        atomic_children = []
-        for child in children:
-            computed = getattr(child, "_chromonic_computed_style", None)
-            child_box = child.__dict__.get("_layout_box")
-            if computed is None or child_box is None:
-                atomic_children = None
-                break
-            display = (getattr(computed, "display", "") or "").strip().lower()
-            tag_name = (getattr(child, "tagName", "") or "").lower()
-            if display != "inline-block" and tag_name not in box_model._REPLACED_OR_CONTROL_TAGS:
-                atomic_children = None
-                break
-            if tag_name in box_model._REPLACED_OR_CONTROL_TAGS and display in (
-                    "block", "flex", "grid", "table", "list-item", "flow-root"):
-                # A replaced element made block-level (img{display:block},
-                # empty-cells-007.xht) is a block box: no line box, no
-                # strut, nothing to sit on a baseline.
-                atomic_children = None
-                break
-            vertical_align = (getattr(computed, "verticalAlign", "") or "baseline").strip().lower()
-            if vertical_align not in ("baseline", ""):
-                atomic_children = None
-                break
-            atomic_children.append((child, child_box))
-        if not atomic_children:
-            continue
-        paint_style = getattr(element, "_chromonic_paint_style", None) or {}
-        font_size = _fontmetrics.parse_length(paint_style.get("font_size"), default=16.0)
-        family = paint_style.get("font_family", "") or ""
-        if family == "none":
-            family = ""
-        weight = inline_formatting._parse_font_weight(paint_style.get("font_weight"))
-        italic = fonts.is_italic(paint_style.get("font_style"))
-        ascent, descent, normal = fonts.text_metrics(family, font_size, weight >= 600, italic)
-        # An explicit `line-height: 0` must not be treated as unset.
-        resolved_line_height = inline_formatting._resolved_line_height(paint_style.get("line_height"))
-        line_height = resolved_line_height if resolved_line_height is not None else normal
-        half_leading = (line_height - (ascent + descent)) / 2.0
-        strut_above = ascent + half_leading
-        strut_below = descent + half_leading
-        aboves: dict = {}
-        belows: dict = {}
-        for child, child_box in atomic_children:
-            child_native = getattr(child, "_chromonic_native_style", None) or {}
-            margin = child_native.get("margin") or (0.0, 0.0, 0.0, 0.0)
-            # vertical-align:baseline on an atomic box aligns its baseline
-            # to the line's (CSS 2.1 10.8.1): a replaced box's or empty
-            # inline-block's is its bottom margin edge; an inline-block
-            # with text sits on its last line's baseline --
-            # absolute-non-replaced-width-017.xht.
-            own = box_model._element_own_baseline(child)
-            if own is None:
-                child_above = child_box.height + box_model._numeric_edge(margin[0]) + box_model._numeric_edge(margin[2])
-                child_below = 0.0
-            else:
-                child_above = own + box_model._numeric_edge(margin[0])
-                child_below = child_box.height - own + box_model._numeric_edge(margin[2])
-            aboves[id(child)] = child_above
-            belows[id(child)] = child_below
-        # The atomics wrap into line boxes (the flex-row approximation's
-        # flex-wrap:wrap rows): a new line starts where x turns back, or
-        # fails to advance while y moves on. Each line is at least one
-        # strut tall and stacks under the previous one -- the old
-        # single-line reading pulled every wrapped row onto the first
-        # baseline -- flex-wrap-002.html.
-        lines: list = []
-        current: list = []
-        prev_x = prev_bottom = None
-        reversed_row = native.get("flex_direction") == "row-reverse"  # an rtl line advances leftwards
-        for child, child_box in atomic_children:
-            turned = prev_x is not None and (
-                (child_box.x > prev_x + 0.01) if reversed_row else (child_box.x < prev_x - 0.01))
-            if prev_x is not None and (
-                    turned
-                    or (abs(child_box.x - prev_x) <= 0.01 and child_box.y >= prev_bottom - 0.01)):
-                lines.append(current)
-                current = []
-            current.append((child, child_box))
-            prev_x = child_box.x
-            prev_bottom = child_box.y + child_box.height
-        if current:
-            lines.append(current)
-        # Each atomic box sits with its bottom margin edge on its line's
-        # baseline, max_above below the line top (CSS 2.1 10.8.1) --
-        # Taffy's baseline placement only knows the boxes, not the strut --
-        # empty-cells-008.xht.
-        content_top = box.y + box.border_top + element.__dict__.get("_chromonic_padding", (0.0,) * 4)[0]
-        line_top = content_top
-        for line in lines:
-            max_above = max([strut_above] + [aboves[id(child)] for child, _b in line])
-            max_below = max([strut_below] + [belows[id(child)] for child, _b in line])
-            for child, child_box in line:
-                child_native = getattr(child, "_chromonic_native_style", None) or {}
-                margin = child_native.get("margin") or (0.0, 0.0, 0.0, 0.0)
-                target = line_top + max_above - aboves[id(child)] + box_model._numeric_edge(margin[0])
-                if abs(target - child_box.y) > 0.01:
-                    geometry._shift_subtree(child, 0.0, target - child_box.y)
-            line_top += max_above + max_below
-        needed_height = line_top - content_top
-        if not height_auto or needed_height <= box.height + 0.01:
-            continue
-        delta = needed_height - box.height
-        # Grown through `geometry._grow_and_reflow`: whatever follows moves down
-        # and every auto-height ancestor grows with it -- empty-cells-008.xht.
-        geometry._grow_and_reflow(element, delta)
-
-
-
-def _apply_empty_inline_block_min_height(node_map: dict) -> None:
-    """A genuinely empty display:inline-block box still measures
-    height:auto as one line's worth of font/line-height, not zero --
-    unlike a plain non-replaced display:inline, whose shared ancestor line
-    can legitimately collapse to zero when empty (CSS 2.1 9.4.2), an
-    inline-block always establishes its own formatting context, whose line
-    box exists even with nothing in it. build()'s childless fallback gives
-    it no such machinery on its own."""
-    for element in node_map.values():
-        if not dom._is_element(element):
-            continue
-        native = getattr(element, "_chromonic_native_style", None)
-        if native is None or native.get("height") != "auto":
-            continue
-        computed = getattr(element, "_chromonic_computed_style", None)
-        display = (getattr(computed, "display", "") or "").strip().lower() if computed is not None else ""
-        if display != "inline-block":
-            continue
-        box = element.__dict__.get("_layout_box")
-        if box is None:
-            continue
-        # CSS 2.1 10.6.1/10.6.7: a block container with no line boxes is
-        # zero tall -- a genuinely empty inline-block has no line box to be
-        # one line tall -- css-flexbox/flex-wrap-002.html. Only an
-        # inline-block with some content, laid out shorter than a line, is
-        # corrected here.
-        if not any(
-                (getattr(node, "nodeType", None) == dom.TEXT_NODE
-                 and dom._collapsed_text_node(node).strip(inline_formatting._CSS_WHITESPACE_STRIP_CHARS))
-                or dom._is_element(node)
-                for node in dom._child_nodes(element)):
-            continue
-        # Deliberately not gated on `_chromonic_has_layout_children` -- that
-        # flag can be set for degenerate content too. What matters is only
-        # whether the box ended up shorter than one line, checked below
-        # against needed_height.
-        paint_style = getattr(element, "_chromonic_paint_style", None) or {}
-        font_size = _fontmetrics.parse_length(paint_style.get("font_size"), default=16.0)
-        family = paint_style.get("font_family", "") or ""
-        if family == "none":
-            family = ""
-        weight = inline_formatting._parse_font_weight(paint_style.get("font_weight"))
-        italic = fonts.is_italic(paint_style.get("font_style"))
-        _ascent, _descent, normal = fonts.text_metrics(family, font_size, weight >= 600, italic)
-        # An explicit `line-height: 0` must not be treated as unset.
-        resolved_line_height = inline_formatting._resolved_line_height(paint_style.get("line_height"))
-        line_height = resolved_line_height if resolved_line_height is not None else normal
-        if line_height <= 0.0:
-            continue
-        border = native.get("border") or (0.0,) * 4
-        padding = native.get("padding") or (0.0,) * 4
-        vertical_edges = (box_model._numeric_edge(border[0]) + box_model._numeric_edge(border[2])
-                          + box_model._numeric_edge(padding[0]) + box_model._numeric_edge(padding[2]))
-        needed_height = line_height + vertical_edges
-        if needed_height <= box.height + 0.01:
-            continue
-        delta = needed_height - box.height
-        element.__dict__["_layout_box"] = dataclasses.replace(
-            box, height=box.height + delta, client_height=box.client_height + delta,
-        )
-
-
-
 def _merge_adjacent_same_line_rects(rects) -> list:
     """Combine consecutive rects (already in the order they were placed --
     left-to-right within one line) that share a `y` into one wider rect,
@@ -373,7 +164,7 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
     # reports its descendants' union -- abspos-inline-003.xht. It borrows
     # its descendants' rects here; _chromonic_native_style set means the
     # element has a real Taffy box already and stops the walk.
-    for key, (owner, groups, _fragments) in list(owner_accum.items()):
+    for key, (owner, groups, _fragments, outer_groups) in list(owner_accum.items()):
         if not groups:
             continue
         parent = getattr(owner, "parentElement", None)
@@ -382,17 +173,22 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
             if entry is None:
                 # Only an ancestor with no fragments of its own -- one that
                 # has some folds its descendants into them below instead.
-                entry = owner_accum[id(parent)] = (parent, {}, [])
-                for group_key, rects in groups.items():
+                # Its box spans its descendants' margin boxes.
+                entry = owner_accum[id(parent)] = (parent, {}, [], {})
+                for group_key, rects in outer_groups.items():
                     entry[1].setdefault(group_key, []).extend(rects)
+                    entry[3].setdefault(group_key, []).extend(rects)
             parent = getattr(parent, "parentElement", None)
     own_merged = {}
-    for key, (owner, groups, _fragments) in owner_accum.items():
+    own_merged_outer = {}
+    for key, (owner, groups, _fragments, outer_groups) in owner_accum.items():
         if not groups:
             continue
         group_keys = sorted(groups, key=lambda key: (key is not None, key))
         merged_groups = [_merge_adjacent_same_line_rects(groups[key]) for key in group_keys]
         own_merged[key] = [rect for group in merged_groups for rect in group]
+        own_merged_outer[key] = [rect for key_ in group_keys
+                                 for rect in _merge_adjacent_same_line_rects(outer_groups.get(key_, groups[key_]))]
 
     def _depth(owner) -> int:
         depth = 0
@@ -411,12 +207,12 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
         while parent is not None:
             parent_key = id(parent)
             if parent_key in descendant_only:
-                descendant_only[parent_key].extend(own_merged[key])
+                descendant_only[parent_key].extend(own_merged_outer[key])
                 descendant_only[parent_key].extend(descendant_only[key])
                 break
             parent = getattr(parent, "parentElement", None)
 
-    for key, (owner, groups, fragments) in owner_accum.items():
+    for key, (owner, groups, fragments, _outer_groups) in owner_accum.items():
         if key not in own_merged:
             continue
         # CSS 2.1 9.2.1: a wrapping inline's fragments span the full
@@ -492,27 +288,17 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
             # height; a merged marker (two blocks with a skipped, empty
             # segment between them) tracks both.
             marker_positions: list = []
-            atomic_segment_elements = getattr(owner, "_chromonic_atomic_segment_elements", None) or {}
             for index, group in enumerate(merged_groups):
-                atomic_nodes = atomic_segment_elements.get(group_keys[index])
                 # An interior segment (between two interruption blocks) with
                 # no real content gets no fragment of its own in real
                 # Chrome. The leading/trailing 0x0 case is different -- that
                 # one is a real, if empty, fragment of the wrapper's own
                 # remaining content on that side.
                 interior_empty = (
-                    not atomic_nodes and 0 < index < len(merged_groups) - 1
+                    0 < index < len(merged_groups) - 1
                     and len(group) == 1 and group[0][2] == 0.0 and group[0][3] == 0.0
                 )
-                if atomic_nodes:
-                    # This segment's "group" is a zero-sized marker run --
-                    # its real content is one or more atomic elements built
-                    # as real subtrees; use their already-final boxes instead.
-                    for node in atomic_nodes:
-                        node_box = node.__dict__.get("_layout_box")
-                        if node_box is not None:
-                            final_rects.append((node_box.x, node_box.y, node_box.width, node_box.height))
-                elif not interior_empty:
+                if not interior_empty:
                     final_rects.extend(group)
                 if index < len(interruption_blocks):
                     block = interruption_blocks[index]
@@ -593,7 +379,7 @@ def _publish_inline_formatting(node_map) -> None:
             plan.publish(box, element.__dict__.get("_chromonic_padding", (0.0,) * 4),
                          owner_accum, element_fragments_accum)
     _finalize_inline_owner_boxes(owner_accum)
-    _fix_split_inline_relative_offset(owner for owner, _groups, _fragments in owner_accum.values())
+    _fix_split_inline_relative_offset(entry[0] for entry in owner_accum.values())
     for element, fragments in element_fragments_accum.values():
         element._chromonic_inline_fragments = fragments
 

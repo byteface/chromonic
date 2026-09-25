@@ -117,18 +117,24 @@ class _AnonymousTableBox:
 
 
 
-class _InlineSpacer:
-    """A Taffy-only leaf standing in, in the flex-row approximation of
-    inline content, for the collapsed whitespace before an element item
-    (one space wide, no height). Not a DOM node; never painted or reported."""
+class _StaticAnchor:
+    """The zero-size placeholder an absolutely positioned box leaves in its
+    static parent's flow when the box itself is laid out as a child of its
+    containing block. Where it lands is the box's static position (CSS 2.1
+    10.3.7/10.6.4); `src/lib.rs` moves the box there on each auto axis."""
 
-    nodeType = None
+    STYLE = {
+        "display": "block", "position": "absolute", "width": 0.0, "height": 0.0,
+        "inset": ["auto", "auto", "auto", "auto"], "margin": [0.0, 0.0, 0.0, 0.0],
+        "padding": [0.0, 0.0, 0.0, 0.0], "border": [0.0, 0.0, 0.0, 0.0],
+    }
 
-    def __init__(self, before):
-        self.before = before
-
-    def __repr__(self):
-        return f"<inline spacer before {getattr(self.before, 'tagName', '?')}>"
+    def __init__(self, owner):
+        self.owner = owner
+        self.parentElement = getattr(owner, "parentElement", None)
+        self.childNodes = ()
+        self._chromonic_tag_name = "#static-anchor"
+        self._chromonic_has_layout_children = False
 
 
 
@@ -429,6 +435,17 @@ def _wrap_inline_runs(element, nodes, computed_cache) -> list:
         while run and classify(run[-1]) == "blank":
             run.pop()
         if not run:
+            run.clear()
+            return
+        if all(classify(node) == "blank" or (dom._is_element(node)
+                                             and box_model._is_floated(dom._describe(node, computed_cache)[0]))
+               for node in run):
+            # CSS 2.1 9.5: a float between block siblings is out of flow --
+            # a direct floated child of this block container (Taffy's block
+            # layout places it), not an anonymous block box's contents.
+            # Only a float amid real inline content belongs to that
+            # content's anonymous block.
+            result.extend(run)
             run.clear()
             return
         key = ("block", id(run[0]))

@@ -91,8 +91,46 @@ def _child_nodes(element):
     ``childNodes`` list as a fallback.
     """
     if isinstance(element, Element):
-        return element.args
+        args = element.args
+        if any(isinstance(node, str) for node in args):
+            return _with_string_text_nodes(element, args)
+        return args
     return getattr(element, "childNodes", None) or ()
+
+
+
+class _StringTextNode:
+    """A DOM text node standing in for a bare `str` child -- what domonic's
+    Python API stores for `div("text")` instead of a `Text` node. Layout
+    keys retained state (text fragments, native nodes) on node identity,
+    so these are cached per element and reused across passes."""
+
+    def __init__(self, text: str, parent):
+        self.nodeType = TEXT_NODE
+        self.textContent = text
+        self.data = text
+        self.parentNode = parent
+        self.parentElement = parent
+        self.childNodes = ()
+
+
+def _with_string_text_nodes(element, args):
+    cache = element.__dict__.setdefault("_chromonic_string_text_nodes", {})
+    nodes = []
+    seen = set()
+    for index, node in enumerate(args):
+        if isinstance(node, str):
+            key = (index, node)
+            seen.add(key)
+            shim = cache.get(key)
+            if shim is None:
+                shim = cache[key] = _StringTextNode(node, element)
+            nodes.append(shim)
+        else:
+            nodes.append(node)
+    for stale in [key for key in cache if key not in seen]:
+        cache.pop(stale)
+    return nodes
 
 
 
@@ -164,7 +202,7 @@ def _extract_paint_style(computed) -> dict:
         "white_space": computed.getPropertyValue("white-space"),
         "word_break": computed.getPropertyValue("word-break") or "normal",
         "overflow_wrap": computed.getPropertyValue("overflow-wrap") or "normal",
-        "text_align": computed.getPropertyValue("text-align"),
+        "text_align": box_model._text_align(computed.getPropertyValue("text-align")),
         # Domonic's generated IDL getter supplies this initial value while
         # getPropertyValue() currently returns an empty string when unset.
         "text_align_last": computed.getPropertyValue("text-align-last") or "auto",

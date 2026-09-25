@@ -44,6 +44,50 @@ left todo: everything still cos the agents get lazy and just get into habbits of
 
 Agent should NOT run full suite of tests between fixes. It takes too long and waiting ages per fix is not productive. Instead run full verification between batches of fixes.
 
+## engine structure (after the inline/float rebuild)
+
+- `src/lib.rs` owns the layout tree (`LayoutPartialTree`), not Taffy's built-in
+  `TaffyTree`: block/flex/grid are Taffy's algorithms, floats included
+  (`float`/`clear` reach Taffy's block formatting context); an `inline` node
+  kind is chromonic's own inline formatting context (`compute_inline_layout`
+  + `inline_formatting._InlineFormattingPlan.measure`). Text leaves report
+  first/last baselines to Taffy.
+- Inline content is one path: the plan places text, atomic inline-level
+  boxes (inline-block/replaced/inline-table, built as real children of the
+  inline node, sized by their own formatting context) and floats (placed
+  through the block formatting context, so later siblings and line boxes
+  flow around them). Line boxes are shortened per float band over their full
+  height; too-narrow lines shift down. The flex-wrap approximations
+  (`_approximate_inline_flow`, `_build_inline_flex_row`,
+  `_group_inline_element_runs`) and every post-layout float/strut/flex-row
+  repair pass (`floats.py`, `_fix_flex_row_baseline_alignment`,
+  `_apply_linebox_strut_height`, ...) are gone.
+- `white-space` is honoured in inline flow (`pre`/`pre-wrap`/`pre-line`/
+  `break-spaces`/`nowrap`: preserved spaces, newlines as forced breaks, no
+  wrapping) via `_runs_for_text`.
+- Known remaining gaps: `<br>` with its own font-size, CSS Inline 3
+  (`baseline-shift`, `alignment-baseline`, `initial-letter`), inline-level
+  text next to a float when the *line* is taller than the band it starts
+  in for text leaves (plan-based inline nodes re-lay such lines; leaves
+  use the line's own uniform height). Taffy 0.14 quirks seen: a BFC box with a
+  negative remaining width beside a float still "fits" (floats-wrap-bfc-with-
+  margin-004), and a float wider than its containing block is dropped below
+  earlier floats where Chrome keeps it at the top (floats-rule3-outside-*).
+- The WPT harness reuses a stored `chrome.json` baseline for an unchanged
+  fixture when its tagged id set matches (`--fresh-chrome` to force);
+  `el.style = ...` scripted fixtures are skipped like `.style.x =` ones.
+
+- Numbers after the rebuild (same harness, same samples; "before" is the
+  pre-rebuild summary where one existed): CSS2/visudet 7 -> 31 of 40;
+  CSS2/box 8 -> 8 of 11; CSS2/linebox (first 60) 43 pass; CSS2/floats
+  (first 120) 19 -> 36 pass; CSS2/floats-clear (first 60) 46 pass;
+  CSS2/positioning (first 150) 134 pass; CSS2/normal-flow (first 200)
+  103 -> 98 (stored baselines for several of the "regressions" were from an
+  older tagger/engine state, e.g. block-non-replaced-height-* lay out
+  identically on the committed code); css-inline (first 100) 8 pass -- that
+  folder is mostly CSS Inline 3 features (initial-letter, baseline-shift,
+  alignment-baseline) chromonic doesn't implement.
+
 ## known chromonic engine gaps (found via real-world use, not WPT)
 
 ~~`paint.py`'s border painting only supported a uniform border~~ -- FIXED.
@@ -110,6 +154,19 @@ aware real browsers are. Not investigated further.
 
 
 ## log domonic issues here to be fixed upstream
+
+domonic keeps an invalid keyword as a property's computed value (e.g.
+`grid-auto-flow: columns`, a typo in css-inline/baseline-source/*, comes
+through as `"columns"`) where CSS drops the declaration at parse time.
+chromonic now falls back to the property's initial value in `src/lib.rs`'s
+`parse_style` instead of failing the page.
+
+domonic's Python API keeps a bare `str` child (`div("text")`) in `args`
+rather than a `Text` node; layout wraps these in a text-node shim
+(`dom._StringTextNode`) so inline formatting sees them.
+
+------
+
 
 `CSS.supports()` doesn't validate a property's *value*, only that the
 declaration's syntax parses -- `CSS.supports("(display: bogus-value-xyz)")`

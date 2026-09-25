@@ -33,15 +33,18 @@ def test_native_tree_computes_a_flex_row():
     )
     boxes = t.compute(root, 500.0, 100.0)
 
-    assert boxes[root][:4] == (0.0, 0.0, 500.0, 100.0)
-    assert boxes[a][:4] == (0.0, 0.0, 100.0, 50.0)
-    assert boxes[b][:4] == (110.0, 0.0, 100.0, 50.0)  # 100 (a's width) + the 10px gap
+    assert boxes[root][0] == (0.0, 0.0, 500.0, 100.0)
+    assert boxes[a][0] == (0.0, 0.0, 100.0, 50.0)
+    assert boxes[b][0] == (110.0, 0.0, 100.0, 50.0)  # 100 (a's width) + the 10px gap
 
 
-def test_native_tree_rejects_a_bad_style_value():
+def test_native_tree_ignores_a_bad_style_keyword():
+    # An invalid declaration is ignored by CSS: the property keeps its
+    # initial value rather than failing layout for the whole page.
     t = Tree()
-    with pytest.raises(ValueError):
-        t.new_leaf({"display": "not-a-real-display-value"})
+    node = t.new_leaf({"display": "not-a-real-display-value", "width": 40.0, "height": 30.0})
+    boxes = t.compute(node, 100.0, None)
+    assert boxes[node][0][2:4] == (40.0, 30.0)
 
 
 def test_style_bridge_translates_lengths_and_keywords():
@@ -642,13 +645,21 @@ def test_generated_content_pseudo_elements_contribute_text_layout():
         interaction.render()
         icon = interaction.root.getElementsByTagName("i")[0]
 
-        # `::before` with non-empty `content` now gets a real, separately
-        # laid-out box (its own font/position/background, not text merely
-        # concatenated onto the owner's) -- see `tree._PseudoElement`.
+        # `::before` with non-empty `content` is a real inline box of its
+        # own (its own font/position/background, not text merely
+        # concatenated onto the owner's) -- see `tree._PseudoElement`. The
+        # `<i>` is a plain inline, so its line is laid by the enclosing
+        # block's inline formatting context (here `<body>`): the generated
+        # text is one of that context's retained fragments, painted in the
+        # pseudo's own style, and both the pseudo and the `<i>` get a box.
         assert icon._chromonic_before_text == "\uf03e"
-        fragments = icon._chromonic_inline_fragments
+        fragments = interaction.root._chromonic_inline_fragments
         assert len(fragments) == 1
-        pseudo = fragments[0]
+        fragment = fragments[0]
+        assert fragment._chromonic_text_lines == ["\uf03e"]
+        assert fragment._chromonic_paint_style["font_size"] == "20px"
+        assert fragment.__dict__["_layout_box"].width > 0
+        pseudo = icon.__dict__["_chromonic_pseudo_objs"]["before"]
         assert pseudo.text == "\uf03e"
         assert pseudo.__dict__["_layout_box"].width > 0
         assert icon.get_layout_box().width > 0

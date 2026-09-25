@@ -47,8 +47,8 @@ case was verified to already work correctly.
 **`display: block` for the standard block-level tags, added in phase 11 --
 not for layout geometry (`chromonic.style_bridge._display()` already collapses
 everything that isn't `flex`/`grid`/`none` to Taffy's block layout, so
-these rules are a geometry no-op) but so `tree.py`'s inline-flow
-*approximation* (`_approximate_inline_flow`) can tell a `<p>`/`<div>` apart
+these rules are a geometry no-op) but so the layout tree's inline-level
+classification (`box_model._is_inline_level`) can tell a `<p>`/`<div>` apart
 from an `<a>`/`<span>` at all.** Without an explicit default, domonic's raw
 CSS initial value for `display` is `inline` for *every* tag alike -- there
 is no way to distinguish "an unstyled `<div>`, meant to stack" from "an
@@ -56,8 +56,8 @@ unstyled `<a>`, meant to sit in a line" without one of them saying so.
 `display: list-item` (`<li>`'s real default) isn't attempted -- Taffy has
 no such display mode, and this doesn't yet draw list markers/bullets (see
 PLAN.md's "Fonts and further rendering" for what's still open); `block` is
-the closest achievable and enough to make `_approximate_inline_flow` treat
-a `<ul>`'s `<li>` children correctly as non-inline.
+the closest achievable and enough to treat a `<ul>`'s `<li>` children
+correctly as non-inline.
 
 Values below are the common values shared by WHATWG's suggested UA
 stylesheet and real browsers' `html.css`, trimmed to properties this POC's
@@ -99,6 +99,7 @@ ul, ol { padding: 0 0 0 40px; }
 b, strong { font-weight: bold; }
 th { font-weight: bold; }
 caption { display: table-caption; text-align: center; }
+center { display: block; text-align: -webkit-center; }
 pre, code, kbd, samp { font-family: monospace; }
 pre { white-space: pre; }
 small { font-size: 0.83em; }
@@ -125,6 +126,13 @@ dialog[open] { display: block; }
 STYLESHEET = f"@layer chromonic-ua {{\n{_RULES}\n}}"
 
 
+# Spelled out rather than `initial`, which domonic's cascade doesn't resolve.
+QUIRKS_STYLESHEET = """
+table { font-weight: normal; font-style: normal; font-variant: normal; font-size: medium;
+        line-height: normal; white-space: normal; text-align: start; }
+"""
+
+
 def apply(document) -> None:
     """Insert the UA stylesheet, in its own `@layer`, as the first child of
     `document`'s `<head>` (creating one if the page somehow has none). Layer
@@ -147,7 +155,14 @@ def apply(document) -> None:
 
     style_element = document.createElement("style")
     style_element.setAttribute("data-chromonic-ua", "")
-    style_element.textContent = STYLESHEET
+    # HTML rendering 15.3.6: a document with no doctype is in quirks mode,
+    # where tables reset inherited text properties -- so text inside a
+    # `<center>`-wrapped table stays left-aligned (news.ycombinator.com has
+    # no doctype and relies on this).
+    quirks = getattr(document, "doctype", None) is None
+    # Inside the UA layer, so any author rule still wins.
+    text = STYLESHEET[:STYLESHEET.rindex("}")] + (QUIRKS_STYLESHEET if quirks else "") + "}\n"
+    style_element.textContent = text
     head.insertBefore(style_element, head.firstChild)
 
     if getattr(document, "_Document__stylesheets", None) is not None:
@@ -157,5 +172,5 @@ def apply(document) -> None:
         sheet._constructed = False
         sheet.href = getattr(document, "URL", "")
         sheet.ownerNode = style_element
-        sheet.replaceSync(STYLESHEET)
+        sheet.replaceSync(text)
         document.styleSheets.insert(0, sheet)

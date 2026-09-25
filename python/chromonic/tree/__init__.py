@@ -9,9 +9,12 @@ builds exactly one `ComputedStyleDeclaration` per element per pass and shares
 it across style-dict-building and `paint.py`'s paint-style extraction.
 
 Split from a single 11,260-line tree.py into this package by concern (dom
-plumbing, anonymous-box synthesis, inline formatting, table layout, floats,
+plumbing, anonymous-box synthesis, inline formatting, table layout,
 positioning, flex/grid, shared box-model/geometry primitives, and the
-recursive `builder.build()`). Cross-submodule calls go through qualified
+recursive `builder.build()`). Block, flex and grid layout are Taffy's, floats
+included (`float`/`clear` reach Taffy's block formatting context); inline
+formatting is chromonic's own node kind (`inline_formatting`, driven from
+`src/lib.rs`'s `compute_inline_layout`). Cross-submodule calls go through qualified
 module access (`from . import x` then `x.name(...)`), never `from .x import
 name` -- several of these modules depend on each other in both directions
 (e.g. dom <-> anonymous_boxes <-> inline_formatting), and only the qualified
@@ -39,7 +42,7 @@ from domonic.utils import Utils
 
 from .. import style_bridge
 from .._native import Tree, layout_text
-from . import anonymous_boxes, box_model, builder, dom, flex_grid, floats, geometry, inline_finalize, inline_formatting, positioning, replaced_elements, table_layout
+from . import anonymous_boxes, box_model, builder, dom, flex_grid, geometry, inline_finalize, inline_formatting, positioning, replaced_elements, table_layout
 
 
 
@@ -119,14 +122,27 @@ class LayoutProjection:
         previous = self.state.get(id(element))
         return previous is None or previous[2] != measure_key
 
-    def upsert(self, element, style, children, measure, measure_key):
+    def upsert(self, element, style, children, measure, measure_key, kind="auto"):
+        """`kind`: "auto" (Taffy dispatches on display), "table" (`Tree.new_table`) or "inline" (an
+        inline formatting context, `Tree.new_inline`). A node's kind is
+        fixed at creation, so an element that changes kind between
+        layouts gets a fresh native node."""
         key = id(element)
         self._seen.add(key)
         children = tuple(children)
         node = self.nodes.get(key)
         previous = self.state.get(key)
+        if node is not None and previous is not None and previous[3] != kind:
+            self.tree.remove(node)
+            self.node_map.pop(node, None)
+            node = None
+            previous = None
         if node is None:
-            if children:
+            if kind == "inline":
+                node = self.tree.new_inline(style, measure, list(children))
+            elif kind == "table":
+                node = self.tree.new_table(style, measure, list(children))
+            elif children:
                 node = self.tree.new_with_children(style, list(children))
             elif measure is not None:
                 node = self.tree.new_text_leaf(style, measure)
@@ -134,7 +150,7 @@ class LayoutProjection:
                 node = self.tree.new_leaf(style)
             self.nodes[key] = node
         else:
-            old_style, old_children, old_measure_key = previous
+            old_style, old_children, old_measure_key, _old_kind = previous
             if old_style != style:
                 self.tree.set_style(node, style)
             if old_children != children:
@@ -144,7 +160,7 @@ class LayoutProjection:
         # Keep an independent value snapshot. Image intrinsic sizing
         # mutates its cached dictionary in place; retaining that object would
         # make the next dirty comparison miss the change.
-        self.state[key] = (_snapshot_style(style), children, measure_key)
+        self.state[key] = (_snapshot_style(style), children, measure_key, kind)
         self.node_map[node] = element
         return node
 
@@ -193,8 +209,8 @@ class LayoutProjection:
         style.update(changes)
         element._chromonic_native_style = style
         self.tree.set_style(node, style)
-        _old_style, children, measure_key = previous
-        self.state[key] = (_snapshot_style(style), children, measure_key)
+        _old_style, children, measure_key, kind = previous
+        self.state[key] = (_snapshot_style(style), children, measure_key, kind)
 
     def patch_insets(self, updates):
         """Batch known ``(element, top, right, bottom, left)`` changes."""
@@ -212,7 +228,7 @@ class LayoutProjection:
             # update only the one changed field instead of copying a
             # ~50-property dict per animated element.
             style["inset"] = inset
-            snapshot, _children, _measure_key = previous
+            snapshot, _children, _measure_key, _kind = previous
             snapshot["inset"] = list(inset)
         self.tree.set_insets(native_updates)
 
@@ -371,13 +387,9 @@ def _adjust_body_collapsed_margins(root_element):
     if getattr(root_element, "_chromonic_tag_name", None) != "body":
         return
     style = getattr(root_element, "_chromonic_native_style", {})
-    # `_approximate_inline_flow` may have turned body into a flex-wrap row
-    # standing in for real float layout -- `_chromonic_float_flow_children`
-    # marks this as chromonic's own approximation, where margin collapsing
-    # still applies. A genuine author flexbox body (no such marker) is
-    # left alone: real flex containers don't collapse margins with children.
-    if (style.get("display") != "block"
-            and getattr(root_element, "_chromonic_float_flow_children", None) is None):
+    # A genuine author flexbox body is left alone: real flex containers
+    # don't collapse margins with children.
+    if style.get("display") != "block":
         return
     if any(value not in (0.0, "auto") for name in ("padding", "border")
            for value in style.get(name, ())):
@@ -506,6 +518,15 @@ def _adjust_body_collapsed_margins(root_element):
 
 
 
+def _in_root_anchored_subtree(node, root_anchored_ids) -> bool:
+    while node is not None:
+        if id(node) in root_anchored_ids:
+            return True
+        node = getattr(node, "parentElement", None)
+    return False
+
+
+
 def _apply_root_margin_offset(root_element, node_map: dict) -> None:
     """Shift the whole laid-out tree by the compute root's own margin.
 
@@ -560,6 +581,19 @@ def _apply_root_margin_offset(root_element, node_map: dict) -> None:
             owner = getattr(owner, "parentElement", None)
         else:
             geometry._shift_box(node, dx, dy)
+            continue
+        if owner.__dict__.get("_chromonic_static_anchored") and not _in_root_anchored_subtree(
+                getattr(owner, "parentElement", None), root_anchored_ids):
+            # Its static position came from its placeholder in the flow,
+            # which did move: on each axis whose insets are both auto, it
+            # moves with it -- unless the placeholder itself sits inside a
+            # viewport-anchored subtree that the margin doesn't move
+            # (abspos-023.xht).
+            inset = (getattr(owner, "_chromonic_native_style", None) or {}).get("inset") or ("auto",) * 4
+            sx = dx if inset[1] == "auto" and inset[3] == "auto" else 0.0
+            sy = dy if inset[0] == "auto" and inset[2] == "auto" else 0.0
+            if sx or sy:
+                geometry._shift_box(node, sx, sy)
 
 
 
@@ -607,8 +641,6 @@ def _scan_layout_pass_features(node_map: dict) -> dict:
     exact marker attribute its pass already gates on internally, so this
     changes nothing about what any pass does, only whether it runs."""
     has_split_wrapper = False
-    has_flex_row_members = False
-    has_float_flow = False
     has_absolute = False
     has_absolute_or_fixed = False
     has_table = False
@@ -622,11 +654,6 @@ def _scan_layout_pass_features(node_map: dict) -> dict:
             has_table = True
         if d.get("_chromonic_split_wrapper_ref") is not None:
             has_split_wrapper = True
-        members = d.get("_chromonic_flex_row_members")
-        if members and len(members) >= 2:
-            has_flex_row_members = True
-        if d.get("_chromonic_float_flow_children"):
-            has_float_flow = True
         style = d.get("_chromonic_native_style")
         if style is not None:
             margin = style.get("margin") or ()
@@ -646,8 +673,6 @@ def _scan_layout_pass_features(node_map: dict) -> dict:
                 has_rtl = True
     return {
         "split_wrapper": has_split_wrapper,
-        "flex_row_members": has_flex_row_members,
-        "float_flow": has_float_flow,
         "absolute": has_absolute,
         "absolute_or_fixed": has_absolute_or_fixed,
         "table": has_table,
@@ -673,9 +698,6 @@ def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_hei
         inline_finalize._fix_nested_split_flow_extent(node_map)
     _adjust_body_collapsed_margins(root_element)
     _apply_root_margin_offset(root_element, node_map)
-    if features["flex_row_members"]:
-        flex_grid._fix_flex_row_baseline_alignment(node_map)
-    floats._fix_inline_float_position(node_map)
     flex_grid._fix_flex_baseline_alignment(node_map)
     flex_grid._fix_flex_safe_alignment(node_map)
     flex_grid._fix_flex_rtl_mirroring(node_map)
@@ -688,11 +710,7 @@ def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_hei
     # `positioning._fix_absolute_static_position_fallback` reads
     # element._chromonic_static_position, which this sets.
     inline_finalize._publish_inline_formatting(node_map)
-    inline_finalize._apply_linebox_strut_height(node_map)
-    inline_finalize._apply_empty_inline_block_min_height(node_map)
-    shrink_to_fit_shifted = floats._fix_float_shrink_to_fit_width(tree_obj, node_map)
-    if features["table"]:
-        shrink_to_fit_shifted |= table_layout._fix_table_shrink_to_fit_width(tree_obj, node_map)
+    shrink_to_fit_shifted = False
     # Both shrink-to-fit fixes above reposition their whole subtree via
     # `geometry._write_boxes` (a fresh, isolated tree.compute()) + `_shift_subtree`
     # -- but `geometry._write_boxes` only touches elements with a real Taffy
@@ -712,23 +730,12 @@ def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_hei
     # with no floats or auto-width tables.
     if shrink_to_fit_shifted:
         inline_finalize._publish_inline_formatting(node_map)
-        # The fresh tree.compute() also discarded the two line-box height
-        # corrections above inside the recomputed subtree -- both are
-        # grow-only and idempotent, so they simply run again.
-        inline_finalize._apply_linebox_strut_height(node_map)
-        inline_finalize._apply_empty_inline_block_min_height(node_map)
     # After the shrink-to-fit pass: that recomputes an auto-width table's
     # whole subtree from scratch (`geometry._write_boxes`), which would discard
     # any row heights distributed before it.
     if features["table"]:
-        table_layout._enforce_fixed_column_boxes(node_map)
-        table_layout._settle_tables(node_map)
         table_layout._publish_table_column_boxes(node_map)
     replaced_elements._publish_svg_shape_boxes(node_map)
-    if features["float_flow"]:
-        floats._fix_float_flow_after_block_sibling(node_map)
-        floats._fix_float_flow_container_auto_height(node_map)
-    floats._fix_nested_bfc_float_auto_height(node_map)
     inline_finalize._resync_interruption_marker_heights(node_map)
     # A nested split wrapper's _layout_box doesn't exist until
     # `inline_finalize._publish_inline_formatting` (above) unions its fragments,
@@ -737,26 +744,22 @@ def _finish_layout_pass(tree_obj, node_map, root_element, *, width, viewport_hei
     # finally real and final.
     if features["split_wrapper"]:
         inline_finalize._fix_nested_split_flow_extent(node_map)
-    # Re-anchor body's auto-height now that a float-flow BFC child's height
-    # may have just shifted -- idempotent, re-derives from final positions.
+    # Re-anchor body's auto-height now that the split-wrapper extents are
+    # final -- idempotent, re-derives from final positions.
     _adjust_body_collapsed_margins(root_element)
     if features["absolute"]:
-        positioning._fix_absolute_shrink_to_fit_extent(node_map)
         positioning._fix_absolute_horizontal_auto_margins(node_map)
         positioning._fix_absolute_vertical_auto_margins(node_map)
         positioning._fix_absolute_width_against_containing_block(node_map)
-        positioning._fix_absolute_height_against_containing_block(node_map)
         positioning._fix_absolute_static_position_fallback(node_map)
     if viewport_height is not None and features["absolute_or_fixed"]:
         positioning._fix_viewport_anchored_positioning(node_map, viewport_height, width)
-    if features["auto_horizontal_margin"]:
-        positioning._publish_used_horizontal_margins(node_map)
     return node_map
 
 
 from .anonymous_boxes import (
     _ANONYMOUS_COMPUTED_DEFAULTS, _AnonymousInlineRun, _AnonymousTableBox,
-    _AnonymousTextFragment, _InlineSpacer, _RowspanPlaceholder, _SyntheticComputed,
+    _AnonymousTextFragment, _RowspanPlaceholder, _SyntheticComputed,
     _TABLE_INTERNAL_KINDS, _TABLE_PART_DISPLAYS, _TABLE_PART_TAGS, _normalized_child_nodes,
     _synthesize_anonymous_style, _table_part_kind, _wrap_inline_runs,
     _wrap_missing_table_boxes
@@ -777,13 +780,8 @@ from .dom import (
 )
 from .flex_grid import (
     _FLEX_DISPLAYS, _GRID_AREA_LINE_RE, _GRID_AREA_SPAN_RE, _css_order,
-    _fix_flex_baseline_alignment, _fix_flex_row_baseline_alignment, _fix_flex_rtl_mirroring,
+    _fix_flex_baseline_alignment, _fix_flex_rtl_mirroring,
     _fix_flex_safe_alignment, _is_flex_or_grid_item, _parse_grid_area, _parse_grid_area_token
-)
-from .floats import (
-    _bfc_descendant_float_bottom, _cleared_y, _fix_float_flow_after_block_sibling,
-    _fix_float_flow_container_auto_height, _fix_float_shrink_to_fit_width,
-    _fix_inline_float_position, _fix_nested_bfc_float_auto_height, _has_ratio_derived_height
 )
 from .geometry import (
     _grow_and_reflow, _grow_box_height, _needed_ancestor_growth, _shift_anonymous_boxes,
@@ -791,7 +789,6 @@ from .geometry import (
     _shift_subtree, _write_boxes
 )
 from .inline_finalize import (
-    _apply_empty_inline_block_min_height, _apply_linebox_strut_height,
     _finalize_inline_owner_boxes, _fix_nested_split_flow_extent,
     _fix_split_inline_relative_offset, _inline_relative_offset, _is_flattened_inline,
     _merge_adjacent_same_line_rects, _publish_inline_formatting,
@@ -801,44 +798,35 @@ from .inline_formatting import (
     _CSS_COLLAPSIBLE_WHITESPACE_RE, _CSS_WHITESPACE_STRIP_CHARS, _InlineFormattingPlan,
     _block_margins_collapse_through, _build_text_runs_from_nodes, _collapse_margin_set,
     _contains_in_flow_block, _empty_decoration_only_run, _empty_inline_strut_run,
-    _first_reachable_in_flow_block, _group_inline_element_runs,
+    _first_reachable_in_flow_block,
     _has_direct_in_flow_block_child, _inline_mixed_content, _inline_text_style,
-    _is_genuine_inline_wrapper, _make_collapsed_space_run, _make_inline_formatting_plan,
-    _make_measure, _needs_inline_flow_grouping, _parse_font_weight, _resolve_text_indent,
+    _is_atomic_inline, _is_genuine_inline_wrapper, _make_collapsed_space_run,
+    _make_inline_formatting_plan, _make_measure, _parse_font_weight, _resolve_text_indent,
     _resolved_line_height, _split_inline_flow_around_blocks, _split_wrapping_inline_element
 )
 from .positioning import (
-    _find_containing_block_ancestor, _fix_absolute_height_against_containing_block,
-    _fix_absolute_horizontal_auto_margins, _fix_absolute_shrink_to_fit_extent,
+    _find_containing_block_ancestor,
+    _fix_absolute_horizontal_auto_margins,
     _fix_absolute_static_position_fallback, _fix_absolute_vertical_auto_margins,
     _fix_absolute_width_against_containing_block, _fix_relative_rtl_insets,
     _fix_rtl_block_positioning, _fix_viewport_anchored_positioning,
-    _flex_container_static_position, _is_root_anchored, _publish_used_horizontal_margins,
+    _flex_container_static_position, _is_root_anchored,
     _resolve_inset, _resolve_viewport_anchored_box, _resolve_viewport_anchored_box_x
 )
 from .replaced_elements import (
-    _INTRINSIC_WIDTH_KEYWORDS, _apply_button_intrinsic_width, _apply_canvas_intrinsic_size,
+    _apply_canvas_intrinsic_size,
     _apply_iframe_intrinsic_size, _apply_image_intrinsic_size, _apply_svg_intrinsic_size,
-    _form_control_display_text, _measure_intrinsic_width, _measure_min_content_width,
-    _measuring_intrinsic_depth, _min_content_width, _numeric_or_zero, _publish_svg_shape_boxes,
-    _resolve_intrinsic_width_keyword, _resolve_replaced_percent_height, _select_display_text,
+    _form_control_display_text, _numeric_or_zero, _publish_svg_shape_boxes,
+    _resolve_replaced_percent_height, _select_display_text,
     _stretched_replaced_flex_item
 )
 from .table_layout import (
     _BORDER_ORIGIN_PRIORITY, _BORDER_SIDE_ATTR, _BORDER_STYLE_PRIORITY, _ROW_GROUP_TAG_KIND,
-    _TABLE_INTERNAL_DISPLAYS, _align_table_cell_baselines_in, _align_table_cell_content_in,
-    _border_candidate, _cell_natural_height, _cell_span, _collapse_amounts, _collapse_rows_in,
-    _column_elements, _compute_fixed_column_widths, _compute_table_column_widths,
-    _cover_spanned_rows_in, _distribute_table_extra_height_in, _enforce_fixed_column_boxes,
-    _fix_table_shrink_to_fit_width, _is_inline_table_box, _is_table_cell_display,
-    _is_table_root_display, _is_table_row_display, _layout_children,
-    _publish_table_column_boxes, _resize_table_row, _resolve_collapsed_border,
-    _resolve_collapsed_table_borders, _row_cells, _row_child_ids_with_rowspan_placeholders,
-    _row_group_kind, _settle_collapsed_cells_in, _settle_rowspan_cells_in, _settle_table,
-    _settle_tables, _spanning_cells, _table_cell_baseline, _table_cell_content_height,
-    _table_cell_has_content, _table_columns, _table_grid, _table_row_baseline, _table_rows
+    _TABLE_INTERNAL_DISPLAYS, _border_candidate, _cell_span, _column_elements, _compute_fixed_column_widths, _is_inline_table_box, _is_table_cell_display,
+    _is_table_root_display, _is_table_row_display, _publish_table_column_boxes, _resolve_collapsed_border,
+    _resolve_collapsed_table_borders, _row_cells, _row_group_kind, _table_cell_has_content, _table_columns, _table_grid, _table_rows
 )
 from .builder import (
-    _approximate_inline_flow, _measure_key, _wants_horizontal_flow, build
+    _build_inline_node, _measure_key, build
 )
 
