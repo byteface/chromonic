@@ -9,7 +9,6 @@ from . import anonymous_boxes, dom, inline_formatting, table_layout
 
 
 
-
 def _numeric_edge(value) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
@@ -155,89 +154,6 @@ def _establishes_containing_block(style_obj) -> bool:
 
 
 
-def _first_baseline(element) -> "float | None":
-    """CSS 2.1 17.5.3: the baseline of a cell (or any block) is the baseline
-    of its first in-flow line box, reached through its first in-flow child
-    that has one; a replaced element's is its bottom edge. None when
-    there's no line box at all (an empty cell)."""
-    box = element.__dict__.get("_layout_box")
-    if box is None:
-        return None
-    if getattr(element, "_chromonic_is_table_root", False):
-        # CSS 2.1 17.5.3/10.8.1: a table's baseline is its first row's. A
-        # caption sits outside the table box (17.4) and never counts --
-        # table-height-algorithm-031.xht. The table algorithm
-        # (`table_formatting`) records it relative to the content box.
-        offset = element.__dict__.get("_chromonic_table_baseline_offset")
-        if offset is None:
-            return None
-        padding = element.__dict__.get("_chromonic_padding", (0.0,) * 4)
-        return box.y + box.border_top + padding[0] + offset
-    def line_baseline(owner, top, line_height):
-        paint = getattr(owner, "_chromonic_paint_style", None) or getattr(element, "_chromonic_paint_style", None) or {}
-        font_size = _fontmetrics.parse_length(paint.get("font_size"), default=16.0)
-        family = paint.get("font_family", "") or ""
-        if family == "none":
-            family = ""
-        weight = inline_formatting._parse_font_weight(paint.get("font_weight"))
-        ascent, descent, normal = fonts.text_metrics(family, font_size, weight >= 600,
-                                                     fonts.is_italic(paint.get("font_style")))
-        line_height = line_height or normal
-        return top + math.floor((line_height - (ascent + descent)) / 2) + ascent
-
-    tag = getattr(element, "_chromonic_tag_name", None) or (getattr(element, "tagName", "") or "").lower()
-    padding = element.__dict__.get("_chromonic_padding", (0.0,) * 4)
-    if tag in _REPLACED_OR_CONTROL_TAGS:
-        if tag == "button" and (getattr(element, "_chromonic_text_lines", None) or []):
-            # A button's baseline is its label's, not its bottom edge --
-            # table-height-algorithm-026.xht.
-            return line_baseline(element, box.y + box.border_top + padding[0],
-                                 float(getattr(element, "_chromonic_line_height", 0.0) or 0.0))
-        return box.y + box.height
-
-    plan = getattr(element, "_chromonic_inline_plan", None)
-    if plan is not None:
-        # An element laying out its own inline formatting context (text
-        # mixed with inline children -- align-self-006.html): its first
-        # line box with content.
-        baselines = getattr(plan, "_line_baselines", None) or {}
-        has_content = getattr(plan, "_line_has_content", None)
-        for y in sorted(baselines):
-            if has_content is not None and not has_content.get(y):
-                continue
-            return box.y + y + baselines[y]
-    computed = getattr(element, "_chromonic_computed_style", None)
-    display = (getattr(computed, "display", "") or "").strip().lower() if computed is not None else ""
-    if not getattr(element, "_chromonic_has_layout_children", False):
-        if not (getattr(element, "_chromonic_text_lines", None) or []):
-            if display == "list-item":
-                # An empty list item still has its marker's line box, and
-                # that line's baseline -- empty-cells-applies-to-003.xht.
-                return line_baseline(element, box.y + box.border_top + padding[0],
-                                     float(getattr(element, "_chromonic_line_height", 0.0) or 0.0))
-            return None
-        offset = float(element.__dict__.get("_chromonic_content_offset_y", 0.0) or 0.0)
-        return line_baseline(element, box.y + box.border_top + padding[0] + offset,
-                             float(getattr(element, "_chromonic_line_height", 0.0) or 0.0))
-    for fragment in element.__dict__.get("_chromonic_inline_fragments") or ():
-        fragment_box = fragment.__dict__.get("_layout_box")
-        if fragment_box is not None and (getattr(fragment, "_chromonic_text_lines", None) or []):
-            return line_baseline(fragment, fragment_box.y,
-                                 float(getattr(fragment, "_chromonic_line_height", 0.0) or 0.0))
-    children = element.__dict__.get("_chromonic_normalized_children") or getattr(element, "childNodes", None) or ()
-    for child in children:
-        if not dom._is_element(child):
-            continue
-        native = getattr(child, "_chromonic_native_style", None) or {}
-        if native.get("position") in ("absolute", "fixed"):
-            continue
-        baseline = _first_baseline(child)
-        if baseline is not None:
-            return baseline
-    return None
-
-
-
 def _alignment_parts(value) -> "tuple[str, bool]":
     """A raw align-*/justify-* computed value as (keyword, safe) -- "safe
     center" -> ("center", True), "last baseline" -> ("last-baseline",
@@ -246,97 +162,6 @@ def _alignment_parts(value) -> "tuple[str, bool]":
     safe = "safe" in parts
     parts = [part for part in parts if part not in ("safe", "unsafe")]
     return ("-".join(parts) or "normal", safe)
-
-
-
-def _element_own_baseline(element) -> "float | None":
-    """The offset, from element's own border-box top, of the CSS 2.1
-    10.8.1 baseline a display:flex; align-items:baseline row should align
-    it on -- None if it has no real in-flow line box at all (the spec's
-    fallback: align on its bottom margin edge, exactly what Taffy's own
-    baseline algorithm already does unprompted).
-
-    Needed because Taffy's flex baseline alignment only looks at a node's
-    own reported baseline, real for a measured text leaf but silently None
-    for anything built from further Taffy children -- including a 9.2.1.1
-    split's own anonymous block boxes, whose real text lives several
-    levels down. CSS 2.1 10.8.1: the baseline is that of the last in-flow
-    line box, not the first."""
-    box = element.__dict__.get("_layout_box")
-    if box is None:
-        return None
-    plan = getattr(element, "_chromonic_inline_plan", None)
-    if plan is not None:
-        baselines = getattr(plan, "_line_baselines", None)
-        has_content = getattr(plan, "_line_has_content", None)
-        if baselines:
-            for y in sorted(baselines, reverse=True):
-                if has_content is not None and not has_content.get(y):
-                    continue
-                return y + baselines[y]
-        return None
-    owners = element.__dict__.get("_chromonic_split_plan_owners")
-    if owners:
-        for index in sorted(owners, reverse=True):
-            owner = owners[index]
-            owner_plan = getattr(owner, "_chromonic_inline_plan", None)
-            owner_box = owner.__dict__.get("_layout_box")
-            if owner_plan is None or owner_box is None:
-                continue
-            baselines = getattr(owner_plan, "_line_baselines", None)
-            has_content = getattr(owner_plan, "_line_has_content", None)
-            if not baselines:
-                continue
-            for y in sorted(baselines, reverse=True):
-                if has_content is not None and not has_content.get(y):
-                    continue
-                return (owner_box.y - box.y) + y + baselines[y]
-        return None
-    if getattr(element, "_chromonic_is_table_root", False):
-        # CSS 2.1 10.8.1: an inline-table's baseline is its first row's --
-        # table-vertical-align-baseline-009.xht.
-        baseline = _first_baseline(element)
-        return None if baseline is None else baseline - box.y
-    if (dom._is_element(element) and not getattr(element, "_chromonic_has_layout_children", False)
-            and (getattr(element, "_chromonic_text_lines", None) or [])):
-        # A text-bearing element built as its own flex item: its baseline
-        # is its font's, on the first line -- the last for an
-        # inline-block (10.8.1) -- not its bottom edge.
-        lines = getattr(element, "_chromonic_text_lines", None) or []
-        paint_style = getattr(element, "_chromonic_paint_style", None) or {}
-        font_size = _fontmetrics.parse_length(paint_style.get("font_size"), default=16.0)
-        family = paint_style.get("font_family") or ""
-        if family == "none":
-            family = ""
-        weight = inline_formatting._parse_font_weight(paint_style.get("font_weight"))
-        italic = fonts.is_italic(paint_style.get("font_style"))
-        ascent, descent, normal = fonts.text_metrics(family, font_size, weight >= 600, italic)
-        line_height = float(getattr(element, "_chromonic_line_height", 0.0) or 0.0) or normal
-        computed = getattr(element, "_chromonic_computed_style", None)
-        display = (getattr(computed, "display", "") or "").strip().lower() if computed is not None else ""
-        index = len(lines) - 1 if display == "inline-block" else 0
-        padding = element.__dict__.get("_chromonic_padding", (0.0,) * 4)
-        offset = float(element.__dict__.get("_chromonic_content_offset_y", 0.0) or 0.0)
-        return (box.border_top + padding[0] + offset + index * line_height
-                + math.floor((line_height - (ascent + descent)) / 2) + ascent)
-    if not dom._is_element(element):
-        # A plain text leaf of the `elif inline_items:` flex-row
-        # approximation (tree.new_text_leaf, no _InlineFormattingPlan of
-        # its own) -- its baseline is just its own font's ascent.
-        paint_style = getattr(element, "_chromonic_paint_style", None)
-        if not paint_style:
-            return None
-        font_size = _fontmetrics.parse_length(paint_style.get("font_size"), default=16.0)
-        family = paint_style.get("font_family") or ""
-        if family == "none":
-            family = ""
-        weight = inline_formatting._parse_font_weight(paint_style.get("font_weight"))
-        italic = fonts.is_italic(paint_style.get("font_style"))
-        ascent, descent, normal = fonts.text_metrics(family, font_size, weight >= 600, italic)
-        resolved_line_height = inline_formatting._resolved_line_height(paint_style.get("line_height"))
-        line_height = resolved_line_height if resolved_line_height is not None else (ascent + descent) or normal
-        return ascent + math.floor((line_height - (ascent + descent)) / 2)
-    return None
 
 
 

@@ -5,6 +5,7 @@ import dataclasses
 from domonic.layout import LayoutBox
 
 from . import box_model, dom
+from .box import box_of
 
 
 
@@ -26,10 +27,11 @@ def _write_boxes(boxes, node_map):
             # reports for a declared `auto` (CSS 2.1 10.3.3).
             margin_top=mt, margin_right=mr, margin_bottom=mb, margin_left=ml,
         )
-        state["_chromonic_padding"] = (pt, pr, pb, pl)
+        layout_state = box_of(element)
+        layout_state.padding = (pt, pr, pb, pl)
         # Fresh geometry no longer carries the position:relative-inline
         # offset `_apply_inline_rel_offset` applied to this box.
-        state.pop("_chromonic_inline_rel_offset", None)
+        layout_state.inline_rel_offset = None
 
 
 
@@ -56,7 +58,7 @@ def _grow_and_reflow(element, delta: float, *, stop_at=None, grow_self: bool = T
     child = element
     ancestor = dom._layout_parent(element)
     while ancestor is not None and dom._is_element(ancestor):
-        native = getattr(ancestor, "_chromonic_native_style", None)
+        native = box_of(ancestor).native_style
         if native is None or native.get("height") != "auto":
             break
         if ancestor is stop_at:
@@ -73,7 +75,7 @@ def _grow_and_reflow(element, delta: float, *, stop_at=None, grow_self: bool = T
         _grow_box_height(ancestor, growth)
         # A table row grown this way (a nested table inside one of its
         # cells got taller) keeps every cell as tall as the row.
-        for cell in getattr(ancestor, "_chromonic_table_cells", None) or ():
+        for cell in box_of(ancestor).table_cells or ():
             if cell is not child:
                 _grow_box_height(cell, growth)
         _shift_later_siblings_for_height_delta(ancestor, growth)
@@ -99,13 +101,13 @@ def _needed_ancestor_growth(ancestor, child, delta: float) -> float:
             continue
         if not seen_self or not dom._is_element(sibling) or sibling.__dict__.get("_layout_box") is None:
             continue
-        sibling_style = getattr(sibling, "_chromonic_native_style", None) or {}
+        sibling_style = box_of(sibling).native_style or {}
         if sibling_style.get("position") in ("absolute", "fixed"):
             continue
         return delta
-    margin = (getattr(child, "_chromonic_native_style", None) or {}).get("margin") or (0.0,) * 4
+    margin = (box_of(child).native_style or {}).get("margin") or (0.0,) * 4
     child_bottom = child_box.y + child_box.height + box_model._numeric_edge(margin[2])
-    padding = ancestor.__dict__.get("_chromonic_padding", (0.0,) * 4)
+    padding = box_of(ancestor).get("padding", (0.0,) * 4)
     content_bottom = ancestor_box.y + ancestor_box.border_top + ancestor_box.client_height - padding[2]
     return max(0.0, min(delta, child_bottom - content_bottom))
 
@@ -123,7 +125,7 @@ def _shift_later_siblings_for_height_delta(element, delta: float) -> None:
     parent = getattr(element, "parentNode", None)
     if parent is None or not dom._is_element(parent):
         return
-    parent_native = getattr(parent, "_chromonic_native_style", None) or {}
+    parent_native = box_of(parent).native_style or {}
     if parent_native.get("display") == "flex" and parent_native.get("flex_direction") in ("row", "row-reverse"):
         # Siblings laid out side by side (a table row's cells, the
         # inline-content approximation's items) don't follow element
@@ -136,7 +138,7 @@ def _shift_later_siblings_for_height_delta(element, delta: float) -> None:
             continue
         if not seen_self or not dom._is_element(sibling):
             continue
-        sibling_style = getattr(sibling, "_chromonic_native_style", None) or {}
+        sibling_style = box_of(sibling).native_style or {}
         if sibling_style.get("position") in ("absolute", "fixed"):
             continue
         if sibling.__dict__.get("_layout_box") is None:
@@ -154,11 +156,11 @@ def _shift_box(node, dx: float, dy: float) -> None:
             border_top=box.border_top, border_left=box.border_left,
         )
     # An inline element's per-line rects (`_publish_inline_formatting`'s
-    # _chromonic_inline_boxes, what it reports as its client rects) move
+    # box.inline_boxes, what it reports as its client rects) move
     # with it -- column-visibility-004.xht.
-    rects = node.__dict__.get("_chromonic_inline_boxes")
+    rects = box_of(node).inline_boxes
     if rects:
-        node.__dict__["_chromonic_inline_boxes"] = [
+        box_of(node).inline_boxes = [
             (rect[0] + dx, rect[1] + dy) + tuple(rect[2:]) for rect in rects]
 
 
@@ -174,7 +176,7 @@ def _shift_recomputed_subtree(element, dx: float, dy: float, boxes, node_map: di
     recomputed = {id(node_map[node_id]) for node_id in boxes if node_id in node_map}
 
     def walk(node):
-        resolved = getattr(node, "_chromonic_resolved_style", None)
+        resolved = box_of(node).resolved_style
         if resolved is not None and not dom._renders(resolved[1]):
             return
         if id(node) not in recomputed:
@@ -182,10 +184,10 @@ def _shift_recomputed_subtree(element, dx: float, dy: float, boxes, node_map: di
                 return
         else:
             _shift_box(node, dx, dy)
-        for fragment in getattr(node, "_chromonic_inline_fragments", None) or ():
+        for fragment in box_of(node).inline_fragments or ():
             if id(fragment) in recomputed:
                 _shift_box(fragment, dx, dy)
-        for box in (node.__dict__.get("_chromonic_anonymous_table_boxes") or {}).values():
+        for box in (box_of(node).anonymous_table_boxes or {}).values():
             if id(box) in recomputed:
                 _shift_box(box, dx, dy)
             walk_anonymous_children(box)
@@ -194,7 +196,7 @@ def _shift_recomputed_subtree(element, dx: float, dy: float, boxes, node_map: di
                 walk(child)
 
     def walk_anonymous_children(box):
-        for inner in (box.__dict__.get("_chromonic_anonymous_table_boxes") or {}).values():
+        for inner in (box_of(box).anonymous_table_boxes or {}).values():
             if id(inner) in recomputed:
                 _shift_box(inner, dx, dy)
             walk_anonymous_children(inner)
@@ -214,11 +216,11 @@ def _shift_subtree(element, dx: float, dy: float) -> None:
     never given a real Taffy node this pass, so its stale _layout_box
     must not keep being shifted on top of whatever was last published,
     or the correction compounds forever across relayouts."""
-    resolved = getattr(element, "_chromonic_resolved_style", None)
+    resolved = box_of(element).resolved_style
     if resolved is not None and not dom._renders(resolved[1]):
         return
     _shift_box(element, dx, dy)
-    for fragment in getattr(element, "_chromonic_inline_fragments", None) or ():
+    for fragment in box_of(element).inline_fragments or ():
         _shift_box(fragment, dx, dy)
     # Anonymous table boxes generated under element (CSS 2.1 17.2.1) aren't
     # in childNodes -- shifted here; the real nodes they wrap are still
@@ -231,6 +233,6 @@ def _shift_subtree(element, dx: float, dy: float) -> None:
 
 
 def _shift_anonymous_boxes(element, dx: float, dy: float) -> None:
-    for box in (element.__dict__.get("_chromonic_anonymous_table_boxes") or {}).values():
+    for box in (box_of(element).anonymous_table_boxes or {}).values():
         _shift_box(box, dx, dy)
         _shift_anonymous_boxes(box, dx, dy)

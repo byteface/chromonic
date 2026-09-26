@@ -7,7 +7,7 @@ Reads exactly two things per element: the `LayoutBox` `tree.py` just wrote
 layout inputs). Neither is built here: `tree.py`'s own walk (`build()`/
 `_describe()`) already built a `ComputedStyleDeclaration` for every element
 a moment ago (to resolve its `LayoutStyle`) and extracted exactly the
-handful of properties this file needs from it (`_chromonic_paint_style`) --
+handful of properties this file needs from it (`box.paint_style`) --
 reading both back instead of re-deriving them is a real, measured perf win
 (see `tree.py`'s module docstring): a `ComputedStyleDeclaration` attribute
 access re-resolves from the underlying style text on *every* access, with
@@ -35,6 +35,7 @@ from domonic import _fontmetrics
 from domonic.style import ComputedStyleDeclaration
 
 from . import fonts
+from .tree.box import box_of
 
 ELEMENT_NODE = 1
 _RGB_RE = re.compile(r"rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)")
@@ -319,7 +320,7 @@ def _paint_image(canvas: "skia.Canvas", element, box) -> None:
     image = browser_images.load_image(element.getAttribute("src") or "")
     if image is None:
         return  # no image (missing src, failed fetch, undecodable format) -- paint nothing, not a placeholder
-    padding = getattr(element, "_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
+    padding = box_of(element).get("padding", (0.0, 0.0, 0.0, 0.0))
     pad_top, pad_right, pad_bottom, pad_left = padding
     x = box.x + box.border_left + pad_left
     y = box.y + box.border_top + pad_top
@@ -335,7 +336,7 @@ def _paint_image(canvas: "skia.Canvas", element, box) -> None:
 
 def _paint_style(element) -> dict:
     """The paint-only properties `tree.py`'s `_describe()` already extracted
-    for this element during the last `layout()` pass (`_chromonic_paint_style`)
+    for this element during the last `layout()` pass (`box.paint_style`)
     -- reading these plain strings back, instead of touching a
     `ComputedStyleDeclaration` attribute directly, is what makes a repaint
     with no relayout in between (a scroll, an unrelated element's style
@@ -343,7 +344,7 @@ def _paint_style(element) -> dict:
     see `tree.py`'s `_extract_paint_style` for the profiling that found
     this. Falls back to building both fresh if `element` was somehow
     painted without a prior `tree.layout()` pass."""
-    style = getattr(element, "_chromonic_paint_style", None)
+    style = box_of(element).paint_style
     if style is not None:
         return style
     from . import tree as _tree
@@ -368,14 +369,14 @@ def text_line_runs(element, box, style):
     alignment, and baseline math the drawing path uses, rather than a second,
     independently-derived approximation that could silently drift from what's
     actually on screen. `paint_element` is the only other caller."""
-    lines = getattr(element, "_chromonic_text_lines", None)
+    lines = box_of(element).text_lines
     if lines is None:
         from . import tree as _tree
         text = " ".join(_tree._rendering_text_content(element).split())
         lines = [text] if text else []
     if not lines or not any(lines):
         return
-    padding = getattr(element, "_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
+    padding = box_of(element).get("padding", (0.0, 0.0, 0.0, 0.0))
     pad_top, pad_right, _pad_bottom, pad_left = padding
     font_size = _px(style["font_size"], 16.0)
     bold = _fontmetrics.is_bold(style["font_weight"])
@@ -385,17 +386,17 @@ def text_line_runs(element, box, style):
     # not a re-derived Helvetica-table guess -- falls back to the same rough
     # multiple used before Parley, for anything painted without a prior
     # `tree.layout()` pass.
-    line_height = getattr(element, "_chromonic_line_height", None) or font_size * 1.2
+    line_height = box_of(element).line_height or font_size * 1.2
     text_x = box.x + box.border_left + pad_left
     # A table cell's `vertical-align: middle`/`bottom` pushes its own text
     # down inside the (row-height) box -- see `tree._align_table_cell_content`.
-    content_offset_y = float(getattr(element, "_chromonic_content_offset_y", 0.0) or 0.0)
-    line_widths = getattr(element, "_chromonic_text_line_widths", [])
+    content_offset_y = float(box_of(element).get("content_offset_y", 0.0) or 0.0)
+    line_widths = box_of(element).get("text_line_widths", [])
     # Lines shortened by floats start further right / lower (`tree`'s
     # `_make_measure`); None means x=0 and `line_height` apart.
-    line_xs = getattr(element, "_chromonic_text_line_x", None) or []
-    line_ys = getattr(element, "_chromonic_text_line_y", None) or []
-    line_avail = getattr(element, "_chromonic_text_line_avail", None) or []
+    line_xs = box_of(element).text_line_x or []
+    line_ys = box_of(element).text_line_y or []
+    line_avail = box_of(element).text_line_avail or []
     content_width = box.client_width - pad_left - pad_right
     align = (style.get("text_align") or "").strip().lower()
     # CSS Text 3 `text-align-last`: a block's own final formatted line uses
@@ -573,7 +574,7 @@ def _paint_video(canvas: "skia.Canvas", element, box) -> None:
     image = decoder.current_frame_image()
     if image is None:
         return
-    padding = getattr(element, "_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
+    padding = box_of(element).get("padding", (0.0, 0.0, 0.0, 0.0))
     pad_top, pad_right, pad_bottom, pad_left = padding
     x = box.x + box.border_left + pad_left
     y = box.y + box.border_top + pad_top
@@ -599,7 +600,7 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
         )
     _paint_background_image(canvas, element, box, style)
 
-    tag_name = getattr(element, "_chromonic_tag_name", None)
+    tag_name = box_of(element).tag_name
     if tag_name is None:
         tag_name = (getattr(element, "tagName", "") or "").lower()
     if tag_name == "img":
@@ -635,7 +636,7 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
         # real declared borders. Corners aren't mitred (each edge is a
         # plain stroked line, not a mitred quad) -- a real gap, just a
         # smaller one than "renders nothing" was.
-        native = getattr(element, "_chromonic_native_style", None) or {}
+        native = box_of(element).native_style or {}
         top, right, bottom, left = native.get("border") or (box.border_top, 0.0, 0.0, box.border_left)
         black = skia.Color4f(0, 0, 0, 1)
         if top > 0:
@@ -666,10 +667,10 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
     # this element's own text (the "not children" branch below never runs)
     # and (b) recurse into `paint_tree` for each <option>, painting nothing
     # useful since none of them has a `get_layout_box()` to paint from.
-    is_listbox = tag_name == "select" and getattr(element, "_chromonic_listbox_rows", 0)
+    is_listbox = tag_name == "select" and box_of(element).get("listbox_rows", 0)
     if is_listbox:
         _paint_listbox_rows(canvas, element, box, style)
-    has_layout_children = getattr(element, "_chromonic_has_layout_children", None)
+    has_layout_children = box_of(element).has_layout_children
     if has_layout_children is None:
         has_layout_children = tag_name != "select" and any(
             _is_element(child) for child in (element.childNodes or [])
@@ -702,7 +703,7 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
     # have retained anonymous layout fragments. They are not DOM Elements,
     # so paint them here; real inline child elements are still visited by
     # paint_tree below.
-    fragments = getattr(element, "_chromonic_inline_fragments", ())
+    fragments = box_of(element).get("inline_fragments", ())
     if fragments:
         # `overflow: hidden`/`clip` clips a box's own content to its
         # padding edge -- real, common pattern for exactly the elements
@@ -739,7 +740,7 @@ def paint_tree(canvas: "skia.Canvas", root_element) -> None:
     DOM, not `tree.py`'s `node_map`, which is populated post-order and would
     paint backwards if walked directly)."""
     paint_element(canvas, root_element)
-    if getattr(root_element, "_chromonic_tag_name", None) == "select":
+    if box_of(root_element).tag_name == "select":
         return  # <option>s were never laid out (see paint_element) -- nothing to recurse into
     for child in (root_element.childNodes or []):
         if not _is_element(child):
@@ -748,7 +749,7 @@ def paint_tree(canvas: "skia.Canvas", root_element) -> None:
         # else (`native_browser.py`'s `draw_open_dialogs`) -- skipped here
         # so it isn't also painted once more at its in-flow document
         # position.
-        if (getattr(child, "_chromonic_tag_name", None) or "").lower() == "dialog":
+        if (box_of(child).tag_name or "").lower() == "dialog":
             continue
         paint_tree(canvas, child)
     _paint_anonymous_boxes(canvas, root_element)
@@ -760,7 +761,7 @@ def _paint_anonymous_boxes(canvas: "skia.Canvas", element) -> None:
     block around loose text) live outside the DOM -- their own boxes (a
     text-only anonymous block/cell paints its lines) are painted here; the
     real nodes they wrap are already reached by the DOM walk above."""
-    for anonymous in (element.__dict__.get("_chromonic_anonymous_table_boxes") or {}).values():
+    for anonymous in (box_of(element).anonymous_table_boxes or {}).values():
         if anonymous.__dict__.get("_layout_box") is not None:
             paint_element(canvas, anonymous)
         _paint_anonymous_boxes(canvas, anonymous)
@@ -778,7 +779,7 @@ def build_display_list(root_element) -> list:
     def walk_anonymous(element):
         # Same anonymous boxes `_paint_anonymous_boxes` covers for the
         # direct paint path -- own boxes only, never their real children.
-        for anonymous in (element.__dict__.get("_chromonic_anonymous_table_boxes") or {}).values():
+        for anonymous in (box_of(element).anonymous_table_boxes or {}).values():
             if anonymous.__dict__.get("_layout_box") is not None:
                 result.append(anonymous)
             walk_anonymous(anonymous)
@@ -787,11 +788,11 @@ def build_display_list(root_element) -> list:
         # An open <dialog> paints separately, centred on top of everything
         # else (`native_browser.py`'s `draw_open_dialogs`) -- excluded here,
         # subtree included, so it isn't also painted at its in-flow position.
-        if (getattr(element, "_chromonic_tag_name", None) or "").lower() == "dialog":
+        if (box_of(element).tag_name or "").lower() == "dialog":
             return
         if element.__dict__.get("_layout_box") is not None:
             result.append(element)
-        if getattr(element, "_chromonic_tag_name", None) == "select":
+        if box_of(element).tag_name == "select":
             return
         for child in (element.childNodes or []):
             if _is_element(child):

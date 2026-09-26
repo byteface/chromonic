@@ -99,7 +99,7 @@ def _resolve_ex_px(text: str, computed) -> "float | None":
     # under its own declared CSS family name -- `chromonic.fonts.
     # resolve_typeface()` (which `x_height()` uses) only ever finds it
     # via that alias, the same substitution `webfonts.resolve_style()`
-    # already applies to `_chromonic_paint_style["font_family"]` before
+    # already applies to `box.paint_style["font_family"]` before
     # painting. This patch runs *inside* domonic's own cascade, well
     # before chromonic's own per-element paint style exists at all, so it
     # repeats that same alias lookup here directly -- `computed._element`

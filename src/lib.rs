@@ -345,6 +345,11 @@ fn parse_align_items(text: &str) -> PyResult<Option<AlignItems>> {
         "flex-start" => Some(AlignItems::FLEX_START),
         "flex-end" => Some(AlignItems::FLEX_END),
         "center" => Some(AlignItems::CENTER),
+        "safe-start" => Some(AlignItems::SAFE_START),
+        "safe-end" => Some(AlignItems::SAFE_END),
+        "safe-flex-start" => Some(AlignItems::SAFE_FLEX_START),
+        "safe-flex-end" => Some(AlignItems::SAFE_FLEX_END),
+        "safe-center" => Some(AlignItems::SAFE_CENTER),
         "baseline" => Some(AlignItems::BASELINE),
         "stretch" => Some(AlignItems::STRETCH),
         other => return Err(PyValueError::new_err(format!("unrecognised align/justify-items keyword: {other:?}"))),
@@ -359,6 +364,11 @@ fn parse_align_content(text: &str) -> PyResult<Option<AlignContent>> {
         "flex-start" => Some(AlignContent::FLEX_START),
         "flex-end" => Some(AlignContent::FLEX_END),
         "center" => Some(AlignContent::CENTER),
+        "safe-start" => Some(AlignContent::SAFE_START),
+        "safe-end" => Some(AlignContent::SAFE_END),
+        "safe-flex-start" => Some(AlignContent::SAFE_FLEX_START),
+        "safe-flex-end" => Some(AlignContent::SAFE_FLEX_END),
+        "safe-center" => Some(AlignContent::SAFE_CENTER),
         "stretch" => Some(AlignContent::STRETCH),
         "space-between" => Some(AlignContent::SPACE_BETWEEN),
         "space-around" => Some(AlignContent::SPACE_AROUND),
@@ -479,6 +489,11 @@ fn parse_style(dict: &Bound<PyDict>) -> PyResult<Style> {
         box_sizing,
         float,
         clear,
+        direction: if get_str(dict, "direction", "ltr")? == "rtl" {
+            taffy::Direction::Rtl
+        } else {
+            taffy::Direction::Ltr
+        },
         text_align: match get_str(dict, "text_align", "auto")?.as_str() {
             "legacy-center" => taffy::TextAlign::LegacyCenter,
             "legacy-right" => taffy::TextAlign::LegacyRight,
@@ -676,39 +691,71 @@ impl Tree {
 
     /// Move every anchored absolutely positioned box whose insets are auto
     /// on an axis to its static position on that axis: where its anchor
-    /// (a zero-size placeholder laid out in normal flow) ended up. Walks in
-    /// tree order so an anchor is always placed before the box it anchors
-    /// (anchors sit in the flow content, positioned boxes after it).
+    /// (a zero-size placeholder laid out in normal flow) ended up. A box
+    /// can sit before its anchor in tree order (a `fixed` box inside an
+    /// absolutely positioned parent: both belong to the viewport root, the
+    /// fixed one first), and moving a box moves any anchors inside it, so
+    /// this settles by repetition: place every box whose anchor is known,
+    /// recompute, until nothing moves.
     fn resolve_static_anchors(&mut self, root: usize) {
-        let mut absolute: Vec<Option<(f32, f32)>> = vec![None; self.nodes.len()];
-        let mut stack: Vec<(usize, f32, f32)> = vec![(root, 0.0, 0.0)];
-        while let Some((index, parent_x, parent_y)) = stack.pop() {
-            if let Some((anchor, rtl)) = self.nodes[index].anchor {
-                if let Some(anchor_pos) = self.resolve(anchor).ok().and_then(|a| absolute[a]) {
-                    let node = &mut self.nodes[index];
-                    let inset = node.style.inset;
-                    let margin = node.layout.margin;
-                    if inset.left.is_auto() && inset.right.is_auto() {
-                        let x = if rtl {
-                            anchor_pos.0 - node.layout.size.width - margin.right
-                        } else {
-                            anchor_pos.0 + margin.left
-                        };
+        let anchored: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| self.nodes[i].alive && self.nodes[i].anchor.is_some())
+            .collect();
+        if anchored.is_empty() {
+            return;
+        }
+        for _ in 0..8 {
+            let absolute = self.absolute_positions(root);
+            let mut moved = false;
+            for &index in &anchored {
+                let Some((anchor, rtl)) = self.nodes[index].anchor else { continue };
+                let Some(anchor_pos) = self.resolve(anchor).ok().and_then(|a| absolute[a]) else { continue };
+                let (Some((own_x, own_y)), Some(parent)) = (absolute[index], self.nodes[index].parent) else { continue };
+                let _ = parent;
+                let node = &mut self.nodes[index];
+                let inset = node.style.inset;
+                let margin = node.layout.margin;
+                let parent_x = own_x - node.layout.location.x;
+                let parent_y = own_y - node.layout.location.y;
+                if inset.left.is_auto() && inset.right.is_auto() {
+                    let x = if rtl {
+                        anchor_pos.0 - node.layout.size.width - margin.right
+                    } else {
+                        anchor_pos.0 + margin.left
+                    };
+                    if (x - own_x).abs() > 0.001 {
                         node.layout.location.x = x - parent_x;
+                        moved = true;
                     }
-                    if inset.top.is_auto() && inset.bottom.is_auto() {
-                        node.layout.location.y = anchor_pos.1 + margin.top - parent_y;
+                }
+                if inset.top.is_auto() && inset.bottom.is_auto() {
+                    let y = anchor_pos.1 + margin.top;
+                    if (y - own_y).abs() > 0.001 {
+                        node.layout.location.y = y - parent_y;
+                        moved = true;
                     }
                 }
             }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    /// Every live node's absolute (x, y), by index.
+    fn absolute_positions(&self, root: usize) -> Vec<Option<(f32, f32)>> {
+        let mut absolute: Vec<Option<(f32, f32)>> = vec![None; self.nodes.len()];
+        let mut stack: Vec<(usize, f32, f32)> = vec![(root, 0.0, 0.0)];
+        while let Some((index, parent_x, parent_y)) = stack.pop() {
             let node = &self.nodes[index];
             let x = parent_x + node.layout.location.x;
             let y = parent_y + node.layout.location.y;
             absolute[index] = Some((x, y));
-            for child in node.children.iter().rev() {
+            for child in &node.children {
                 stack.push((index_of(NodeId::from(*child)), x, y));
             }
         }
+        absolute
     }
 
     fn collect_absolute(&self, index: usize, parent_x: f32, parent_y: f32, out: &Bound<PyDict>) -> PyResult<()> {
@@ -1080,8 +1127,10 @@ impl TreeView<'_> {
     ///          row/cell box as (node, x, y, width, height, content_offset)
     ///          relative to this node's content box. A node whose parent is
     ///          also placed is converted to parent-relative coordinates.
-    ///          content_offset >= 0 lays the node out at that size and moves
-    ///          its content down by the offset (a cell's vertical-align);
+    ///          (+ layout_width, layout_height). content_offset >= 0 lays the
+    ///          node out at the layout size (a cell spanning a collapsed row or
+    ///          column keeps its uncollapsed size) and moves its content down
+    ///          by the offset (a cell's vertical-align);
     ///          a negative offset only positions and sizes the box (a row
     ///          or row group, whose children are placed separately).
     fn compute_table_layout(&mut self, node_id: NodeId, inputs: LayoutInput) -> LayoutOutput {
@@ -1122,7 +1171,7 @@ impl TreeView<'_> {
             vertical_margins_are_collapsible: Line::FALSE,
         };
         let responses = PyDict::new(py);
-        let mut result: Option<(f32, f32, Option<f32>, Vec<(u64, f32, f32, f32, f32, f32)>)> = None;
+        let mut result: Option<(f32, f32, Option<f32>, Vec<(u64, f32, f32, f32, f32, f32, f32, f32)>)> = None;
         for _ in 0..16 {
             let args = (width_arg, height_arg, known.width, known.height, responses.clone(), fills_width);
             let Ok(reply) = measure.call1(py, args) else { break };
@@ -1165,7 +1214,7 @@ impl TreeView<'_> {
                 continue;
             }
             if let Ok((tag, w, h, baseline, placements)) =
-                reply.extract::<(String, f32, f32, Option<f32>, Vec<(u64, f32, f32, f32, f32, f32)>)>()
+                reply.extract::<(String, f32, f32, Option<f32>, Vec<(u64, f32, f32, f32, f32, f32, f32, f32)>)>()
             {
                 if tag == "done" {
                     result = Some((w, h, baseline, placements));
@@ -1180,7 +1229,7 @@ impl TreeView<'_> {
             let inset = Point { x: own.padding_border.left, y: own.padding_border.top };
             // table-content-relative position of every placed node
             let mut placed: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
-            for (order, (node, x, y, w, h, offset)) in placements.iter().enumerate() {
+            for (order, (node, x, y, w, h, offset, layout_w, layout_h)) in placements.iter().enumerate() {
                 let Ok(child) = self.tree.resolve(*node) else { continue };
                 let child_id = NodeId::from(pack(child, self.tree.nodes[child].generation));
                 let (px, py_) = match self.tree.nodes[child].parent.and_then(|p| placed.get(&p)) {
@@ -1188,16 +1237,15 @@ impl TreeView<'_> {
                     None => (-inset.x, -inset.y),
                 };
                 placed.insert(child, (*x, *y));
-                let mut layout = if *offset >= 0.0 {
-                    let output = self.compute_child_layout(
+                if *offset >= 0.0 {
+                    self.compute_child_layout(
                         child_id,
                         child_inputs(
                             RunMode::PerformLayout,
-                            Size { width: Some(*w), height: Some(*h) },
-                            AvailableSpace::Definite(*w),
+                            Size { width: Some(*layout_w), height: Some(*layout_h) },
+                            AvailableSpace::Definite(*layout_w),
                         ),
                     );
-                    let _ = output;
                     if *offset > 0.0 {
                         let kids = self.tree.nodes[child].children.clone();
                         for kid in kids {
@@ -1205,14 +1253,16 @@ impl TreeView<'_> {
                             self.tree.nodes[k].layout.location.y += *offset;
                         }
                     }
-                    self.tree.nodes[child].layout
-                } else {
+                }
+                // A node's own layout record is its parent's to write (Taffy
+                // never sets it while laying the node out), so its padding
+                // and border come from its style here.
+                let mut layout = Layout::with_order(order as u32);
+                {
                     let child_style = &self.tree.nodes[child].style;
-                    let mut layout = Layout::with_order(order as u32);
                     layout.padding = child_style.padding.resolve_or_zero(cb_width, |_, _| 0.0);
                     layout.border = child_style.border.resolve_or_zero(cb_width, |_, _| 0.0);
-                    layout
-                };
+                }
                 layout.order = order as u32;
                 layout.location = Point { x: x - px, y: y - py_ };
                 layout.size = Size { width: *w, height: *h };

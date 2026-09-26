@@ -15,13 +15,13 @@ full command and troubleshooting.
 ## whats been mostly done so far
 
 CSS2/box/ - 8/11 PASSING
-CSS2/visudet/ - 7/40 PASSING
-CSS2/positioning/ - 527/555 PASSING
+CSS2/visudet/ - 31/40 PASSING
+CSS2/positioning/ - 527/555 PASSING (old full run); first 250 fixtures now 225/250
 CSS2/box-display/ ??
 CSS2/margin-padding-clear/ - 86 failed / 69 errors (out of 739 total)
-CSS2/linebox/ - sampled ~250 fixtures ?? and?
-CSS2/normal-flow/ - 524 passed / 230 failed / 37 errors
-CSS2/table/ - 909/962 PASSING
+CSS2/linebox/ - first 60 fixtures: 43 pass / 15 fail
+CSS2/normal-flow/ - 524 passed / 230 failed / 37 errors (old full run); first 200 fixtures now 98 pass / 37 fail / 4 errors
+CSS2/tables/ - 920/1137 PASSING with the table node (old code: 909 of the same 1137; 2 regressions left: row-visibility-003/004)
 CSS2/backgrounds - 173/200 PASSING
 CSS2/colors ??
 CSS2/positioning/ - (575 fixtures). ?? COMPLETE?
@@ -29,7 +29,7 @@ css-position/ ? no idea
 css-display/ - ??
 css-flexbox/ - 706/1203
 css-grid/ - 257/551 
-CSS2/floats/ + CSS2/floats-clear/ - 110/366
+CSS2/floats/ + CSS2/floats-clear/ - 110/366 (old); now floats first 120: 36 pass, floats-clear first 60: 46 pass
 css-sizing/ - 205/608 
 css-box/ - tiny (10 fixtures) and??
 css-text/ + css-text-decor/ - 257/1538
@@ -38,7 +38,7 @@ css-grid (257/551),
 CSS2/positioning (527/555),
 cssom-view/ - 43/153
 css/selectors/ - (365 fixtures). ?? passing what?
-css-inline/ - (all 385 fixtures) 
+css-inline/ - (all 385 fixtures); first 100 now 8 pass (mostly unimplemented CSS Inline 3)
 
 left todo: everything still cos the agents get lazy and just get into habbits of running loads of fixtures and not fixing things. Today one ran a few hundred and fixed fuck all and then said what should i do next. gets a bit fucking dull.
 
@@ -62,6 +62,21 @@ Agent should NOT run full suite of tests between fixes. It takes too long and wa
   `_group_inline_element_runs`) and every post-layout float/strut/flex-row
   repair pass (`floats.py`, `_fix_flex_row_baseline_alignment`,
   `_apply_linebox_strut_height`, ...) are gone.
+- Tree roots: a viewport-sized initial containing block holds `<html>` (a
+  real box, a BFC) and every `fixed`/root-absolute box; `<body>` is an
+  ordinary block child. Static positions of escaped positioned boxes come
+  from zero-size placeholders left in the flow (`src/lib.rs` anchors).
+- `direction`, `safe` alignment, sizing keywords (`min-content` ...) and
+  legacy `<center>`/`align=` alignment are passed to Taffy, not corrected
+  afterwards. Taffy is vendored (`vendor/taffy`, patches listed in
+  `vendor/taffy/CHROMONIC_PATCHES.md`).
+- Tables are a `table` node kind (`table_formatting.py`): columns, rows,
+  rowspans, baselines and vertical-align are resolved during layout.
+- Per-node layout state lives on one `Box` (`tree/box.py`, `box_of(node)`),
+  not on `_chromonic_*` attributes.
+- Post-layout passes left: publishing inline fragments, relative offsets of
+  split inlines, `<col>` boxes, absolute boxes whose containing block is an
+  inline, and static positions inside flex/grid parents.
 - `white-space` is honoured in inline flow (`pre`/`pre-wrap`/`pre-line`/
   `break-spaces`/`nowrap`: preserved spaces, newlines as forced breaks, no
   wrapping) via `_runs_for_text`.
@@ -90,22 +105,6 @@ Agent should NOT run full suite of tests between fixes. It takes too long and wa
 
 ## known chromonic engine gaps (found via real-world use, not WPT)
 
-~~`paint.py`'s border painting only supported a uniform border~~ -- FIXED.
-It checked/used `box.border_top` alone as the width for a single
-`drawRect` stroke around the whole box, so `border-bottom: 1px solid` (or
-any other single-side-only border, or differing per-side widths/colors)
-with the other sides at 0 painted nothing at all. The per-side widths
-were already resolved and available (`_chromonic_native_style['border']`,
-a real `[top, right, bottom, left]` list -- Taffy/layout needed them for
-its own box-model math regardless of whether paint used them); the paint
-style dict just never extracted `border-right-color`/`border-bottom-
-color`/`border-left-color` (only `border-top-color`) since nothing had
-asked for them before. Fixed in both places: `dom.py`'s
-`_extract_paint_style` now extracts all four colors, and `paint.py` now
-strokes each side as its own line, independently sized/colored, instead
-of one rect. Corners aren't mitred (plain line per edge, not a mitred
-quad) -- a real, smaller remaining gap. Still no `border-radius` support
-at all (radio's round outer edge is hand special-cased, not general).
 
 `inline_formatting.py`'s `_build_text_runs_from_nodes` silently drops a
 replaced/control element (`<input>`, `<img>`, ...) nested inside a plain
@@ -155,6 +154,10 @@ aware real browsers are. Not investigated further.
 
 ## log domonic issues here to be fixed upstream
 
+domonic doesn't drop an invalid declaration in favour of an earlier valid
+one: python.org's `white-space: pre-wrap; white-space: -o-pre-wrap;` computes
+to `-o-pre-wrap`. Worked around in `dom._white_space`.
+
 domonic keeps an invalid keyword as a property's computed value (e.g.
 `grid-auto-flow: columns`, a typo in css-inline/baseline-source/*, comes
 through as `"columns"`) where CSS drops the declaration at parse time.
@@ -202,6 +205,7 @@ patched -- `examples/forms_demo.html` uses `addEventListener` instead.
 
 ------
 
+SHOULD BE FIXED in 1.8.5
 
 A radio's group (which other same-`name` radios share `checked`
 exclusivity with) is spec'd as its `<form>` owner, or the whole document
@@ -240,32 +244,6 @@ but still stringifies `Path2D` arguments and loses their commands; the narrowed
 `domonic_canvas_patch.py` remains only to preserve replayable path/gradient/
 pattern arguments for Chromonic's Skia command replay.
 
-
-------
-
-
-`MediaQueryList._evaluate` has no concept of a "current media type" at
-all -- `all`/`screen`/`print` all just unconditionally return `True`
-regardless of what's actually rendering. Confirmed directly: `@media
-print { ... }` applied during chromonic's own (always screen/interactive)
-rendering, hiding content and applying sizing rules real Chrome never
-does outside an actual print preview. Fixed upstream in Domonic 1.8.4;
-the former local workaround was removed.
-
-
-------
-
-
-`ComputedStyleDeclaration`'s cascade only matches a rule's selector via
-`Element._matchElement` (a small hand-rolled matcher, no `:nth-child`/
-`:nth-of-type`/`:hover`/etc. support) or `_matches_selector_chain` (combinator
-chains only) -- a single-compound selector using any pseudo-class outside
-that whitelist (e.g. `div:nth-of-type(2)`) is silently never matched during
-cascade resolution, even though `Element.matches()` correctly matches the
-same selector (via a further `querySelectorAll()` fallback the cascade never
-calls). Confirmed directly: `div:nth-of-type(2) { line-height: 30px }` never
-applied to any element. Fixed upstream in Domonic 1.8.4; the former local
-workaround was removed.
 
 
 ------

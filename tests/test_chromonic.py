@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 import pytest
+from chromonic.tree.box import box_of
 
 pytest.importorskip("chromonic._native", reason="chromonic's Rust extension isn't built -- run `maturin develop` in chromonic/")
 
@@ -153,7 +154,7 @@ def test_block_in_inline_split_marker_reports_the_blocks_border_box_not_margin_b
     tree.layout(document.body, width=800.0)
 
     anchor = document.getElementsByTagName("a")[0]
-    rects = anchor.__dict__.get("_chromonic_inline_boxes")
+    rects = box_of(anchor).inline_boxes
     marker = rects[1]
     assert marker == (8.0, 108.0, 784.0, 100.0)
 
@@ -435,7 +436,7 @@ def test_public_todo_app_features():
     for char in "Ship":
         app.interaction.handle_text(char)
     assert field.value == "Ship"
-    assert field._chromonic_text_lines == ["Ship"]
+    assert box_of(field).text_lines == ["Ship"]
 
     app.interaction.handle_key("Enter")
     assert field.value == ""
@@ -652,14 +653,14 @@ def test_generated_content_pseudo_elements_contribute_text_layout():
         # block's inline formatting context (here `<body>`): the generated
         # text is one of that context's retained fragments, painted in the
         # pseudo's own style, and both the pseudo and the `<i>` get a box.
-        assert icon._chromonic_before_text == "\uf03e"
-        fragments = interaction.root._chromonic_inline_fragments
+        assert box_of(icon).before_text == "\uf03e"
+        fragments = box_of(interaction.root).inline_fragments
         assert len(fragments) == 1
         fragment = fragments[0]
-        assert fragment._chromonic_text_lines == ["\uf03e"]
-        assert fragment._chromonic_paint_style["font_size"] == "20px"
+        assert box_of(fragment).text_lines == ["\uf03e"]
+        assert box_of(fragment).paint_style["font_size"] == "20px"
         assert fragment.__dict__["_layout_box"].width > 0
-        pseudo = icon.__dict__["_chromonic_pseudo_objs"]["before"]
+        pseudo = box_of(icon).pseudo_objs["before"]
         assert pseudo.text == "\uf03e"
         assert pseudo.__dict__["_layout_box"].width > 0
         assert icon.get_layout_box().width > 0
@@ -1077,13 +1078,13 @@ def test_layout_shares_ancestor_styles_only_within_one_pass(monkeypatch):
     monkeypatch.setattr(ComputedStyleDeclaration, '_resolve', resolve)
     tree.layout(root, width=100)
     assert all(count == 1 for count in resolutions.values())
-    before = first._chromonic_computed_style.color
+    before = box_of(first).computed_style.color
     resolutions.clear()
     root.style.color = 'rgb(0,0,255)'
     tree.layout(root, width=100)
     assert all(count == 1 for count in resolutions.values())
-    assert first._chromonic_computed_style.color != before
-    assert second._chromonic_computed_style.color == first._chromonic_computed_style.color
+    assert box_of(first).computed_style.color != before
+    assert box_of(second).computed_style.color == box_of(first).computed_style.color
 
 
 # -- phase 7: a UA stylesheet + <img> loading -----------------------------
@@ -1540,8 +1541,8 @@ def test_text_transform_changes_layout_text_and_text_align_offsets_paint():
     tree.layout(root, width=200.0)
     child = root.childNodes[0]
 
-    assert child._chromonic_text_lines == ["WELCOME"]
-    assert child._chromonic_text_line_widths[0] < child.get_layout_box().client_width
+    assert box_of(child).text_lines == ["WELCOME"]
+    assert box_of(child).text_line_widths[0] < child.get_layout_box().client_width
 
     png = paint.render_png(root, width=200, height=40)
     image = skia.Image.MakeFromEncoded(skia.Data.MakeWithCopy(png))
@@ -1607,7 +1608,7 @@ def test_long_text_wraps_across_multiple_lines_within_available_width():
     tree.layout(root, width=150.0)
 
     para = root.childNodes[0]
-    lines = para._chromonic_text_lines
+    lines = box_of(para).text_lines
     assert len(lines) > 1
     assert " ".join(lines).replace("  ", " ") == text  # no words dropped or duplicated
     for line in lines:
@@ -1623,11 +1624,11 @@ def test_text_rewraps_when_relaid_out_at_a_different_width():
     root = div(para, _style="width:600px;")
 
     tree.layout(root, width=600.0)
-    wide_lines = len(para._chromonic_text_lines)
+    wide_lines = len(box_of(para).text_lines)
 
     root.style.width = "120px"
     tree.layout(root, width=120.0)
-    narrow_lines = len(para._chromonic_text_lines)
+    narrow_lines = len(box_of(para).text_lines)
 
     assert narrow_lines > wide_lines  # the same text needs more lines in a narrower box
 
@@ -1646,7 +1647,7 @@ def test_an_unconstrained_measure_call_does_not_wrap():
 def test_short_text_is_not_wrapped():
     root = div(p("hi", _style="font-size:16px;"), _style="width:300px;")
     tree.layout(root, width=300.0)
-    assert root.childNodes[0]._chromonic_text_lines == ["hi"]
+    assert box_of(root.childNodes[0]).text_lines == ["hi"]
 
 
 # -- fonts (chromonic.fonts) --------------------------------------------------
@@ -1773,7 +1774,7 @@ def test_paint_style_falls_back_when_painted_without_a_prior_layout():
     from chromonic import paint
 
     # an element that never went through tree.layout() (no
-    # _chromonic_paint_style yet) must still paint correctly, just without the
+    # box.paint_style yet) must still paint correctly, just without the
     # caching benefit.
     element = p("hi", _style="color:rgb(4,5,6);")
     style = paint._paint_style(element)
@@ -2169,7 +2170,7 @@ def test_tree_measure_uses_the_elements_own_font_family():
     # different fonts wrap at different points -- proof the actual
     # font-family (not one fixed table) drove the line-break decisions,
     # regardless of whether the two happen to produce the same line count
-    assert serif._chromonic_text_lines != mono._chromonic_text_lines
+    assert box_of(serif).text_lines != box_of(mono).text_lines
 
 
 def test_tree_measure_respects_letter_spacing():
@@ -2179,7 +2180,7 @@ def test_tree_measure_respects_letter_spacing():
     root = div(tight, wide, _style="width:200px;")
     tree.layout(root, width=200.0)
 
-    assert len(wide._chromonic_text_lines) > len(tight._chromonic_text_lines)
+    assert len(box_of(wide).text_lines) > len(box_of(tight).text_lines)
 
 
 def test_tree_measure_respects_an_explicit_line_height():
@@ -2197,12 +2198,12 @@ def test_paint_uses_parleys_real_line_height_for_baseline_spacing():
     root = div(para, _style="width:150px;")
     tree.layout(root, width=150.0)
 
-    assert para._chromonic_line_height > 0
-    lines = len(para._chromonic_text_lines)
+    assert box_of(para).line_height > 0
+    lines = len(box_of(para).text_lines)
     assert lines > 1
     # a per-line number, not the whole box's height -- the box is
     # (roughly) `lines` of these stacked, not equal to a single one
-    assert para._chromonic_line_height < para.get_layout_box().height
+    assert box_of(para).line_height < para.get_layout_box().height
 
 
 def test_warm_text_layout_does_not_crash_and_is_idempotent():
@@ -2438,7 +2439,7 @@ def test_reuse_styles_skips_css_resolution_for_an_already_resolved_element(monke
     from chromonic import tree
 
     root = div(p('hello'), _style='color:rgb(255,0,0);width:100px')
-    tree.layout(root, width=100)  # first pass: real resolution, populates _chromonic_resolved_style
+    tree.layout(root, width=100)  # first pass: real resolution, populates box.resolved_style
 
     resolutions = []
     original = ComputedStyleDeclaration._resolve
@@ -2472,9 +2473,9 @@ def test_reuse_styles_false_still_sees_a_real_style_mutation():
 
     root = div(p('hello'), _style='color:rgb(255,0,0);width:100px')
     tree.layout(root, width=100)  # populates the per-element cache reuse_styles=True would reuse
-    before = root.childNodes[0]._chromonic_computed_style.color
+    before = box_of(root.childNodes[0]).computed_style.color
 
     root.style.color = 'rgb(0,0,255)'
     tree.layout(root, width=100)  # default reuse_styles=False -- must not serve the stale cached colour
-    after = root.childNodes[0]._chromonic_computed_style.color
+    after = box_of(root.childNodes[0]).computed_style.color
     assert after != before

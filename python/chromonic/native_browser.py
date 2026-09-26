@@ -15,6 +15,7 @@ import skia
 
 from . import browser, browser_images, domonic_canvas_patch, fonts, hittest, paint, tree, window
 from .tree import warm_text_layout
+from .tree.box import box_of
 
 _log = logging.getLogger(__name__)
 
@@ -132,15 +133,15 @@ def _collect_selectable_runs(display_list):
     works against. `display_list` (`paint.build_display_list`'s flat, already
     paint-ordered element list) covers every real DOM element with a layout
     box, but not the anonymous inline-text/generated-content fragments mixed
-    inline content retains (`_chromonic_inline_fragments` -- see `paint.
+    inline content retains (`box.inline_fragments` -- see `paint.
     paint_element`'s own handling of them); those are walked recursively here
     the same way `paint_element` recurses into them for drawing, so a
     selectable run always corresponds to something actually painted."""
     runs = []
 
     def add(element):
-        tag_name = getattr(element, "_chromonic_tag_name", None) or (getattr(element, "tagName", "") or "").lower()
-        has_layout_children = getattr(element, "_chromonic_has_layout_children", None)
+        tag_name = box_of(element).tag_name or (getattr(element, "tagName", "") or "").lower()
+        has_layout_children = box_of(element).has_layout_children
         if has_layout_children is None:
             has_layout_children = tag_name != "select" and any(
                 paint._is_element(child) for child in (element.childNodes or [])
@@ -149,7 +150,7 @@ def _collect_selectable_runs(display_list):
             box = element.__dict__.get("_layout_box")
             if box is not None:
                 runs.extend(paint.text_line_runs(element, box, paint._paint_style(element)))
-        for fragment in getattr(element, "_chromonic_inline_fragments", ()) or ():
+        for fragment in box_of(element).get("inline_fragments", ()) or ():
             add(fragment)
 
     for element in display_list:
@@ -620,7 +621,7 @@ class View:
 
         # Prefer resolved/computed style when tree.py has already attached it;
         # this catches dimensions supplied by stylesheets, not only inline CSS.
-        style = image.__dict__.get('_chromonic_paint_style', {}) or {}
+        style = box_of(image).get("paint_style", {}) or {}
 
         def fixed(value):
             if value is None:
@@ -694,14 +695,15 @@ class View:
                 viewport_height=self.viewport_height,
             )
             self._center_open_dialogs(doc)
+            # The document's extent: `<html>` spans body's margins, and any
+            # box overflowing it counts too. The viewport-sized initial
+            # containing block itself doesn't.
             self.content_height = max(
                 (
-                    max(
-                        box.y + box.height,
-                        float(element.__dict__.get('_chromonic_scroll_extent', 0.0)),
-                    )
+                    box.y + box.height
                     for element in nodes.values()
                     if (box := element.__dict__.get('_layout_box')) is not None
+                    and box_of(element).tag_name != '#initial-containing-block'
                 ),
                 default=0.0,
             )
@@ -1125,7 +1127,7 @@ class View:
 
         select = self._select_ancestor(element)
         if select is not None and select.getAttribute('disabled') is None:
-            if getattr(select, '_chromonic_listbox_rows', 0):
+            if box_of(select).get("listbox_rows", 0):
                 self._click_listbox_row(select, x, y)
             else:
                 self.open_select = select
@@ -1319,14 +1321,14 @@ class View:
         def walk(node):
             if getattr(node, 'nodeType', None) != 1:
                 return
-            # `_chromonic_native_style["position"]` can't tell fixed from
+            # `box.native_style["position"]` can't tell fixed from
             # absolute -- `style_bridge._position()` maps both to the same
             # Taffy-level "absolute" string (Taffy has no native fixed
             # concept; `positioning.py`'s own viewport-anchoring fixup hits
             # the identical problem and resolves it the same way).
-            # `_chromonic_resolved_style`'s pre-mapping `LayoutStyle.position`
+            # `box.resolved_style`'s pre-mapping `LayoutStyle.position`
             # still keeps fixed distinct.
-            resolved = getattr(node, '_chromonic_resolved_style', None)
+            resolved = box_of(node).resolved_style
             position = getattr(resolved[1].position, 'value', resolved[1].position) if resolved is not None else None
             if position == 'fixed':
                 found.append(node)
@@ -1787,9 +1789,9 @@ class View:
         box = element.get_layout_box()
         if box is None:
             return
-        padding = element.__dict__.get('_chromonic_padding', (0.0, 0.0, 0.0, 0.0))
+        padding = box_of(element).get("padding", (0.0, 0.0, 0.0, 0.0))
         pad_top, _pad_right, _pad_bottom, pad_left = padding
-        style = element.__dict__.get('_chromonic_paint_style', {})
+        style = box_of(element).get("paint_style", {})
         font_size = paint._px(style.get('font_size'), 16.0)
         bold = paint._fontmetrics.is_bold(style.get('font_weight'))
         italic = fonts.is_italic(style.get('font_style'))
@@ -1797,7 +1799,7 @@ class View:
         value = str(getattr(element, 'value', '') or '')
         is_password = (element.getAttribute('type') or '').lower() == 'password'
         display_value = '•' * len(value) if is_password else value
-        line_height = element.__dict__.get('_chromonic_line_height') or font_size * 1.2
+        line_height = box_of(element).line_height or font_size * 1.2
         text_x0 = box.x + box.border_left + pad_left
         baseline_y0 = box.y + box.border_top + pad_top + font_size
 

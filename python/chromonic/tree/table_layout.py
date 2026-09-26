@@ -7,6 +7,7 @@ from domonic.layout import LayoutBox
 
 from .. import fonts, style_bridge
 from . import anonymous_boxes, box_model, dom, geometry, inline_formatting, replaced_elements
+from .box import box_of
 
 
 
@@ -415,7 +416,7 @@ def _compute_fixed_column_widths(table_element, cells, column_count, columns, co
             widths[c] = float(width)
         elif isinstance(width, tuple) and width[0] == "pct":
             widths[c] = width[1] * percentage_base
-    collapsed = getattr(table_element, "_chromonic_collapsed_cell_borders", None) or {}
+    collapsed = box_of(table_element).collapsed_cell_borders or {}
     for cell, row_index, c, _rowspan, colspan in cells:
         if row_index != 0:
             continue
@@ -469,7 +470,7 @@ def _is_inline_table_box(element) -> bool:
     2.1 17.2.1 anonymous one generated inside inline content."""
     if isinstance(element, anonymous_boxes._AnonymousTableBox):
         return element.kind == "inline-table"
-    computed = getattr(element, "_chromonic_computed_style", None)
+    computed = box_of(element).computed_style
     return (getattr(computed, "display", "") or "").strip().lower() == "inline-table" if computed is not None else False
 
 
@@ -482,11 +483,11 @@ def _column_elements(table_element) -> list:
     for child in dom._child_nodes(table_element):
         if not dom._is_element(child):
             continue
-        resolved = getattr(child, "_chromonic_resolved_style", None)
+        resolved = box_of(child).resolved_style
         if resolved is not None and box_model._is_absolutely_positioned(resolved[1]):
             continue  # CSS 2.1 9.7: blockified, a real box of its own (top-applies-to-005.xht)
         tag = (getattr(child, "tagName", "") or "").lower()
-        computed = getattr(child, "_chromonic_computed_style", None)
+        computed = box_of(child).computed_style
         display = (getattr(computed, "display", "") or "").strip().lower() if computed is not None else ""
         if display == "":
             try:
@@ -520,11 +521,11 @@ def _publish_table_column_boxes(node_map: dict) -> None:
     row/cell box is final, purely so the element reports that rect --
     nothing paints it."""
     for element in list(node_map.values()):
-        if not getattr(element, "_chromonic_is_table_root", False):
+        if not box_of(element).get("is_table_root", False):
             continue
-        columns = getattr(element, "_chromonic_table_columns", None) or []
-        cells = getattr(element, "_chromonic_table_grid_cells", None) or []
-        rows = [row for row in (getattr(element, "_chromonic_table_rows", None) or ())
+        columns = box_of(element).table_columns or []
+        cells = box_of(element).table_grid_cells or []
+        rows = [row for row in (box_of(element).table_rows or ())
                 if row.__dict__.get("_layout_box") is not None]
         table_box = element.__dict__.get("_layout_box")
         if table_box is None:
@@ -568,7 +569,7 @@ def _publish_table_column_boxes(node_map: dict) -> None:
         # column's left edge is where some cell starts, or failing that
         # just past the previous column's right edge (a colspan-covered
         # column has no cell edge of its own); likewise its right edge.
-        spacing_h = getattr(element, "_chromonic_border_spacing", (0.0, 0.0))[0]
+        spacing_h = box_of(element).get("border_spacing", (0.0, 0.0))[0]
         column_count = len(columns)
         starts: dict = {}
         ends: dict = {}
@@ -582,8 +583,8 @@ def _publish_table_column_boxes(node_map: dict) -> None:
         # A fixed-layout table knows every column's exact width, which
         # also places the columns under the middle of a colspan (no cell
         # edge of their own at all).
-        exact = (getattr(element, "_chromonic_table_columns_max", None)
-                 if getattr(element, "_chromonic_table_fixed", False) else None)
+        exact = (box_of(element).table_columns_max
+                 if box_of(element).get("table_fixed", False) else None)
         for first, last, owner in ranges.values():
             left = starts.get(first)
             if left is None and first > 0 and (first - 1) in ends:

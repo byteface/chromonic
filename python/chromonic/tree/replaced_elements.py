@@ -8,6 +8,7 @@ from domonic.layout import LayoutBox
 from .. import fonts, style_bridge
 from .._native import Tree, layout_text
 from . import box_model, builder, dom, flex_grid, inline_formatting, positioning
+from .box import box_of
 
 
 
@@ -29,7 +30,7 @@ def _form_control_display_text(element) -> str:
         text = "•" * len(str(value))
     else:
         text = str(value) if value else element.getAttribute("placeholder") or ""
-    style = element.__dict__.get("_chromonic_paint_style", {})
+    style = box_of(element).get("paint_style", {})
     return dom._apply_text_transform(text, style.get("text_transform"))
 
 
@@ -95,9 +96,9 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
     # otherwise it looks identical to a real explicit width even once the
     # image arrives. `style` may be the same cached dict a reuse_styles=True
     # pass hands back, not fresh from style_bridge.to_dict().
-    if getattr(element, "_chromonic_image_loading_width_stretch", False):
+    if box_of(element).get("image_loading_width_stretch", False):
         style["width"] = "auto"
-        element._chromonic_image_loading_width_stretch = False
+        box_of(element).image_loading_width_stretch = False
 
     src = element.getAttribute("src") or ""
     image = browser_images.load_image(src)
@@ -109,7 +110,7 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
         # silently collapses to 0 instead while width stays "auto".
         if style["display"] == "block" and style["width"] == "auto":
             style["width"] = ("pct", 1.0)
-            element._chromonic_image_loading_width_stretch = True
+            box_of(element).image_loading_width_stretch = True
         return
     intrinsic_width, intrinsic_height, _ratio = browser_images.natural_size(src)
     has_complete_pair = intrinsic_width is not None and intrinsic_height is not None
@@ -128,7 +129,7 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
         # definite height computes to auto, then comes from width and
         # intrinsic ratio -- flex-aspect-ratio-img-column-004.html.
         parent = dom._layout_parent(element)
-        parent_native = getattr(parent, "_chromonic_native_style", None) if parent is not None else None
+        parent_native = box_of(parent).native_style if parent is not None else None
         if parent_native is not None and not isinstance(parent_native.get("height"), (int, float)):
             style["height"] = "auto"
     width_auto = style["width"] == "auto"
@@ -141,7 +142,7 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
         # the ratio once left auto.
         style["aspect_ratio"] = intrinsic_ratio
         return
-    element.__dict__.pop("_chromonic_img_measure", None)
+    box_of(element).pop("img_measure", None)
     if width_auto and height_auto:
         if has_complete_pair:
             width, height = intrinsic_width, intrinsic_height
@@ -162,7 +163,7 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
                         return (known_height * ratio, known_height)
                     return (iw, ih)
 
-                element.__dict__["_chromonic_img_measure"] = (measure, ("img-measure", src, iw, ih))
+                box_of(element).img_measure = (measure, ("img-measure", src, iw, ih))
                 style["aspect_ratio"] = intrinsic_ratio
                 return
             if (intrinsic_ratio and isinstance(style.get("flex_basis"), (int, float))
@@ -172,7 +173,7 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
                 # Taffy's aspect_ratio only reads the style width, never
                 # the flexed size, so both are resolved here
                 # (flex-grow/shrink not modelled).
-                parent_native = (dom._layout_parent(element).__dict__.get("_chromonic_native_style") or {})
+                parent_native = (box_of(dom._layout_parent(element)).native_style or {})
                 if (parent_native.get("flex_direction") or "row").startswith("row"):
                     width = float(style["flex_basis"])
                     height = width / intrinsic_ratio
@@ -208,7 +209,7 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
         # so the clamp is resolved here) -- flex-aspect-ratio-img-column-005.html.
         clamped = style["width"]
         parent = dom._layout_parent(element)
-        parent_native = getattr(parent, "_chromonic_native_style", None) if parent is not None else None
+        parent_native = box_of(parent).native_style if parent is not None else None
         parent_width = parent_native.get("width") if parent_native is not None else None
         for key, pick in (("max_width", min), ("min_width", max)):
             bound = style.get(key)
@@ -245,7 +246,7 @@ def _apply_image_intrinsic_size(style: dict, element) -> None:
                 return (height * ratio, height)
             return natural
 
-        element.__dict__["_chromonic_img_measure"] = (measure, ("img-ratio-measure", src, ratio, natural))
+        box_of(element).img_measure = (measure, ("img-ratio-measure", src, ratio, natural))
     if isinstance(style["width"], (int, float)):
         # A resolved replaced-element width (intrinsic, ratio-derived, or
         # the 300px UA default) is never subject to flex-shrink -- it's
@@ -271,7 +272,7 @@ def _stretched_replaced_flex_item(element, style: dict) -> bool:
     if style.get("position") in ("absolute", "fixed") or not flex_grid._is_flex_or_grid_item(element):
         return False
     parent = dom._layout_parent(element)
-    parent_native = getattr(parent, "_chromonic_native_style", None) or {}
+    parent_native = box_of(parent).native_style or {}
     parent_inset = parent_native.get("inset") or ("auto",) * 4
     parent_definite_height = (
         isinstance(parent_native.get("height"), (int, float))
@@ -283,10 +284,10 @@ def _stretched_replaced_flex_item(element, style: dict) -> bool:
             or not (parent_native.get("flex_direction") or "row").startswith("row")
             or not parent_definite_height):
         return False
-    resolved = getattr(element, "_chromonic_resolved_style", None)
+    resolved = box_of(element).resolved_style
     align, _safe = box_model._alignment_parts(getattr(resolved[0], "alignSelf", "auto") if resolved else "auto")
     if align == "auto":
-        parent_resolved = getattr(parent, "_chromonic_resolved_style", None)
+        parent_resolved = box_of(parent).resolved_style
         align, _safe = box_model._alignment_parts(getattr(parent_resolved[0], "alignItems", "normal")
                                         if parent_resolved else "normal")
     return align in ("stretch", "normal")
@@ -301,7 +302,7 @@ def _resolve_replaced_percent_height(style: dict, element, height_attr: str) -> 
     circularly against a still-undetermined auto height."""
     containing_block = positioning._find_containing_block_ancestor(element) if (
         style.get("position") in ("absolute", "fixed")) else getattr(element, "parentElement", None)
-    cb_native = (getattr(containing_block, "_chromonic_native_style", None)
+    cb_native = (box_of(containing_block).native_style
                  if containing_block is not None else None)
     cb_height = cb_native.get("height") if cb_native is not None else None
     if not isinstance(cb_height, (int, float)):

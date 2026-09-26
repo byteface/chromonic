@@ -6,6 +6,7 @@ import re
 from domonic.layout import AUTO, Edges, Keyword, Length
 
 from . import box_model, dom, inline_formatting
+from .box import box_of
 
 
 
@@ -18,8 +19,8 @@ class _AnonymousTextFragment:
         self.parent = parent
         self.childNodes = []
         self.nodeType = dom.TEXT_NODE
-        self._chromonic_tag_name = "#text"
-        self._chromonic_has_layout_children = False
+        box_of(self).tag_name = "#text"
+        box_of(self).has_layout_children = False
 
 
 
@@ -78,10 +79,10 @@ class _AnonymousTableBox:
     inline-table, table-row or table-cell generated around misparented
     table content. Not a DOM node: never in anyone's childNodes (a
     wrapped node's real parentElement is untouched -- `_layout_parent`
-    follows _chromonic_anonymous_parent instead), reached only through
+    follows box.anonymous_parent instead), reached only through
     `_normalized_child_nodes`. Carries the same tagName a real table part
     would so every tag-based check treats it as one, and a synthetic
-    style (_chromonic_synthetic_style, see dom._describe) instead of a cascade."""
+    style (box.synthetic_style, see dom._describe) instead of a cascade."""
 
     nodeType = dom.ELEMENT_NODE
     _TAGS = {"table": "TABLE", "inline-table": "TABLE", "row": "TR", "cell": "TD", "block": "DIV"}
@@ -117,6 +118,28 @@ class _AnonymousTableBox:
 
 
 
+class _DocumentRootBox:
+    """The layout box of `<html>`, the root of the layout tree above
+    `<body>` (`tree._build_root`)."""
+
+    def __init__(self, element):
+        self.element = element
+        self.childNodes = ()
+        box_of(self).tag_name = "html"
+        box_of(self).has_layout_children = True
+
+
+
+class _InitialContainingBlock:
+    """The viewport-sized root of the layout tree (`tree._build_root`)."""
+
+    def __init__(self):
+        self.childNodes = ()
+        box_of(self).tag_name = "#initial-containing-block"
+        box_of(self).has_layout_children = True
+
+
+
 class _StaticAnchor:
     """The zero-size placeholder an absolutely positioned box leaves in its
     static parent's flow when the box itself is laid out as a child of its
@@ -133,8 +156,8 @@ class _StaticAnchor:
         self.owner = owner
         self.parentElement = getattr(owner, "parentElement", None)
         self.childNodes = ()
-        self._chromonic_tag_name = "#static-anchor"
-        self._chromonic_has_layout_children = False
+        box_of(self).tag_name = "#static-anchor"
+        box_of(self).has_layout_children = False
 
 
 
@@ -207,23 +230,23 @@ def _synthesize_anonymous_style(box: "_AnonymousTableBox", parent, computed_cach
         maxWidth=AUTO, maxHeight=AUTO, margin=zero, padding=zero, borderWidth=zero,
         flexGrow=0.0, flexShrink=1.0, flexBasis=AUTO, alignSelf=Keyword("auto"),
     )
-    box.__dict__["_chromonic_synthetic_style"] = (_SyntheticComputed(parent_computed, display), style_obj)
+    box_of(box).synthetic_style = (_SyntheticComputed(parent_computed, display), style_obj)
     # Inherited paint properties (font, color, ...) come from the parent;
     # nothing an anonymous box paints of its own -- so the parent's own
     # (non-inherited) background/border must not come along, or the box
     # would repaint them over its area.
-    paint_style = dict(getattr(parent, "_chromonic_paint_style", None) or {})
+    paint_style = dict(box_of(parent).paint_style or {})
     for name in ("background_color", "border_top_color", "border_right_color",
                  "border_bottom_color", "border_left_color"):
         if name in paint_style:
             paint_style[name] = "transparent"
     if "background_image" in paint_style:
         paint_style["background_image"] = "none"
-    box.__dict__["_chromonic_paint_style"] = paint_style
-    box.__dict__["_chromonic_before_text"] = ""
-    box.__dict__["_chromonic_after_text"] = ""
-    box.__dict__["_chromonic_before_pseudo"] = None
-    box.__dict__["_chromonic_after_pseudo"] = None
+    box_of(box).paint_style = paint_style
+    box_of(box).before_text = ""
+    box_of(box).after_text = ""
+    box_of(box).before_pseudo = None
+    box_of(box).after_pseudo = None
 
 
 
@@ -260,7 +283,7 @@ def _wrap_missing_table_boxes(element, computed_cache) -> list:
         # below overrides it for its own run).
         for node in nodes:
             if hasattr(node, "__dict__"):
-                node.__dict__.pop("_chromonic_anonymous_parent", None)
+                box_of(node).pop("anonymous_parent", None)
 
     def is_blank_text(node) -> bool:
         return getattr(node, "nodeType", None) == dom.TEXT_NODE and not dom._collapsed_text_node(node).strip()
@@ -311,7 +334,7 @@ def _wrap_missing_table_boxes(element, computed_cache) -> list:
     else:
         parent_style = dom._describe(element, computed_cache)[1] if not isinstance(element, _AnonymousTableBox) else None
         wrap = "inline-table" if (parent_style is not None and box_model._is_inline_level(element, parent_style)) else "table"
-    cache = element.__dict__.setdefault("_chromonic_anonymous_table_boxes", {})
+    cache = box_of(element).setdefault("anonymous_table_boxes", {})
     result: list = []
     run: list = []
 
@@ -328,7 +351,7 @@ def _wrap_missing_table_boxes(element, computed_cache) -> list:
         box.childNodes = list(run)
         for node in run:
             if hasattr(node, "__dict__"):
-                node.__dict__["_chromonic_anonymous_parent"] = box
+                box_of(node).anonymous_parent = box
         _synthesize_anonymous_style(box, element, computed_cache)
         result.append(box)
         run.clear()
@@ -427,7 +450,7 @@ def _wrap_inline_runs(element, nodes, computed_cache) -> list:
         if "block" not in kinds or not ({"text", "inline"} & set(kinds)):
             return nodes
         wrappable = {"text", "inline"}
-    cache = element.__dict__.setdefault("_chromonic_anonymous_table_boxes", {})
+    cache = box_of(element).setdefault("anonymous_table_boxes", {})
     result: list = []
     run: list = []
 
@@ -455,7 +478,7 @@ def _wrap_inline_runs(element, nodes, computed_cache) -> list:
         box.childNodes = list(run)
         for node in run:
             if hasattr(node, "__dict__"):
-                node.__dict__["_chromonic_anonymous_parent"] = box
+                box_of(node).anonymous_parent = box
         _synthesize_anonymous_style(box, element, computed_cache)
         result.append(box)
         run.clear()
@@ -486,10 +509,10 @@ def _normalized_child_nodes(element, computed_cache, *, reuse_styles=False) -> l
     # the anonymous table/block projection is identical too -- reusing the
     # prior list avoids reclassifying every child on an unchanged DOM.
     if reuse_styles and hasattr(element, "__dict__"):
-        cached = element.__dict__.get("_chromonic_normalized_children")
+        cached = box_of(element).normalized_children
         if cached is not None:
             return cached
     nodes = _wrap_inline_runs(element, _wrap_missing_table_boxes(element, computed_cache), computed_cache)
     if hasattr(element, "__dict__"):
-        element.__dict__["_chromonic_normalized_children"] = nodes
+        box_of(element).normalized_children = nodes
     return nodes

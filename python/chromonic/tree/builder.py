@@ -8,6 +8,7 @@ from domonic.layout import Keyword, Length
 from .. import fonts, style_bridge
 from .._native import Tree, layout_text
 from . import table_formatting, anonymous_boxes, box_model, dom, flex_grid, inline_formatting, replaced_elements, table_layout
+from .box import box_of
 
 
 
@@ -16,26 +17,14 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
     """Body of `build()`'s `is_table_root` branch, extracted verbatim: resolves
     the table's grid/columns/borders/spacing and stashes them as `element._chromonic_table_*`
     attributes for the row/cell branches (in later, separate `build()` calls) to read."""
-    element._chromonic_is_table_root = True
-    element.__dict__.pop("_chromonic_table_growth_propagated", None)
-    # The previous pass's column resolution must not leak into this
-    # one: `table_layout._compute_table_column_widths` measures every cell in a
-    # scratch tree, and the cell branch (`dom._layout_parent` reaches this
-    # real table from there) would read last pass's per-cell width and
-    # discard the cell's own `width` -- border-conflict-example-
-    # 001.xht's `width: 2em` cells came out 52px on every relayout
-    # after the first (69px), i.e. on any resize or image load.
-    for stale in ("_chromonic_table_column_widths", "_chromonic_table_column_min_widths",
-                  "_chromonic_table_columns_max", "_chromonic_table_columns_min",
-                  "_chromonic_table_columns_uncollapsed", "_chromonic_table_fixed"):
-        element.__dict__.pop(stale, None)
+    box_of(element).is_table_root = True
     # A table box establishes a block formatting context (CSS 2.1
     # 9.4.1): a caption's top margin stays inside it, never collapsing
     # through into the table's own (table-anonymous-block-011.xht: a
     # `margin-top: 2em` caption in a `margin-top: 2em` table sits 4em
     # below the preceding border in Chrome, not 2em).
     style["establishes_bfc"] = True
-    element._chromonic_border_collapse = computed.borderCollapse == "collapse"
+    box_of(element).border_collapse = computed.borderCollapse == "collapse"
     # The table's grid, resolved once here for everything below and
     # for the post-layout passes (`_distribute_table_extra_height`):
     # rows in CSS 2.1 17.5.3 display order, each row's own cells, and
@@ -47,16 +36,16 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
     # of nothing but a `width: 5em` column is 80px wide in Chrome
     # (table-column-rendering-001.xht).
     column_count = max(column_count, len(table_layout._table_columns(element, computed_cache, None)))
-    element._chromonic_table_rows = rows
-    element._chromonic_table_grid_cells = cells
-    element._chromonic_table_columns = table_layout._table_columns(element, computed_cache, column_count)
+    box_of(element).table_rows = rows
+    box_of(element).table_grid_cells = cells
+    box_of(element).table_columns = table_layout._table_columns(element, computed_cache, column_count)
     # CSS 2.1 17.5.5: a `visibility: collapse` column (or column
     # group) is 0px wide -- its cells with it, and one border-spacing
     # gap goes with it (column-visibility-003.xht: four 128px `<col>`s
     # with one collapsed make a 392px table: three columns, four
     # gaps) -- while its cells still take part in the row layout.
     collapsed_columns: set = set()
-    for index, (column, group) in enumerate(element._chromonic_table_columns):
+    for index, (column, group) in enumerate(box_of(element).table_columns):
         for owner in (column, group):
             if owner is None:
                 continue
@@ -66,13 +55,11 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
                 visibility = ""
             if visibility.strip().lower() == "collapse":
                 collapsed_columns.add(index)
-    element._chromonic_table_collapsed_columns = collapsed_columns
-    element._chromonic_table_cell_columns = {
-        id(cell): (c, min(c + colspan, column_count) - c) for cell, _r, c, _rs, colspan in cells}
+    box_of(element).table_collapsed_columns = collapsed_columns
     # CSS 2.1 17.5: an `rtl` table's first column is the rightmost -- rows
     # lay cells out right-to-left (row-reverse, see the row branch) and the
     # collapsed-border grid lines mirror.
-    element._chromonic_table_rtl = dom._element_direction(element, computed) == "rtl"
+    box_of(element).table_rtl = dom._element_direction(element, computed) == "rtl"
     row_cells: dict = {}
     content_rows: set = set()
     for cell, row_index, _col, rowspan, _colspan in cells:
@@ -82,8 +69,7 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
         if table_layout._table_cell_has_content(cell, computed_cache):
             content_rows.update(range(row_index, min(row_index + rowspan, len(rows))))
     for index, row in enumerate(rows):
-        row._chromonic_table_cells = row_cells.get(id(row), [])
-        row._chromonic_table_row_empty = index not in content_rows
+        box_of(row).table_cells = row_cells.get(id(row), [])
         # CSS 2.1 17.5.5: visibility:collapse on a row or its row group
         # removes it (0px, `_collapse_rows_in`) while its cells still size
         # the columns -- row-visibility-001..004.xht.
@@ -99,19 +85,19 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
                 collapsed = True
                 break
             node = dom._layout_parent(node)
-        row._chromonic_row_collapsed = collapsed
-    if element._chromonic_border_collapse:
+        box_of(row).row_collapsed = collapsed
+    if box_of(element).border_collapse:
         # CSS 2.1 17.6.2: each side of a collapsed grid line keeps only its
         # own half of the winning width -- `table_layout._resolve_collapsed_table_borders`
         # runs the real 17.6.2.1 conflict resolution per segment; cells read
-        # their halves from `_chromonic_collapsed_cell_borders` below.
+        # their halves from `box.collapsed_cell_borders` below.
         # Table box: own border halved, padding makes up the rest of the
         # winning perimeter width -- border-collapse-001.xht,
         # border-collapse-005.html.
         cell_borders, perimeter = table_layout._resolve_collapsed_table_borders(
             element, computed, rows, cells, column_count, computed_cache,
-            rtl=element._chromonic_table_rtl)
-        element._chromonic_collapsed_cell_borders = cell_borders
+            rtl=box_of(element).table_rtl)
+        box_of(element).collapsed_cell_borders = cell_borders
         own = [box_model._numeric_edge(value) for value in style["border"]]
         style["border"] = [value / 2.0 for value in own]
         style.update({
@@ -120,11 +106,11 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
             "padding": [max(0.0, perimeter[i] / 2.0 - own[i] / 2.0) for i in range(4)],
         })
     else:
-        element.__dict__.pop("_chromonic_collapsed_cell_borders", None)
+        box_of(element).pop("collapsed_cell_borders", None)
     # CSS 2.1 17.5.3: a table's specified height is a minimum, not a cap
     # (`_distribute_table_extra_height` hands out surplus/needs the original
     # value) -- `min_height` is exactly that semantic in Taffy.
-    element._chromonic_table_specified_height = (
+    box_of(element).table_specified_height = (
         style["height"] if isinstance(style["height"], (int, float)) else None)
     if style["height"] != "auto":
         if style["min_height"] in ("auto", 0.0):
@@ -133,7 +119,7 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
     if tag_name == "table":
         # HTML UA stylesheet: `table { box-sizing: border-box }`.
         style["box_sizing"] = "border-box"
-    elif style["box_sizing"] != "border-box" and not element._chromonic_border_collapse:
+    elif style["box_sizing"] != "border-box" and not box_of(element).border_collapse:
         # CSS 2.1 17.6.1: a `display:table` element's width/height excludes
         # border-spacing too (it's modelled as extra padding here) -- convert
         # a definite size to the equivalent border box up front so the
@@ -144,15 +130,15 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
         if isinstance(style["width"], (int, float)):
             style["width"] = style["width"] + padding[1] + padding[3] + border[1] + border[3]
             style["box_sizing"] = "border-box"
-        if isinstance(style["min_height"], (int, float)) and element._chromonic_table_specified_height is not None:
+        if isinstance(style["min_height"], (int, float)) and box_of(element).table_specified_height is not None:
             vertical = padding[0] + padding[2] + border[0] + border[2]
             style["min_height"] = style["min_height"] + vertical
-            element._chromonic_table_specified_height = style["min_height"]
+            box_of(element).table_specified_height = style["min_height"]
             style["box_sizing"] = "border-box"
     # CSS 2.1 17.6.1: border-spacing only applies in the separate border
     # model; `ua_style.py` supplies the UA default (2px) domonic has none of.
-    if element._chromonic_border_collapse:
-        element._chromonic_border_spacing = (0.0, 0.0)
+    if box_of(element).border_collapse:
+        box_of(element).border_spacing = (0.0, 0.0)
     else:
         parts = (computed.borderSpacing or "0px").split() or ["0px"]
 
@@ -181,7 +167,7 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
             # to the UA default -- domonic's cascade doesn't (logged in
             # PLAN.md), reproduced here.
             spacing_h = spacing_v = 2.0
-        element._chromonic_border_spacing = (spacing_h, spacing_v)
+        box_of(element).border_spacing = (spacing_h, spacing_v)
         if spacing_h or spacing_v:
             # The same gap also separates the table's own edge from
             # its outermost row/column (CSS 2.1 17.6.1's spacing
@@ -197,11 +183,11 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
                 own_padding[2] + spacing_v if isinstance(own_padding[2], (int, float)) else spacing_v,
                 own_padding[3] + spacing_h if isinstance(own_padding[3], (int, float)) else spacing_h,
             ]
-    element._chromonic_table_fixed = computed.tableLayout == "fixed" and style["width"] != "auto"
+    box_of(element).table_fixed = computed.tableLayout == "fixed" and style["width"] != "auto"
     # CSS 2.1 17.5.2: a specified table width is a floor the columns may
     # widen past (`table_formatting` resolves the used width), so it reaches
     # Taffy as a minimum; the table node sizes itself from its content.
-    element._chromonic_table_specified_width = style["width"]
+    box_of(element).table_specified_width = style["width"]
     if style["width"] != "auto":
         if style["min_width"] in ("auto", 0.0):
             style["min_width"] = style["width"]
@@ -239,27 +225,27 @@ def _setup_table_row_or_cell(element, style, computed, style_obj, tag_name,
         # table-visual-layout-002.xht.
         style["margin"] = [0.0, 0.0, 0.0, 0.0]
         ancestor = dom._layout_parent(element)
-        while ancestor is not None and not getattr(ancestor, "_chromonic_is_table_root", False):
+        while ancestor is not None and not box_of(ancestor).get("is_table_root", False):
             ancestor = dom._layout_parent(ancestor)
-        if ancestor is not None and getattr(ancestor, "_chromonic_border_collapse", False):
+        if ancestor is not None and box_of(ancestor).get("border_collapse", False):
             # CSS 2.1 17.6.2: this cell's box includes half of each of its
             # four collapsed grid lines' winning widths, resolved once for
             # the whole table (`table_layout._resolve_collapsed_table_borders`) regardless
             # of the cell's own declaration -- border-conflict-style-001.xht.
             # A cell outside the resolved grid falls back to halving its own.
-            resolved = getattr(ancestor, "_chromonic_collapsed_cell_borders", {}).get(id(element))
+            resolved = box_of(ancestor).get("collapsed_cell_borders", {}).get(id(element))
             style["border"] = (list(resolved) if resolved is not None else
                                [value / 2.0 if isinstance(value, (int, float)) else value
                                 for value in style["border"]])
         # The table algorithm (`table_formatting`) sizes every cell from its
         # columns; a specified width only feeds the column widths.
-        element._chromonic_cell_specified_width = style["width"] if style["width"] != "auto" else None
+        box_of(element).cell_specified_width = style["width"] if style["width"] != "auto" else None
         style["width"] = "auto"
-        # CSS 2.1 17.5.3: a cell's specified height is a minimum too.
-        if style["height"] != "auto":
-            if style["min_height"] in ("auto", 0.0):
-                style["min_height"] = style["height"]
-            style["height"] = "auto"
+        # CSS 2.1 17.5.3: a cell's specified height is a minimum for its
+        # row (`table_formatting`), not for the cell's content -- which
+        # vertical-align then positions within the taller cell.
+        box_of(element).cell_specified_height = style["height"] if style["height"] != "auto" else None
+        style["height"] = "auto"
 
 
 
@@ -267,7 +253,7 @@ def _setup_table_caption(element, style, computed, parent, is_table_caption: boo
     """Body of `build()`'s `is_table_caption` branch, extracted verbatim: pulls a
     caption's margins outward past the table's own border+padding so it spans the
     table wrapper box, CSS 2.1 17.4."""
-    if is_table_caption and parent is not None and getattr(parent, "_chromonic_is_table_root", False):
+    if is_table_caption and parent is not None and box_of(parent).get("is_table_root", False):
         # CSS 2.1 17.4: a caption belongs to the table wrapper box, spanning
         # its full outer width, not the table box itself -- chromonic has no
         # separate wrapper, so the caption's margins compensate: pulled
@@ -276,7 +262,7 @@ def _setup_table_caption(element, style, computed, parent, is_table_caption: boo
         # padding still sit between caption and first/last row.
         # basic-css-table-001.xht. An author margin still applies on top; a
         # percentage one is left alone.
-        parent_style = getattr(parent, "_chromonic_native_style", None) or {}
+        parent_style = box_of(parent).native_style or {}
         bt, br, bb, bl = (box_model._numeric_edge(v) for v in parent_style.get("border", (0.0,) * 4))
         pt, pr, pb, pl = (box_model._numeric_edge(v) for v in parent_style.get("padding", (0.0,) * 4))
         at_bottom = (getattr(computed, "captionSide", "") or "top").strip().lower() == "bottom"
@@ -302,14 +288,14 @@ def _build_split_pieces(tree, element, style, split_pieces, *, computed_cache, i
     """Body of build()'s `split_pieces is not None` branch: one ordinary block-flow
     child per CSS 2.1 9.2.1.1 split piece (a measured text leaf for a "plan"
     piece, a recursive build() for a "block" piece)."""
-    element.__dict__.pop("_chromonic_inline_plan", None)
-    element._chromonic_inline_fragments = []
+    box_of(element).pop("inline_plan", None)
+    box_of(element).inline_fragments = []
     # Its pieces are ordinary block-level boxes: Taffy's block layout
     # stretches them across the containing block itself. (Forcing
     # `width: 100%` here made every such box's min-content width equal the
     # space it was offered -- a table cell holding `<a><img
     # style="display:block"></a>` swallowed its whole table row.)
-    owner_cache = element.__dict__.setdefault("_chromonic_split_plan_owners", {})
+    owner_cache = box_of(element).setdefault("split_plan_owners", {})
     piece_ids = []
     plan_index = 0
     for kind, *payload in split_pieces:
@@ -320,7 +306,7 @@ def _build_split_pieces(tree, element, style, split_pieces, *, computed_cache, i
                 owner = owner_cache[plan_index] = anonymous_boxes._AnonymousInlineRun(None, element)
             plan_index += 1
             plan_style = inline_formatting._inline_text_style(style)
-            owner._chromonic_native_style = plan_style
+            box_of(owner).native_style = plan_style
             # An "escapee" run (an out-of-flow element mixed into this
             # segment) marks its static-position slot; its real subtree
             # lands one edge from its real containing block.
@@ -364,21 +350,38 @@ def _sizing_keyword(raw) -> "str | None":
 
 
 
+# The initial containing block's children (`tree._build_root`): every
+# `position: fixed` box, whatever its ancestors (CSS 2.1 10.1 rule 4). None
+# when the layout has no viewport.
+_viewport_sink: "list | None" = None
+
+
+def _is_fixed(style_obj) -> bool:
+    position = getattr(style_obj, "position", None)
+    return getattr(position, "value", position) == "fixed"
+
+
+def _escapee_sink(style_obj, sink):
+    """Where an out-of-flow box built away from its static parent goes:
+    the viewport for `fixed`, else its containing block's list `sink`."""
+    return _viewport_sink if _is_fixed(style_obj) and _viewport_sink is not None else sink
+
+
 def _static_anchor(tree, element, escapee_id, *, rtl, projection, node_map) -> int:
     """A zero-size placeholder for `element` (an absolutely positioned box
     built under its containing block, `escapee_id`) to sit in its static
     parent's flow, linked so `src/lib.rs` places the box at its static
     position. Returns the placeholder's node id, for the caller to insert
     at the box's place in the flow."""
-    anchor = element.__dict__.get("_chromonic_static_anchor_obj")
+    anchor = box_of(element).static_anchor_obj
     if anchor is None:
-        anchor = element.__dict__["_chromonic_static_anchor_obj"] = anonymous_boxes._StaticAnchor(element)
+        anchor = box_of(element).static_anchor_obj = anonymous_boxes._StaticAnchor(element)
     style = dict(anonymous_boxes._StaticAnchor.STYLE)
     anchor_id = (projection.upsert(anchor, style, [], None, None)
                  if projection else tree.new_leaf(style))
     node_map[anchor_id] = anchor
     tree.set_static_anchor(escapee_id, anchor_id, rtl)
-    element.__dict__["_chromonic_static_anchored"] = True
+    box_of(element).static_anchored = True
     return anchor_id
 
 
@@ -405,8 +408,8 @@ def _build_inline_node(tree, owner, plan, style, *, computed_cache, escapee_sink
     if projection is not None and not projection.measure_changed(owner, measure_key):
         # The retained node keeps its callback bound to the existing plan;
         # that plan's placements are what publish() must report too.
-        plan = owner._chromonic_inline_plan
-    owner._chromonic_inline_plan = plan
+        plan = box_of(owner).inline_plan
+    box_of(owner).inline_plan = plan
     child_ids = []
     for run in plan.runs:
         if run.get("atomic"):
@@ -418,13 +421,14 @@ def _build_inline_node(tree, owner, plan, style, *, computed_cache, escapee_sink
                 escapees=escapee_sink, reuse_styles=reuse_styles, projection=projection,
             ))
         elif run.get("escapee"):
+            sink = _escapee_sink(run["style"], escapee_sink)
             escapee_id = build(
                 tree, run["element"], node_map, computed=run["computed"], style_obj=run["style"],
                 computed_cache=computed_cache,
                 is_containing_block=box_model._establishes_containing_block(run["style"]),
-                escapees=escapee_sink, reuse_styles=reuse_styles, projection=projection,
+                escapees=sink, reuse_styles=reuse_styles, projection=projection,
             )
-            escapee_sink.append(escapee_id)
+            sink.append(escapee_id)
             # The plan places this placeholder where the box would sit in
             # the line (its static position); see `_InlineFormattingPlan.measure`.
             run["anchor_index"] = len(child_ids)
@@ -454,7 +458,7 @@ def _build_from_inline_plan(tree, element, style, inline_plan, css_display_value
     against `element`, and the escapee runs' recorded static positions
     still apply. Otherwise `element` is the inline node itself and its
     positioned descendants go to the nearest containing-block ancestor."""
-    element._chromonic_has_layout_children = True
+    box_of(element).has_layout_children = True
     # `style["display"]` is already Taffy-mapped to "block", so it can't
     # distinguish a genuine block element from an inline/inline-block one
     # built as an atomic box elsewhere -- `css_display_value` (the real
@@ -465,16 +469,16 @@ def _build_from_inline_plan(tree, element, style, inline_plan, css_display_value
             escapee_sink=escapees if escapees is not None else own_escapees,
             reuse_styles=reuse_styles, projection=projection, node_map=node_map,
         )
-    owner = element.__dict__.get("_chromonic_inline_owner")
+    owner = box_of(element).inline_owner
     if owner is None:
-        owner = element.__dict__["_chromonic_inline_owner"] = anonymous_boxes._AnonymousInlineRun(None, element)
+        owner = box_of(element).inline_owner = anonymous_boxes._AnonymousInlineRun(None, element)
     owner_style = inline_formatting._inline_text_style(style)
     # The anonymous node spans the element's content box: a percentage
     # height on an atomic child then resolves against the element's definite
     # height (CSS 2.1 10.5), and against nothing when the element's is auto.
     owner_style["height"] = ("pct", 1.0)
-    owner._chromonic_native_style = owner_style
-    owner._chromonic_paint_style = element._chromonic_paint_style
+    box_of(owner).native_style = owner_style
+    box_of(owner).paint_style = box_of(element).paint_style
     inline_id = _build_inline_node(
         tree, owner, inline_plan, owner_style, computed_cache=computed_cache,
         escapee_sink=own_escapees, reuse_styles=reuse_styles, projection=projection, node_map=node_map,
@@ -491,22 +495,25 @@ def _build_block_children(tree, element, style, computed, children, *, computed_
     """Body of build()'s `elif children:` branch: ordinary block-flow children, each
     recursively built, grouped into rowspan placeholders (a table row) or inline
     runs (everything else)."""
-    element.__dict__.pop("_chromonic_inline_plan", None)
-    element._chromonic_inline_fragments = []
+    box_of(element).pop("inline_plan", None)
+    box_of(element).inline_fragments = []
     normal_child_ids = []
     normal_entries = []
     for child, child_computed, child_style in children:
         child_is_cb = box_model._establishes_containing_block(child_style)
-        if box_model._is_absolutely_positioned(child_style) and not is_containing_block:
-            # `element` isn't a valid containing block -- build the child
-            # normally, hand its node id to the real ancestor `escapees` belongs to.
+        fixed_to_viewport = _is_fixed(child_style) and _viewport_sink is not None
+        if (box_model._is_absolutely_positioned(child_style) and not is_containing_block) or fixed_to_viewport:
+            # `element` isn't this box's containing block -- build the child
+            # normally, hand its node id to the real ancestor `escapees` belongs
+            # to (the viewport, for `fixed`).
+            sink = _escapee_sink(child_style, escapees)
             child_id = build(
                 tree, child, node_map, computed=child_computed, style_obj=child_style,
-                computed_cache=computed_cache, is_containing_block=child_is_cb, escapees=escapees,
+                computed_cache=computed_cache, is_containing_block=child_is_cb, escapees=sink,
                 reuse_styles=reuse_styles, projection=projection,
                 is_grid_item=style["display"] == "grid",
             )
-            escapees.append(child_id)
+            sink.append(child_id)
             if style["display"] == "block" and not is_table_row:
                 # Its static position is here, in `element`'s block flow.
                 anchor_id = _static_anchor(
@@ -523,10 +530,9 @@ def _build_block_children(tree, element, style, computed, children, *, computed_
             normal_child_ids.append(child_id)
             normal_entries.append((child, child_style, child_id))
     all_child_ids = normal_child_ids + (own_escapees if is_containing_block else [])
-    if getattr(element, "_chromonic_is_table_root", False):
+    if box_of(element).get("is_table_root", False):
         # CSS 2.1 17.5: the table lays out its own rows and cells.
         plan = table_formatting._TableLayoutPlan(element, computed_cache)
-        element._chromonic_table_plan = plan
         node_id = (projection.upsert(element, style, all_child_ids, plan.measure, ("table", id(plan)), kind="table")
                    if projection else tree.new_table(style, plan.measure, all_child_ids))
         return node_id
@@ -539,9 +545,9 @@ def _build_block_children(tree, element, style, computed, children, *, computed_
 def _build_br_leaf(tree, element, style, *, projection) -> int:
     """Body of build()'s `tag_name == "br"` branch: a zero-width, one-line-height
     strut leaf (CSS 2.1 9.2.2 -- a `<br>` never generates an ordinary block box)."""
-    element.__dict__.pop("_chromonic_inline_plan", None)
-    element._chromonic_inline_fragments = []
-    paint_style = element._chromonic_paint_style
+    box_of(element).pop("inline_plan", None)
+    box_of(element).inline_fragments = []
+    paint_style = box_of(element).paint_style
     font_size = _fontmetrics.parse_length(paint_style.get("font_size"), default=16.0)
     family = paint_style.get("font_family", "") or ""
     if family == "none":
@@ -554,11 +560,7 @@ def _build_br_leaf(tree, element, style, *, projection) -> int:
     line_height = resolved_line_height if resolved_line_height is not None else normal
     style["width"] = 0.0
     style["height"] = line_height
-    # The break's own inline box (Chrome's client rect when it shares a
-    # line with floats -- see the `<br>` branch of `_fix_float_flow_after_block_sibling`).
-    element.__dict__["_chromonic_br_glyph_height"] = ascent + descent
-    element.__dict__.pop("_chromonic_br_flow_bottom", None)  # stale from an earlier pass
-    element._chromonic_text_lines = []
+    box_of(element).text_lines = []
     node_id = (projection.upsert(element, style, [], None, None)
                if projection else tree.new_leaf(style))
     return node_id
@@ -568,8 +570,8 @@ def _build_br_leaf(tree, element, style, *, projection) -> int:
 def _build_replaced_leaf(tree, element, style, tag_name, *, projection) -> int:
     """Body of build()'s img/canvas/svg/iframe branch: a replaced-element leaf sized
     by its own intrinsic-size resolver."""
-    element.__dict__.pop("_chromonic_inline_plan", None)
-    element._chromonic_inline_fragments = []
+    box_of(element).pop("inline_plan", None)
+    box_of(element).inline_fragments = []
     if tag_name == "img":
         replaced_elements._apply_image_intrinsic_size(style, element)
     elif tag_name == "canvas":
@@ -580,8 +582,8 @@ def _build_replaced_leaf(tree, element, style, tag_name, *, projection) -> int:
         replaced_elements._apply_video_intrinsic_size(style, element)
     else:
         replaced_elements._apply_svg_intrinsic_size(style, element)
-    element._chromonic_text_lines = []
-    img_measure = element.__dict__.get("_chromonic_img_measure")
+    box_of(element).text_lines = []
+    img_measure = box_of(element).img_measure
     if img_measure is not None:
         measure, measure_key = img_measure
         node_id = (projection.upsert(element, style, [], measure, measure_key)
@@ -599,21 +601,21 @@ def _build_select_leaf(tree, element, style, *, projection) -> int:
     (a listbox, not a closed dropdown) overrides the height to fit every row
     -- `paint.py`'s `_paint_listbox_rows` does the actual per-row painting;
     this only has to reserve the right box."""
-    element.__dict__.pop("_chromonic_inline_plan", None)
-    element._chromonic_inline_fragments = []
+    box_of(element).pop("inline_plan", None)
+    box_of(element).inline_fragments = []
     rows = replaced_elements._listbox_row_count(element)
-    element._chromonic_listbox_rows = rows
+    box_of(element).listbox_rows = rows
     if rows:
         style["height"] = rows * replaced_elements.LISTBOX_ROW_HEIGHT
     text = replaced_elements._select_display_text(element)
     if text:
-        measure_key = _measure_key(element._chromonic_paint_style, text)
-        measure = (inline_formatting._make_measure(element._chromonic_paint_style, text, element)
+        measure_key = _measure_key(box_of(element).paint_style, text)
+        measure = (inline_formatting._make_measure(box_of(element).paint_style, text, element)
                    if projection is None or projection.measure_changed(element, measure_key) else None)
         node_id = (projection.upsert(element, style, [], measure, measure_key)
                    if projection else tree.new_text_leaf(style, measure))
     else:
-        element._chromonic_text_lines = []
+        box_of(element).text_lines = []
         node_id = (projection.upsert(element, style, [], None, None)
                    if projection else tree.new_leaf(style))
     return node_id
@@ -623,17 +625,17 @@ def _build_select_leaf(tree, element, style, *, projection) -> int:
 def _build_form_control_leaf(tree, element, style, *, projection) -> int:
     """Body of build()'s input/textarea branch: a measured text leaf for its display
     text, or an empty leaf."""
-    element.__dict__.pop("_chromonic_inline_plan", None)
-    element._chromonic_inline_fragments = []
+    box_of(element).pop("inline_plan", None)
+    box_of(element).inline_fragments = []
     text = replaced_elements._form_control_display_text(element)
     if text:
-        measure_key = _measure_key(element._chromonic_paint_style, text)
-        measure = (inline_formatting._make_measure(element._chromonic_paint_style, text, element)
+        measure_key = _measure_key(box_of(element).paint_style, text)
+        measure = (inline_formatting._make_measure(box_of(element).paint_style, text, element)
                    if projection is None or projection.measure_changed(element, measure_key) else None)
         node_id = (projection.upsert(element, style, [], measure, measure_key)
                    if projection else tree.new_text_leaf(style, measure))
     else:
-        element._chromonic_text_lines = []
+        box_of(element).text_lines = []
         node_id = (projection.upsert(element, style, [], None, None)
                    if projection else tree.new_leaf(style))
     return node_id
@@ -643,19 +645,40 @@ def _build_form_control_leaf(tree, element, style, *, projection) -> int:
 def _build_text_leaf(tree, element, style, *, projection) -> int:
     """Body of build()'s final `else` branch (an ordinary element with no recognised
     special handling): a measured text leaf for its own text content, or an empty leaf."""
-    element.__dict__.pop("_chromonic_inline_plan", None)
-    element._chromonic_inline_fragments = []
+    box_of(element).pop("inline_plan", None)
+    box_of(element).inline_fragments = []
     text = dom._own_text(element)
     if text:
-        measure_key = _measure_key(element._chromonic_paint_style, text)
-        measure = (inline_formatting._make_measure(element._chromonic_paint_style, text, element)
+        measure_key = _measure_key(box_of(element).paint_style, text)
+        measure = (inline_formatting._make_measure(box_of(element).paint_style, text, element)
                    if projection is None or projection.measure_changed(element, measure_key) else None)
         # An inline node, not a bare leaf: its lines are laid against the
         # block formatting context's float bands (CSS 2.1 9.5).
         node_id = (projection.upsert(element, style, [], measure, measure_key, kind="inline")
                    if projection else tree.new_inline(style, measure, []))
+    elif (getattr(box_of(element).computed_style, "display", "") or "").strip().lower() == "list-item":
+        # An empty list item still has its marker's line box, and so a
+        # baseline one line-ascent below its content top
+        # (empty-cells-applies-to-003.xht).
+        box_of(element).text_lines = []
+        paint_style = box_of(element).paint_style or {}
+        family = "" if paint_style.get("font_family") in (None, "none") else paint_style["font_family"]
+        font_size = _fontmetrics.parse_length(paint_style.get("font_size"), default=16.0)
+        ascent, descent, normal = fonts.text_metrics(
+            family, font_size, inline_formatting._parse_font_weight(paint_style.get("font_weight")) >= 600,
+            fonts.is_italic(paint_style.get("font_style")))
+        line_height = inline_formatting._resolved_line_height(paint_style.get("line_height"))
+        line_height = normal if line_height is None else line_height
+        baseline = ascent + math.floor((line_height - ascent - descent) / 2)
+
+        def measure(_w, _h, _kw=None, _kh=None, baseline=baseline):
+            return (0.0, 0.0, baseline, baseline)
+
+        measure_key = ("list-item-marker", baseline)
+        node_id = (projection.upsert(element, style, [], measure, measure_key)
+                   if projection else tree.new_text_leaf(style, measure))
     else:
-        element._chromonic_text_lines = []
+        box_of(element).text_lines = []
         node_id = (projection.upsert(element, style, [], None, None)
                    if projection else tree.new_leaf(style))
     return node_id
@@ -679,14 +702,32 @@ def build(
     a non-containing-block descendant's absolutely-positioned child is
     added to that list instead of its literal parent's Taffy children.
     An intermediate position:static element passes `escapees` straight through."""
-    element.__dict__.pop("_chromonic_flattened_inline", None)  # given a box of its own this pass
+    box_of(element).pop("flattened_inline", None)  # given a box of its own this pass
     if computed_cache is None:
         computed_cache = {}
     if computed is None or style_obj is None:
         computed, style_obj = dom._describe(element, computed_cache, reuse_styles=reuse_styles)
-    style = getattr(element, "_chromonic_native_style", None) if reuse_styles else None
+    style = box_of(element).native_style if reuse_styles else None
     if style is None:
         style = style_bridge.to_dict(style_obj)
+        if style.get("position") == "absolute":
+            # CSS 2.1 10.3.7/10.6.4: an absolutely positioned box's auto
+            # margins absorb free space only when both insets and the size on
+            # that axis are all non-auto; otherwise they are 0. (Taffy would
+            # spread the space into them and centre the box -- abspos-009.xht.)
+            inset = style.get("inset") or ["auto"] * 4
+            margin = list(style.get("margin") or [0.0] * 4)
+            if "auto" in (inset[1], inset[3], style.get("width")):
+                margin[1] = 0.0 if margin[1] == "auto" else margin[1]
+                margin[3] = 0.0 if margin[3] == "auto" else margin[3]
+            if "auto" in (inset[0], inset[2], style.get("height")):
+                margin[0] = 0.0 if margin[0] == "auto" else margin[0]
+                margin[2] = 0.0 if margin[2] == "auto" else margin[2]
+            style["margin"] = margin
+        # CSS 2.1 9.10: Taffy's block and flex layout place children
+        # right-to-left in an rtl box.
+        if dom._element_direction(element, computed) == "rtl":
+            style["direction"] = "rtl"
         # HTML's legacy alignment (`<center>`, `align=`): Taffy's block
         # layout also aligns narrower child blocks by it.
         legacy_align = {"-webkit-center": "legacy-center", "-moz-center": "legacy-center",
@@ -735,7 +776,7 @@ def build(
                     style["grid_row"] = row
                 if col != (None, None):
                     style["grid_column"] = col
-        element._chromonic_native_style = style
+        box_of(element).native_style = style
     if False and is_grid_item and style["min_width"] == "auto":
         # Disabled -- predates `flex_grid._is_flex_or_grid_item` excluding flex/grid
         # items from the generic width:auto->pct(1.0) substitution; forcing 0
@@ -748,7 +789,7 @@ def build(
         # content size regardless of main-axis width/height --
         # flexbox-flex-basis-content-001a.html. Taffy has no `content`
         # keyword; the main-axis size is cleared so auto measures content.
-        parent_native = (dom._layout_parent(element).__dict__.get("_chromonic_native_style") or {})
+        parent_native = (box_of(dom._layout_parent(element)).native_style or {})
         if parent_native.get("display") == "flex":
             main = "height" if (parent_native.get("flex_direction") or "row").startswith("column") else "width"
             style["flex_basis"] = "auto"
@@ -757,7 +798,7 @@ def build(
         # CSS Flexbox 9.2.3 B: a percentage flex-basis against an indefinite
         # main size is treated as content, ignoring the item's own height
         # for its base size -- flex-basis-010.html.
-        parent_native = (dom._layout_parent(element).__dict__.get("_chromonic_native_style") or {})
+        parent_native = (box_of(dom._layout_parent(element)).native_style or {})
         if (parent_native.get("display") == "flex"
                 and (parent_native.get("flex_direction") or "row").startswith("column")
                 and parent_native.get("height") == "auto"):
@@ -765,7 +806,7 @@ def build(
             style["height"] = "auto"
     own_escapees = [] if is_containing_block else escapees
     tag_name = (getattr(element, "tagName", "") or "").lower()
-    element._chromonic_tag_name = tag_name
+    box_of(element).tag_name = tag_name
     is_genuinely_inline = (
         tag_name not in box_model._REPLACED_OR_CONTROL_TAGS
         and getattr(style_obj.display, "value", "") == "inline"
@@ -857,16 +898,17 @@ def build(
                 kind = "body"
             (header if kind == "header" else footer if kind == "footer" else body).append(entry)
         children = captions_top + header + body + footer + captions_bottom
-        element._chromonic_table_bottom_captions = [entry[0] for entry in captions_bottom]
-        element._chromonic_table_captions = [entry[0] for entry in captions_top + captions_bottom]
-    if is_table_row and getattr(element, "_chromonic_row_rtl", False):
-        children = children[::-1]  # see the `is_table_row` branch above
-    element._chromonic_has_layout_children = bool(children)
+        box_of(element).table_bottom_captions = [entry[0] for entry in captions_bottom]
+        box_of(element).table_captions = [entry[0] for entry in captions_top + captions_bottom]
+        box_of(element).table_sections = [
+            entry[0] for entry in header + body + footer
+            if table_layout._row_group_kind((getattr(entry[0], "tagName", "") or "").lower(), entry[1]) is not None]
+    box_of(element).has_layout_children = bool(children)
     # Replaced/control elements run their own dedicated branch below -- CSS
     # generated content doesn't apply to them.
     has_pseudo = tag_name not in dom._NO_GENERATED_CONTENT_TAGS and (
-        getattr(element, "_chromonic_before_pseudo", None) is not None
-        or getattr(element, "_chromonic_after_pseudo", None) is not None
+        box_of(element).before_pseudo is not None
+        or box_of(element).after_pseudo is not None
     )
     # CSS 2.1 17.2.1: a table/row-group/row never formats inline content of
     # its own -- loose text/inline children get wrapped into an anonymous
@@ -905,7 +947,9 @@ def build(
             escapees=escapees, own_escapees=own_escapees, is_containing_block=is_containing_block,
             reuse_styles=reuse_styles, projection=projection, node_map=node_map,
         )
-    elif children:
+    elif children or is_table_root:
+        # A table is a table node even with no rows (a table of only
+        # `<col>`s still has their widths -- table-column-rendering-001.xht).
         node_id = _build_block_children(
             tree, element, style, computed, children, computed_cache=computed_cache,
             is_containing_block=is_containing_block, is_table_row=is_table_row,
@@ -929,10 +973,10 @@ def build(
     else:
         node_id = _build_text_leaf(tree, element, style, projection=projection)
 
-    if box_model._is_absolutely_positioned(style_obj) and element.__dict__.pop("_chromonic_static_anchored", None):
+    if box_model._is_absolutely_positioned(style_obj) and box_of(element).pop("static_anchored", None):
         # Re-linked by the caller if this box still escapes its static parent.
         tree.set_static_anchor(node_id, None)
-    element.__dict__["_chromonic_node_id"] = node_id
+    box_of(element).node_id = node_id
     node_map[node_id] = element
     return node_id
 

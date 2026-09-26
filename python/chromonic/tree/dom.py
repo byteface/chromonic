@@ -8,6 +8,7 @@ from domonic.style import ComputedStyleDeclaration
 
 from .. import fonts
 from . import anonymous_boxes, box_model, inline_formatting
+from .box import box_of
 
 
 
@@ -20,7 +21,7 @@ TEXT_NODE = 3
 def _layout_parent(node):
     """`node`'s parent *box* -- its anonymous table wrapper when CSS 2.1
     17.2.1 generated one around it this pass, else its real DOM parent."""
-    anonymous = node.__dict__.get("_chromonic_anonymous_parent") if hasattr(node, "__dict__") else None
+    anonymous = box_of(node).anonymous_parent if hasattr(node, "__dict__") else None
     return anonymous if anonymous is not None else getattr(node, "parentElement", None)
 
 
@@ -29,7 +30,7 @@ class _PseudoElement:
     """A ::before/::after generated box -- not a real DOM node, just enough
     surface for build()/paint.py to treat it like a childless element.
     Never appears in real childNodes -- reached only via
-    `_inline_mixed_content`'s synthesized items and _chromonic_inline_fragments."""
+    `_inline_mixed_content`'s synthesized items and box.inline_fragments."""
 
     def __init__(self, owner, which):
         self.owner = owner
@@ -56,7 +57,7 @@ class _PseudoElement:
 
 
 def _get_pseudo_object(element, which: str) -> "_PseudoElement":
-    cache = element.__dict__.setdefault("_chromonic_pseudo_objs", {})
+    cache = box_of(element).setdefault("pseudo_objs", {})
     obj = cache.get(which)
     if obj is None:
         obj = cache[which] = _PseudoElement(element, which)
@@ -115,7 +116,7 @@ class _StringTextNode:
 
 
 def _with_string_text_nodes(element, args):
-    cache = element.__dict__.setdefault("_chromonic_string_text_nodes", {})
+    cache = box_of(element).setdefault("string_text_nodes", {})
     nodes = []
     seen = set()
     for index, node in enumerate(args):
@@ -147,7 +148,7 @@ def _element_direction(element, computed=None) -> str:
     self-contradictory case of also writing `direction:ltr` on a
     `dir="rtl"` attribute."""
     if computed is None:
-        computed = getattr(element, "_chromonic_computed_style", None)
+        computed = box_of(element).computed_style
     resolved = (getattr(computed, "direction", "ltr") or "ltr").strip().lower() if computed is not None else "ltr"
     if resolved == "rtl":
         return "rtl"
@@ -160,6 +161,21 @@ def _element_direction(element, computed=None) -> str:
         node = getattr(node, "parentElement", None)
     return resolved
 
+
+
+_WHITE_SPACE_VALUES = frozenset({"normal", "pre", "nowrap", "pre-wrap", "pre-line", "break-spaces"})
+
+
+def _white_space(value) -> str:
+    """A computed `white-space`, with the old vendor spellings pages list
+    as fallbacks (`-o-pre-wrap`, `-moz-pre-wrap`, `-pre-wrap`) read as
+    `pre-wrap`: a browser drops those as invalid and keeps the earlier
+    `pre-wrap`, but domonic keeps whichever came last (python.org's code
+    sample). Anything else unknown is the initial value."""
+    text = (value or "normal").strip().lower()
+    if text.endswith("pre-wrap"):
+        return "pre-wrap"
+    return text if text in _WHITE_SPACE_VALUES else "normal"
 
 
 def _extract_paint_style(computed) -> dict:
@@ -199,7 +215,7 @@ def _extract_paint_style(computed) -> dict:
         "letter_spacing": computed.getPropertyValue("letter-spacing"),
         "word_spacing": computed.getPropertyValue("word-spacing"),
         "line_height": computed.getPropertyValue("line-height"),
-        "white_space": computed.getPropertyValue("white-space"),
+        "white_space": _white_space(computed.getPropertyValue("white-space")),
         "word_break": computed.getPropertyValue("word-break") or "normal",
         "overflow_wrap": computed.getPropertyValue("overflow-wrap") or "normal",
         "text_align": box_model._text_align(computed.getPropertyValue("text-align")),
@@ -308,7 +324,7 @@ def _describe(element, computed_cache=None, *, reuse_styles=False):
     between, don't re-resolve either.
 
     reuse_styles=True skips resolving CSS entirely if a prior resolution
-    (element._chromonic_resolved_style) exists, reusing it as-is -- CSS
+    (box_of(element).resolved_style) exists, reusing it as-is -- CSS
     resolution, not Taffy, dominates relayout cost, so a relayout
     triggered by something that can't have changed any element's
     class/inline-style/stylesheets (an image arriving, a same-bucket
@@ -322,17 +338,17 @@ def _describe(element, computed_cache=None, *, reuse_styles=False):
     if cached is not None:
         return cached
 
-    synthetic = element.__dict__.get("_chromonic_synthetic_style") if hasattr(element, "__dict__") else None
+    synthetic = box_of(element).synthetic_style if hasattr(element, "__dict__") else None
     if synthetic is not None:
         # An anonymous table box (_AnonymousTableBox): no cascade to run,
         # its style was synthesized from its parent's when generated.
-        element._chromonic_computed_style = synthetic[0]
-        element._chromonic_resolved_style = synthetic
+        box_of(element).computed_style = synthetic[0]
+        box_of(element).resolved_style = synthetic
         cache[id(element)] = synthetic
         return synthetic
 
     if reuse_styles:
-        prior = getattr(element, "_chromonic_resolved_style", None)
+        prior = box_of(element).resolved_style
         if prior is not None:
             cache[id(element)] = prior
             return prior
@@ -346,18 +362,18 @@ def _describe(element, computed_cache=None, *, reuse_styles=False):
     # would build a second, separate ComputedStyleDeclaration for it.
     chain_cache[id(element)] = computed
     style_obj = LayoutStyle.from_computed(computed)
-    element._chromonic_computed_style = computed
-    element._chromonic_paint_style = _extract_paint_style(computed)
-    (element._chromonic_before_text, element._chromonic_after_text,
-     element._chromonic_before_pseudo, element._chromonic_after_pseudo) = _extract_generated_content(element, cache)
+    box_of(element).computed_style = computed
+    box_of(element).paint_style = _extract_paint_style(computed)
+    (box_of(element).before_text, box_of(element).after_text,
+     box_of(element).before_pseudo, box_of(element).after_pseudo) = _extract_generated_content(element, cache)
     from .. import webfonts
-    webfonts.resolve_style(element, element._chromonic_paint_style)
+    webfonts.resolve_style(element, box_of(element).paint_style)
     # Give Parley and Skia the same platform choice for CSS monospace.
-    family = element._chromonic_paint_style["font_family"]
+    family = box_of(element).paint_style["font_family"]
     if family and family.strip().lower() in ("monospace", "ui-monospace"):
-        element._chromonic_paint_style["font_family"] = fonts._GENERIC_FAMILIES[family.strip().lower()]
+        box_of(element).paint_style["font_family"] = fonts._GENERIC_FAMILIES[family.strip().lower()]
     result = (computed, style_obj)
-    element._chromonic_resolved_style = result
+    box_of(element).resolved_style = result
     cache[id(element)] = result
     return result
 
@@ -432,12 +448,12 @@ def _child_elements(element, computed_cache=None, *, reuse_styles=False) -> list
 
 def _clear_stale_layout_geometry(element) -> None:
     """`element` just resolved to display:none -- clear its (and its
-    subtree's) _layout_box/_chromonic_inline_fragments rather than leaving
+    subtree's) _layout_box/box.inline_fragments rather than leaving
     them from whenever it last rendered, or paint_tree/hit-testing/
     getBoundingClientRect() (which walk the real DOM, not node_map) keep
     reading it as still having a box."""
     element.__dict__.pop("_layout_box", None)
-    element.__dict__.pop("_chromonic_inline_fragments", None)
+    box_of(element).pop("inline_fragments", None)
     for child in _child_nodes(element):
         if _is_element(child):
             _clear_stale_layout_geometry(child)
@@ -462,11 +478,11 @@ def _own_text(element) -> str:
     # not raw .textContent, since a "childless" element can still have a
     # <style>/<script> descendant whose raw source text isn't real prose.
     text = (
-        getattr(element, "_chromonic_before_text", "")
+        box_of(element).get("before_text", "")
         + _rendering_text_content(element)
-        + getattr(element, "_chromonic_after_text", "")
+        + box_of(element).get("after_text", "")
     )
-    style = element.__dict__.get("_chromonic_paint_style", {})
+    style = box_of(element).get("paint_style", {})
     text = _apply_text_transform(text, style.get("text_transform"))
     if style.get("white_space") in ("pre", "pre-wrap", "break-spaces"):
         return text

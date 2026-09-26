@@ -7,6 +7,7 @@ from myjs import Page
 from chromonic import browser, paint, tree
 from chromonic.native_browser import TOOLBAR, View
 from chromonic import ua_style
+from chromonic.tree.box import box_of
 
 
 def loader(url):
@@ -318,7 +319,7 @@ def test_display_list_tests_children_independently_of_parent_box():
     child = parent.childNodes[0]
     parent.set_layout_box(LayoutBox(x=0, y=-100, width=20, height=10))
     child.set_layout_box(LayoutBox(x=0, y=10, width=20, height=10))
-    parent._chromonic_paint_style = child._chromonic_paint_style = {
+    box_of(parent).paint_style = box_of(child).paint_style = {
         'background_color': 'transparent', 'border_top_color': 'black',
         'color': 'black', 'font_size': '16px', 'font_weight': '400',
         'font_style': 'normal', 'font_family': 'sans-serif',
@@ -401,7 +402,7 @@ def test_projection_detects_in_place_cached_native_style_changes():
     box = page.document.getElementById('box')
     node = view.layout_projection.nodes[id(box)]
 
-    box._chromonic_native_style['width'] = 125.0
+    box_of(box).native_style['width'] = 125.0
     view.relayout(reuse_styles=True)
 
     assert view.layout_projection.nodes[id(box)] == node

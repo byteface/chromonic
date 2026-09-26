@@ -7,7 +7,7 @@ from domonic.layout import LayoutBox
 
 from .. import fonts, style_bridge
 from . import anonymous_boxes, box_model, dom, flex_grid, geometry, inline_formatting, positioning
-
+from .box import box_of
 
 
 
@@ -29,65 +29,6 @@ def _merge_adjacent_same_line_rects(rects) -> list:
 
 
 
-def _resync_interruption_marker_heights(node_map: dict) -> None:
-    """`_finalize_inline_owner_boxes` builds each CSS 2.1 9.2.1.1
-    interruption marker's rect from its block's `_layout_box` height at
-    that point in the pipeline -- before the float-auto-height corrections
-    (`_fix_float_flow_container_auto_height`/`_fix_nested_bfc_float_auto_height`,
-    both run after `_publish_inline_formatting`) have zeroed out a
-    float-only block's contribution (CSS 2.1 9.5: a float doesn't
-    contribute to auto-height). That pre-correction, float-inflated
-    height got baked into the marker and the owner's bounding box.
-
-    Patches each marker rect's height back in sync with the block's real
-    final height, and re-derives the owner's bounding box the same way
-    `_finalize_inline_owner_boxes` first did -- idempotent. A nested split
-    wrapper never appears in `node_map` itself -- reached the same way
-    `_fix_nested_split_flow_extent` reaches it, via each interruption
-    block's `_chromonic_split_wrapper_ref` back-reference."""
-    seen_ids: set = set()
-    for node in list(node_map.values()) + [
-        node.__dict__.get("_chromonic_split_wrapper_ref")
-        for node in node_map.values()
-        if dom._is_element(node) and node.__dict__.get("_chromonic_split_wrapper_ref") is not None
-    ]:
-        if not dom._is_element(node) or id(node) in seen_ids:
-            continue
-        seen_ids.add(id(node))
-        owner = node
-        marker_positions = owner.__dict__.get("_chromonic_marker_positions")
-        rects = owner.__dict__.get("_chromonic_inline_boxes")
-        if not marker_positions or rects is None:
-            continue
-        rects = list(rects)
-        changed = False
-        for index, blocks in marker_positions:
-            if index >= len(rects):
-                continue
-            boxes = [block.__dict__.get("_layout_box") for block in blocks]
-            if any(box is None for box in boxes):
-                continue
-            total_height = sum(box.height for box in boxes)
-            old = rects[index]
-            if abs(old[3] - total_height) > 0.01:
-                rects[index] = (old[0], old[1], old[2], total_height)
-                changed = True
-        if not changed:
-            continue
-        owner.__dict__["_chromonic_inline_boxes"] = rects
-        # Same all-degenerate fallback as `_finalize_inline_owner_boxes` --
-        # kept in sync here since this can be the pass that makes every
-        # rect degenerate (a float-only marker zeroing out).
-        bounding_rects = [r for r in rects if r[2] != 0.0 and r[3] != 0.0] or rects[-1:]
-        left = min(r[0] for r in bounding_rects); top = min(r[1] for r in bounding_rects)
-        right = max(r[0] + r[2] for r in bounding_rects); bottom = max(r[1] + r[3] for r in bounding_rects)
-        owner.__dict__["_layout_box"] = LayoutBox(
-            x=left, y=top, width=right - left, height=bottom - top,
-            client_width=right - left, client_height=bottom - top,
-        )
-
-
-
 def _inline_relative_offset(owner, stop, container_box) -> "tuple[float, float]":
     """The CSS 2.1 9.4.3 offset a fragment owned by `owner` carries from
     every `position: relative` inline between it and the plan element
@@ -97,7 +38,7 @@ def _inline_relative_offset(owner, stop, container_box) -> "tuple[float, float]"
     dx = dy = 0.0
     node = owner
     while node is not None and node is not stop and dom._is_element(node):
-        resolved = getattr(node, "_chromonic_resolved_style", None)
+        resolved = box_of(node).resolved_style
         if resolved is not None and _is_flattened_inline(node):
             style_obj = resolved[1]
             position = getattr(style_obj.position, "value", style_obj.position)
@@ -141,7 +82,7 @@ def _is_flattened_inline(element) -> bool:
     (abspos-027.xht's cell lost its real box to its text's union)."""
     if not dom._is_element(element) or isinstance(element, anonymous_boxes._AnonymousTableBox):
         return False
-    return bool(element.__dict__.get("_chromonic_flattened_inline"))
+    return bool(box_of(element).flattened_inline)
 
 
 
@@ -149,8 +90,8 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
     """Merge each inline owner's accumulated fragment rects -- gathered
     across every `_InlineFormattingPlan` that published fragments for it
     (CSS 2.1 9.2.1.1's split contributes from multiple independent plans
-    belonging to the same owner) -- into its final _chromonic_inline_boxes/
-    _layout_box/_chromonic_owned_fragments, once per owner per pass.
+    belonging to the same owner) -- into its final box.inline_boxes/
+    _layout_box/box.owned_fragments, once per owner per pass.
 
     Rects are grouped by split segment (run["split_group"]) rather than
     merged as one re-sorted list -- getClientRects() preserves document
@@ -162,7 +103,7 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
     # An inline wrapper flattened into the plan with no text of its own is
     # never a fragment owner, so it would get no box at all -- Chrome
     # reports its descendants' union -- abspos-inline-003.xht. It borrows
-    # its descendants' rects here; _chromonic_native_style set means the
+    # its descendants' rects here; box.native_style set means the
     # element has a real Taffy box already and stops the walk.
     for key, (owner, groups, _fragments, outer_groups) in list(owner_accum.items()):
         if not groups:
@@ -241,15 +182,15 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
         # wrapping the interrupting block, not the block's own (possibly
         # narrower) box. It's width:auto, 100% of owner's containing
         # block, on top of the real leading/trailing fragments.
-        interruption_blocks = getattr(owner, "_chromonic_interruption_blocks", None) or ()
+        interruption_blocks = box_of(owner).interruption_blocks or ()
         if interruption_blocks:
-            container = getattr(owner, "_chromonic_split_container", None)
+            container = box_of(owner).split_container
             container_box = container.__dict__.get("_layout_box") if container is not None else None
-            cpt, cpr, cpb, cpl = (container.__dict__.get("_chromonic_padding", (0.0,) * 4)
+            cpt, cpr, cpb, cpl = (box_of(container).get("padding", (0.0,) * 4)
                                   if container is not None else (0.0,) * 4)
             group_keys = sorted(groups, key=lambda key: (key is not None, key))
             merged_groups = [_merge_adjacent_same_line_rects(groups[key]) for key in group_keys]
-            self_edges = getattr(owner, "_chromonic_split_self_edges", None)
+            self_edges = box_of(owner).split_self_edges
             self_left, self_right, self_top = self_edges or (0.0, 0.0, 0.0)
             if self_edges and merged_groups:
                 # `owner` is a real Taffy node here (the direct-child split
@@ -339,11 +280,11 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
                     elif block_box is not None:
                         final_rects.append((block_box.x, block_box.y, block_box.width, 0.0))
                         marker_positions.append([len(final_rects) - 1, [block]])
-            owner.__dict__["_chromonic_inline_boxes"] = final_rects
-            owner.__dict__["_chromonic_marker_positions"] = marker_positions
+            box_of(owner).inline_boxes = final_rects
+            box_of(owner).marker_positions = marker_positions
             all_merged = final_rects  # the block interruption also grows getBoundingClientRect()
         else:
-            owner.__dict__["_chromonic_inline_boxes"] = all_merged
+            box_of(owner).inline_boxes = all_merged
         # getBoundingClientRect() unions every getClientRects() rect except
         # zero-width/height ones -- all_merged/final_rects themselves stay
         # unfiltered; only the union bounds here drop them. When every rect
@@ -357,10 +298,10 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
             x=left, y=top, width=right-left, height=bottom-top,
             client_width=right-left, client_height=bottom-top,
         )
-        owner._chromonic_has_layout_children = True
+        box_of(owner).has_layout_children = True
         # Text-range fragments stay scoped to this owner's own direct text,
         # never unioned across a nested element boundary.
-        owner._chromonic_owned_fragments = fragments
+        box_of(owner).owned_fragments = fragments
 
 
 
@@ -373,15 +314,15 @@ def _publish_inline_formatting(node_map) -> None:
         if id(element) in seen:
             continue
         seen.add(id(element))
-        plan = getattr(element, "_chromonic_inline_plan", None)
+        plan = box_of(element).inline_plan
         box = element.__dict__.get("_layout_box")
         if plan is not None and box is not None:
-            plan.publish(box, element.__dict__.get("_chromonic_padding", (0.0,) * 4),
+            plan.publish(box, box_of(element).get("padding", (0.0,) * 4),
                          owner_accum, element_fragments_accum)
     _finalize_inline_owner_boxes(owner_accum)
     _fix_split_inline_relative_offset(entry[0] for entry in owner_accum.values())
     for element, fragments in element_fragments_accum.values():
-        element._chromonic_inline_fragments = fragments
+        box_of(element).inline_fragments = fragments
 
 
 
@@ -396,15 +337,15 @@ def _fix_split_inline_relative_offset(owners) -> None:
     Takes the owners `_finalize_inline_owner_boxes` just published rather
     than walking `node_map` -- a nested split wrapper never appears there."""
     for owner in owners:
-        interruption_blocks = getattr(owner, "_chromonic_interruption_blocks", None)
+        interruption_blocks = box_of(owner).interruption_blocks
         if not interruption_blocks:
             continue
-        container = getattr(owner, "_chromonic_split_container", None)
-        native = getattr(owner, "_chromonic_native_style", None)
+        container = box_of(owner).split_container
+        native = box_of(owner).native_style
         container_box = container.__dict__.get("_layout_box") if container is not None else None
         if container_box is None or native is None:
             continue
-        cpt, cpr, cpb, cpl = container.__dict__.get("_chromonic_padding", (0.0,) * 4)
+        cpt, cpr, cpb, cpl = box_of(container).get("padding", (0.0,) * 4)
         basis_width = container_box.client_width - cpl - cpr
         basis_height = container_box.client_height - cpt - cpb
         top, right, bottom, left = native.get("inset") or ("auto",) * 4
@@ -419,12 +360,12 @@ def _fix_split_inline_relative_offset(owners) -> None:
         box = owner.__dict__.get("_layout_box")
         if box is not None:
             owner.__dict__["_layout_box"] = dataclasses.replace(box, x=box.x + dx, y=box.y + dy)
-        inline_boxes = owner.__dict__.get("_chromonic_inline_boxes")
+        inline_boxes = box_of(owner).inline_boxes
         if inline_boxes:
-            owner.__dict__["_chromonic_inline_boxes"] = [
+            box_of(owner).inline_boxes = [
                 (rx + dx, ry + dy, rw, rh) for rx, ry, rw, rh in inline_boxes
             ]
-        for fragment in getattr(owner, "_chromonic_owned_fragments", None) or ():
+        for fragment in box_of(owner).owned_fragments or ():
             fbox = fragment.__dict__.get("_layout_box")
             if fbox is not None:
                 fragment._layout_box = dataclasses.replace(fbox, x=fbox.x + dx, y=fbox.y + dy)
@@ -433,41 +374,3 @@ def _fix_split_inline_relative_offset(owners) -> None:
 
 
 
-def _fix_nested_split_flow_extent(node_map: dict) -> None:
-    """A nested CSS 2.1 9.2.1.1 split wrapper (never a real Taffy node)
-    still gets a `_layout_box` published -- the visual union of every
-    generated fragment, border/padding decoration included, which can be
-    taller than the real vertical space those fragments occupy in
-    ordinary block flow. An ancestor's auto-height must not read it directly.
-
-    Computes a second, decoration-free box instead -- the real block-flow
-    extent: the interruption blocks' final top/bottom edges, extended by
-    whichever edge fragments contributed real flow height. Ordinary
-    sequential stacking, so it can't overlap; `_adjust_body_collapsed_margins`
-    prefers this when present."""
-    seen_wrappers: set = set()
-    for node in node_map.values():
-        if not dom._is_element(node):
-            continue
-        element = node.__dict__.get("_chromonic_split_wrapper_ref")
-        if element is None or id(element) in seen_wrappers:
-            continue
-        seen_wrappers.add(id(element))
-        container = getattr(element, "_chromonic_split_container", None)
-        if container is None or container is element:
-            continue  # the "wrapper is container" case already has a real, accurate Taffy box
-        blocks = getattr(element, "_chromonic_interruption_blocks", None)
-        if not blocks:
-            continue
-        first_box = blocks[0].__dict__.get("_layout_box")
-        last_box = blocks[-1].__dict__.get("_layout_box")
-        if first_box is None or last_box is None:
-            continue
-        edge_heights = getattr(element, "_chromonic_split_edge_flow_height", None) or {}
-        flow_top = first_box.y - edge_heights.get("leading", 0.0)
-        flow_bottom = last_box.y + last_box.height + edge_heights.get("trailing", 0.0)
-        element._chromonic_flow_extent_box = LayoutBox(
-            x=first_box.x, y=flow_top, width=first_box.width,
-            height=max(0.0, flow_bottom - flow_top),
-            client_width=first_box.width, client_height=max(0.0, flow_bottom - flow_top),
-        )

@@ -9,6 +9,7 @@ from domonic.layout import LayoutBox, LayoutStyle, Length, _parse_length_or_perc
 from .. import fonts, style_bridge
 from .._native import layout_text
 from . import anonymous_boxes, box_model, dom, geometry, inline_finalize
+from .box import box_of
 
 
 
@@ -29,7 +30,7 @@ class _InlineFormattingPlan:
         # run stays untouched, no full bidi). `element` is the block
         # establishing this formatting context, so its own computed
         # direction governs every plan built for it, split or not.
-        computed = getattr(element, "_chromonic_computed_style", None)
+        computed = box_of(element).computed_style
         self.rtl = dom._element_direction(element, computed) == "rtl"
         # text-align/text-align-last inherit normally -- `element`'s
         # computed value already reflects whatever ancestor declared it.
@@ -58,7 +59,8 @@ class _InlineFormattingPlan:
         self._atomic_info = {info[0]: info for info in atomics}
         self._placed_floats = {k: (x, y) for k, x, y in placed_floats}
         width = float(available_width or 0.0)
-        if width < 0:
+        min_content_probe = width < 0
+        if min_content_probe:
             # src/lib.rs's MinContent sentinel: lay out at ~zero width so
             # every break opportunity is taken.
             width = 1.0
@@ -369,7 +371,7 @@ class _InlineFormattingPlan:
                 (run, text, x, y, token_width, 0.0, leading, trailing, advance_width)
                 for run, text, x, y, token_width, _token_height, leading, trailing, advance_width in placed
             ]
-        if owns_bfc and getattr(self.element, "_chromonic_tag_name", None) != "body":
+        if owns_bfc and box_of(self.element).tag_name != "body":
             # CSS 2.1 10.6.7: this node is the root of its block formatting
             # context, so its auto height reaches the bottom of its floats.
             # (`<body>` is the tree's root here but not a BFC root in CSS.)
@@ -377,8 +379,12 @@ class _InlineFormattingPlan:
                 metrics = self._atomic_metrics.get(k)
                 if metrics is not None:
                     self.height = max(self.height, fy + metrics["extent"])
-        content_width = min(width, max(
-            (px + advance for _r, _t, px, _y, _pw, _h, _l, _tr, advance in placed), default=0.0))
+        # Trailing white space hangs past the line end (CSS Text 3 4.1.2).
+        widest_line = max((px + advance - (run.get("space_width", 0.0) if text[-1:].isspace() else 0.0)
+                           for run, text, px, _y, _pw, _h, _l, _tr, advance in placed), default=0.0)
+        # A min-content probe's answer is its widest unbreakable piece, which
+        # overflows the ~zero probe width -- not the probe width itself.
+        content_width = widest_line if min_content_probe else min(width, widest_line)
         # An explicit physical text-align:left overrides direction:rtl's
         # default right-mirroring -- CSS 2.1 9.10's initial `start` value
         # resolves to "right" for rtl, not `left`.
@@ -397,7 +403,7 @@ class _InlineFormattingPlan:
             # (this plan's own bidi-box-model build already threaded it
             # correctly there -- see `_make_inline_formatting_plan`), to
             # avoid double-counting it.
-            is_final_segment = getattr(self, "_chromonic_final_split_fragment", True)
+            is_final_segment = box_of(self).get("final_split_fragment", True)
             last_index_for_owner: dict = {}
             for i, entry in enumerate(placed):
                 last_index_for_owner[id(entry[0].get("owner"))] = i
@@ -407,7 +413,7 @@ class _InlineFormattingPlan:
                 margin_end = run.get("margin_end", 0.0)
                 if (not margin_end and not run.get("_bidi_margin_resolved") and is_final_segment
                         and index == last_index_for_owner.get(id(run.get("owner")))):
-                    owner_style = getattr(run.get("owner"), "_chromonic_native_style", None) or {}
+                    owner_style = box_of(run.get("owner")).native_style or {}
                     owner_margin = owner_style.get("margin") or (0.0, 0.0, 0.0, 0.0)
                     margin_end = box_model._numeric_edge(owner_margin[1])
                 line_left, line_right = self._line_bands.get(y, (0.0, width))
@@ -610,7 +616,7 @@ class _InlineFormattingPlan:
         # A table cell's vertical-align moves its content down
         # (`table_formatting` sets the offset; Rust moves the atomic boxes).
         origin_y = (box.y + box.border_top + padding[0]
-                    + float(self.element.__dict__.get("_chromonic_content_offset_y", 0.0) or 0.0))
+                    + float(box_of(self.element).get("content_offset_y", 0.0) or 0.0))
         escapee_positions = getattr(self, "_escapee_positions", None)
         if escapee_positions:
             # A later pass applies each escapee's real page-coordinate
@@ -619,7 +625,7 @@ class _InlineFormattingPlan:
                 if run.get("escapee"):
                     position = escapee_positions.get(id(run["element"]))
                     if position is not None:
-                        run["element"]._chromonic_static_position = (
+                        box_of(run["element"]).static_position = (
                             None if position[0] is None else origin_x + position[0], origin_y + position[1])
         self.fragments = []
         owner_rects = {}
@@ -654,10 +660,10 @@ class _InlineFormattingPlan:
             elif entry is None:
                 fragment = anonymous_boxes._AnonymousTextFragment(run["source"], self.element)
                 fragment.owner = run["owner"]
-                fragment._chromonic_paint_style = run["paint_style"]
-                fragment._chromonic_text_lines = [text]
-                fragment._chromonic_text_line_widths = [visual_width]
-                fragment._chromonic_line_height = glyph_height
+                box_of(fragment).paint_style = run["paint_style"]
+                box_of(fragment).text_lines = [text]
+                box_of(fragment).text_line_widths = [visual_width]
+                box_of(fragment).line_height = glyph_height
                 # CSS 2.1 9.4.3: a position:relative inline moves its
                 # fragments by its offsets, layout otherwise untouched --
                 # position-relative-002.xht.
@@ -670,11 +676,11 @@ class _InlineFormattingPlan:
                 grouped[key] = fragment
                 self.fragments.append(fragment)
             else:
-                entry._chromonic_text_lines[0] += text
+                box_of(entry).text_lines[0] += text
                 old = entry._layout_box
                 rel_dx, _rel_dy = inline_finalize._inline_relative_offset(run["owner"], self.element, box)
                 combined_width = origin_x + x + rel_dx + visual_width - old.x
-                entry._chromonic_text_line_widths[0] = combined_width
+                box_of(entry).text_line_widths[0] = combined_width
                 entry._layout_box = LayoutBox(
                     x=old.x, y=old.y, width=combined_width, height=old.height,
                     client_width=combined_width, client_height=old.client_height,
@@ -750,7 +756,7 @@ class _InlineFormattingPlan:
                 # baseline -- not the line box: Chrome reports a `<br>` in
                 # `font: 20px/1 serif` as 23px tall starting 2px above its
                 # 20px line (separated-border-model-004a.xht).
-                br_paint = getattr(run["element"], "_chromonic_paint_style", None) or self.element._chromonic_paint_style
+                br_paint = box_of(run["element"]).paint_style or box_of(self.element).paint_style
                 br_size = _fontmetrics.parse_length(br_paint.get("font_size"), default=16.0)
                 br_family = "" if br_paint.get("font_family") in (None, "none") else br_paint.get("font_family")
                 br_ascent, br_descent, _normal = fonts.text_metrics(
@@ -763,7 +769,7 @@ class _InlineFormattingPlan:
                     width=0.0, height=br_height,
                     client_width=0.0, client_height=br_height,
                 )
-                run["element"]._chromonic_has_layout_children = False
+                box_of(run["element"]).has_layout_children = False
         # Same accumulate-not-overwrite reasoning as owner_accum above, for
         # self.element's own painted fragments.
         elem_entry = element_fragments_accum.get(id(self.element))
@@ -810,7 +816,7 @@ def _inline_mixed_content(element, children, element_is_inline=False):
     # The normalized view (`anonymous_boxes._normalized_child_nodes`): text a 9.2.1.1
     # anonymous block took over is no longer this element's own, and an
     # anonymous inline-table (17.2.1) stands in for loose cells.
-    child_nodes = (element.__dict__.get("_chromonic_normalized_children")
+    child_nodes = (box_of(element).normalized_children
                    if hasattr(element, "__dict__") else None)
     if child_nodes is None:
         child_nodes = dom._child_nodes(element)
@@ -839,8 +845,8 @@ def _inline_mixed_content(element, children, element_is_inline=False):
         and bool(children)
         and all(_child_qualifies(child, computed, style_obj) for child, computed, style_obj in children)
     )
-    before_info = getattr(element, "_chromonic_before_pseudo", None)
-    after_info = getattr(element, "_chromonic_after_pseudo", None)
+    before_info = box_of(element).before_pseudo
+    after_info = box_of(element).after_pseudo
     if not has_direct_text and not has_inline_only_children and before_info is None and after_info is None:
         return None
     by_id = {id(child): (child, computed, style_obj) for child, computed, style_obj in children}
@@ -860,7 +866,7 @@ def _inline_mixed_content(element, children, element_is_inline=False):
     items = []
     pending_space = False
     previous_was_element = False
-    preserves_white_space = ((getattr(element, "_chromonic_paint_style", None) or {}).get("white_space")
+    preserves_white_space = ((box_of(element).paint_style or {}).get("white_space")
                              or "normal").strip().lower() in _PRESERVING_WHITE_SPACE
     # CSS 2.1 16.6.1: whitespace at the very start of a block's content
     # collapses to nothing, like at a line's start -- only interior
@@ -874,15 +880,15 @@ def _inline_mixed_content(element, children, element_is_inline=False):
             text = dom._collapsed_text_node(node)
             raw = getattr(node, "textContent", None) or getattr(node, "data", "") or ""
             if text or (preserves_white_space and raw):
-                fragment = getattr(node, "_chromonic_fragment", None)
+                fragment = box_of(node).fragment
                 if fragment is None:
                     fragment = anonymous_boxes._AnonymousTextFragment(node, element)
-                    node._chromonic_fragment = fragment
+                    box_of(node).fragment = fragment
                 # Only a real collapsed-away whitespace node earns the
                 # leading space -- text butted right against the preceding
                 # inline element has none (CSS 2.1 16.6.1) --
                 # column-visibility-004.xht.
-                fragment._chromonic_leading_collapsed_space = has_content and pending_space
+                box_of(fragment).leading_collapsed_space = has_content and pending_space
                 items.append(("text", fragment, text, None, None))
                 pending_space = False
                 previous_was_element = False
@@ -910,10 +916,10 @@ def _inline_mixed_content(element, children, element_is_inline=False):
                     # height-width-inline-table-001.xht; a float likewise
                     # (CSS 2.1 9.5), so a space after one at a line's start
                     # still collapses -- floats-placement-001.html.
-                    child._chromonic_leading_collapsed_space = False
+                    box_of(child).leading_collapsed_space = False
                     items.append(("element", child, None, computed, style_obj))
                     continue
-                child._chromonic_leading_collapsed_space = has_content and pending_space
+                box_of(child).leading_collapsed_space = has_content and pending_space
                 items.append(("element", child, None, computed, style_obj))
                 pending_space = False
                 previous_was_element = True
@@ -927,10 +933,10 @@ def _inline_mixed_content(element, children, element_is_inline=False):
         # A synthetic pseudo never goes through `dom._describe()` (no real DOM
         # node for a ComputedStyleDeclaration), so its paint style must be
         # set explicitly here, @font-face substitution included.
-        pseudo._chromonic_paint_style = dom._extract_paint_style(pseudo_computed)
-        pseudo._chromonic_computed_style = pseudo_computed
+        box_of(pseudo).paint_style = dom._extract_paint_style(pseudo_computed)
+        box_of(pseudo).computed_style = pseudo_computed
         from .. import webfonts
-        webfonts.resolve_style(element, pseudo._chromonic_paint_style)
+        webfonts.resolve_style(element, box_of(pseudo).paint_style)
         return ("element", pseudo, None, pseudo_computed, pseudo_style_obj)
 
     if before_info is not None:
@@ -975,7 +981,7 @@ def _block_margins_collapse_through(child, child_box) -> bool:
     `height: 0` still stops collapse-through; only `auto` qualifies."""
     if child_box.height != 0.0:
         return False
-    native = getattr(child, "_chromonic_native_style", None) or {}
+    native = box_of(child).native_style or {}
     if native.get("height") != "auto":
         return False
     if any(box_model._numeric_edge(v) != 0.0 for name in ("border", "padding") for v in native.get(name, ())):
@@ -991,7 +997,7 @@ def _empty_inline_strut_run(owner, leading_edge, trailing_edge, top_edge_val, ex
     real text run, while its own vertical padding/border/margin only grow
     its own box, never the line's. One empty ("", 0.0) token so measure()
     places it without treating it as wrappable content."""
-    paint_style = owner._chromonic_paint_style
+    paint_style = box_of(owner).paint_style
     font_size = _fontmetrics.parse_length(paint_style["font_size"], default=16.0)
     family = "" if paint_style["font_family"] == "none" else paint_style["font_family"]
     weight = _parse_font_weight(paint_style["font_weight"])
@@ -1026,7 +1032,7 @@ def _empty_decoration_only_run(owner, leading_edge, trailing_edge, top_edge_val,
     participant (it's on its own dedicated block-flow line) -- so it gets
     no font/line-height contribution at all, just its own border/padding."""
     return {
-        "source": owner, "owner": owner, "paint_style": owner._chromonic_paint_style,
+        "source": owner, "owner": owner, "paint_style": box_of(owner).paint_style,
         "font_size": 0.0, "tokens": [("", 0.0)],
         "leading": leading_edge, "trailing": trailing_edge,
         "box_height": extra_height,
@@ -1176,10 +1182,10 @@ def _pseudo_object_for(element, which: str, info):
     pseudo = dom._get_pseudo_object(element, which)
     pseudo.text = text
     pseudo_style_obj = LayoutStyle.from_computed(pseudo_computed)
-    pseudo._chromonic_paint_style = dom._extract_paint_style(pseudo_computed)
-    pseudo._chromonic_computed_style = pseudo_computed
+    box_of(pseudo).paint_style = dom._extract_paint_style(pseudo_computed)
+    box_of(pseudo).computed_style = pseudo_computed
     from .. import webfonts
-    webfonts.resolve_style(element, pseudo._chromonic_paint_style)
+    webfonts.resolve_style(element, box_of(pseudo).paint_style)
     return pseudo, pseudo_computed, pseudo_style_obj
 
 
@@ -1193,12 +1199,12 @@ def _pseudo_runs(pseudo, pseudo_computed, pseudo_style, owner, computed_cache) -
     box given explicit dimensions (an icon-only box) -- is atomic and is
     built as a real child of the inline node."""
     native = style_bridge.to_dict(pseudo_style)
-    pseudo._chromonic_native_style = native
+    box_of(pseudo).native_style = native
     display = (getattr(pseudo_computed, "display", "") or "inline").strip().lower()
     text = pseudo.text or ""
     has_explicit_size = isinstance(native.get("width"), (int, float)) or isinstance(native.get("height"), (int, float))
     if display not in ("inline", "") or (not text.strip(_CSS_WHITESPACE_STRIP_CHARS) and has_explicit_size):
-        return [_atomic_run(pseudo, pseudo_computed, pseudo_style, owner, owner._chromonic_paint_style)]
+        return [_atomic_run(pseudo, pseudo_computed, pseudo_style, owner, box_of(owner).paint_style)]
     left_edge = box_model._numeric_edge(native["padding"][3]) + box_model._numeric_edge(native["border"][3])
     right_edge = box_model._numeric_edge(native["padding"][1]) + box_model._numeric_edge(native["border"][1])
     top_edge = box_model._numeric_edge(native["padding"][0]) + box_model._numeric_edge(native["border"][0])
@@ -1206,10 +1212,10 @@ def _pseudo_runs(pseudo, pseudo_computed, pseudo_style, owner, computed_cache) -
                     + box_model._numeric_edge(native["border"][2]))
     margin_start = box_model._numeric_edge(native["margin"][3])
     margin_end = box_model._numeric_edge(native["margin"][1])
-    pseudo.__dict__["_chromonic_flattened_inline"] = True
+    box_of(pseudo).flattened_inline = True
     if text.strip(_CSS_WHITESPACE_STRIP_CHARS):
         return _build_text_runs_from_nodes(
-            [_GeneratedTextNode(text)], pseudo._chromonic_paint_style, pseudo,
+            [_GeneratedTextNode(text)], box_of(pseudo).paint_style, pseudo,
             leading_edge=left_edge, trailing_edge=right_edge, top_edge_val=top_edge,
             extra_height=extra_height, margin_start=margin_start, margin_end=margin_end,
             computed_cache=None,
@@ -1225,8 +1231,8 @@ def _with_pseudo_runs(item, child_runs, computed_cache) -> list:
     element's ::before/::after runs around them. The element's leading
     edge/margin-start moves onto the ::before (it is the first inline box
     inside the element), the trailing ones onto the ::after."""
-    before_info = getattr(item, "_chromonic_before_pseudo", None)
-    after_info = getattr(item, "_chromonic_after_pseudo", None)
+    before_info = box_of(item).before_pseudo
+    after_info = box_of(item).after_pseudo
     if before_info is None and after_info is None:
         return child_runs
 
@@ -1264,12 +1270,12 @@ def _apply_inline_rel_offset(element, dx: float, dy: float) -> None:
     """CSS 2.1 9.4.3: an atomic box inside a position:relative inline
     moves with it. Idempotent per laid-out box: `geometry._write_boxes`
     clears the record whenever the box is written fresh."""
-    state = element.__dict__
-    previous = state.get("_chromonic_inline_rel_offset") or (0.0, 0.0)
+    state = box_of(element)
+    previous = state.inline_rel_offset or (0.0, 0.0)
     delta_x, delta_y = dx - previous[0], dy - previous[1]
     if delta_x or delta_y:
         geometry._shift_subtree(element, delta_x, delta_y)
-    state["_chromonic_inline_rel_offset"] = (dx, dy)
+    state.inline_rel_offset = (dx, dy)
 
 
 
@@ -1285,7 +1291,7 @@ class _PreservedNewline:
         self.parentElement = owner
         self.tagName = "#newline"
         self.childNodes = ()
-        self._chromonic_paint_style = paint_style
+        box_of(self).paint_style = paint_style
 
 
 def _run_font_metrics(paint_style) -> dict:
@@ -1567,9 +1573,9 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                              + box_model._numeric_edge(nested_native["border"][2]))
             nested_margin_left = box_model._numeric_edge(nested_native["margin"][3])
             nested_margin_right = box_model._numeric_edge(nested_native["margin"][1])
-            child_node.__dict__["_chromonic_flattened_inline"] = True  # see `_is_flattened_inline`
+            box_of(child_node).flattened_inline = True  # see `_is_flattened_inline`
             nested_runs = _build_text_runs_from_nodes(
-                list(dom._child_nodes(child_node)), child_node._chromonic_paint_style, child_node,
+                list(dom._child_nodes(child_node)), box_of(child_node).paint_style, child_node,
                 leading_edge=leading_edge if is_first_text else 0.0,
                 trailing_edge=trailing_edge if is_last_text else 0.0,
                 top_edge_val=top_edge_val + nested_top,
@@ -1758,10 +1764,10 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
     needing its finished geometry: the block-interruption marker rect
     (`_finalize_inline_owner_boxes`) and the percentage `top`/`left` basis
     (`_fix_split_inline_relative_offset`)."""
-    wrapper._chromonic_split_container = container
+    box_of(wrapper).split_container = container
     wrapper_computed, wrapper_style_obj = dom._describe(wrapper, computed_cache)
     native = style_bridge.to_dict(wrapper_style_obj)
-    wrapper._chromonic_native_style = native
+    box_of(wrapper).native_style = native
     left_edge = box_model._numeric_edge(native["padding"][3]) + box_model._numeric_edge(native["border"][3])
     right_edge = box_model._numeric_edge(native["padding"][1]) + box_model._numeric_edge(native["border"][1])
     # The split's leading/trailing fragments carry the wrapper's logical
@@ -1782,13 +1788,13 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
         # already physically shifted its text-leaf children by this same
         # border/padding/margin -- zeroed here to avoid double-counting
         # horizontal position; vertical position is corrected via
-        # `_chromonic_split_self_edges` in `_finalize_inline_owner_boxes` instead.
-        wrapper._chromonic_split_self_edges = (
+        # `box.split_self_edges` in `_finalize_inline_owner_boxes` instead.
+        box_of(wrapper).split_self_edges = (
             (right_edge if is_rtl else left_edge), (left_edge if is_rtl else right_edge), top_edge_val)
         left_edge = right_edge = margin_left = margin_right = 0.0
     else:
-        wrapper.__dict__.pop("_chromonic_split_self_edges", None)
-    paint_style = wrapper._chromonic_paint_style
+        box_of(wrapper).pop("split_self_edges", None)
+    paint_style = box_of(wrapper).paint_style
 
     segments: list = [[]]
     blocks: list = []
@@ -1816,7 +1822,7 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
                         and not box_model._is_inline_level(node, child_style)):
                     # The split doesn't change this block's own normal-flow
                     # containing block or positioning rules, direction:rtl included.
-                    node._chromonic_split_container = container
+                    box_of(node).split_container = container
                     blocks.append((node, child_computed, child_style))
                     segments.append([])
                     continue
@@ -1837,19 +1843,10 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
     # visible. A nested-wrapper interruption reports the first real block
     # reachable through it, so every ancestor level gets its own marker at
     # that same position, matching Chrome.
-    wrapper._chromonic_interruption_blocks = [
+    box_of(wrapper).interruption_blocks = [
         block if block is not None else _first_reachable_in_flow_block(nested_wrapper_at[index], computed_cache)
         for index, (block, _computed, _style) in enumerate(blocks)
     ]
-    wrapper._chromonic_split_edge_flow_height = {}
-    # `wrapper` itself is never built as a real Taffy node when it's a
-    # nested wrapper -- it never ends up in `node_map`, so a walk of
-    # `node_map.values()` (e.g. `_fix_nested_split_flow_extent`) can't discover
-    # it directly. Each real interruption block is a genuine node, so a
-    # back-reference on it is a reliable way back to its wrapper.
-    for block, _computed, _style in blocks:
-        if block is not None:
-            block.__dict__["_chromonic_split_wrapper_ref"] = wrapper
 
     for index, seg_nodes in enumerate(segments):
         is_first, is_last = index == 0, index == len(segments) - 1
@@ -1877,13 +1874,6 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
             runs = [_empty_inline_strut_run(
                 wrapper, seg_leading, seg_trailing, top_edge_val, extra_height, seg_margin_start,
             )]
-            # Ancestor auto-height must read only the real line box
-            # (`above`+`below`), not this fragment's visual height (which
-            # includes the wrapper's vertical border/padding) -- stashed
-            # per edge for `_fix_nested_split_flow_extent` to correct with.
-            wrapper.__dict__.setdefault("_chromonic_split_edge_flow_height", {})[
-                "leading" if is_first else "trailing"
-            ] = runs[0]["above"] + runs[0]["below"]
         if not runs:
             # Genuinely nothing on this side -- still an explicit 0x0
             # fragment (Chrome reports one), no height/font/flow of its own.
@@ -1938,19 +1928,19 @@ def _split_inline_flow_around_blocks(element, inline_items, style, css_display, 
             else:
                 if runs_acc:
                     plan = _InlineFormattingPlan(
-                        element, runs_acc, element._chromonic_paint_style, css_display)
-                    plan._chromonic_final_split_fragment = False
+                        element, runs_acc, box_of(element).paint_style, css_display)
+                    box_of(plan).final_split_fragment = False
                     pieces.append(("plan", plan))
                     runs_acc = []
                 pieces.append(sub)
         if runs_acc:
             plan = _InlineFormattingPlan(
-                element, runs_acc, element._chromonic_paint_style, css_display)
-            plan._chromonic_final_split_fragment = True
+                element, runs_acc, box_of(element).paint_style, css_display)
+            box_of(plan).final_split_fragment = True
             pieces.append(("plan", plan))
         return pieces
-    element.__dict__.pop("_chromonic_interruption_blocks", None)
-    element.__dict__.pop("_chromonic_split_container", None)
+    box_of(element).pop("interruption_blocks", None)
+    box_of(element).pop("split_container", None)
     pieces: list = []
     pending: list = []
     found_split = False
@@ -1985,12 +1975,12 @@ def _split_inline_flow_around_blocks(element, inline_items, style, css_display, 
                 else:
                     if runs_acc:
                         plan = _InlineFormattingPlan(
-                            element, runs_acc, element._chromonic_paint_style, css_display)
+                            element, runs_acc, box_of(element).paint_style, css_display)
                         # A block interruption follows -- this plan is a
                         # leading/interior segment, never the wrapper's true
                         # trailing one. measure()'s RTL mirror must not
                         # apply the wrapper's margin-right on that false signal.
-                        plan._chromonic_final_split_fragment = False
+                        box_of(plan).final_split_fragment = False
                         pieces.append(("plan", plan))
                         runs_acc = []
                     pieces.append(sub)
@@ -1999,8 +1989,8 @@ def _split_inline_flow_around_blocks(element, inline_items, style, css_display, 
                 # segment, where measure() applies the wrapper's
                 # margin-right normally (the default for a non-split plan).
                 plan = _InlineFormattingPlan(
-                    element, runs_acc, element._chromonic_paint_style, css_display)
-                plan._chromonic_final_split_fragment = True
+                    element, runs_acc, box_of(element).paint_style, css_display)
+                box_of(plan).final_split_fragment = True
                 pieces.append(("plan", plan))
         else:
             pending.append((kind, item, text, child_computed, child_style))
@@ -2034,17 +2024,17 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
             # An atomic inline-level box or a float: a real child of the
             # inline node, sized by its own formatting context, placed by
             # measure() (CSS 2.1 9.2.2, 9.5, 10.3.9).
-            item.__dict__.pop("_chromonic_interruption_blocks", None)
-            item.__dict__.pop("_chromonic_split_container", None)
+            box_of(item).pop("interruption_blocks", None)
+            box_of(item).pop("split_container", None)
             if (not box_model._is_floated(child_computed)
-                    and getattr(item, "_chromonic_leading_collapsed_space", False)):
-                runs.append(_make_collapsed_space_run(element._chromonic_paint_style, element, 0.0, 0.0))
-            runs.append(_atomic_run(item, child_computed, child_style, element, element._chromonic_paint_style))
+                    and box_of(item).get("leading_collapsed_space", False)):
+                runs.append(_make_collapsed_space_run(box_of(element).paint_style, element, 0.0, 0.0))
+            runs.append(_atomic_run(item, child_computed, child_style, element, box_of(element).paint_style))
             continue
         if kind == "text":
             source = item.source
             owner = element
-            paint_style = element._chromonic_paint_style
+            paint_style = box_of(element).paint_style
             native = None
         else:
             # Nested markup is flattened into this plan when it contains
@@ -2058,15 +2048,15 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
             # `item` is on the ordinary (non-split) path this layout --
             # clear any stale interruption-block bookkeeping a previous
             # layout's split may have left on it.
-            item.__dict__.pop("_chromonic_interruption_blocks", None)
-            item.__dict__.pop("_chromonic_split_container", None)
+            box_of(item).pop("interruption_blocks", None)
+            box_of(item).pop("split_container", None)
             # Walk childNodes to collect text segments and <br> breaks,
             # decorating them with the child element's border+padding edges
             # (first fragment gets left edge, last gets right) -- see
             # `_build_text_runs_from_nodes`, also reused by
             # `_split_wrapping_inline_element`.
             native = style_bridge.to_dict(child_style)
-            item._chromonic_native_style = native
+            box_of(item).native_style = native
             left_edge = (box_model._numeric_edge(native["padding"][3])
                          + box_model._numeric_edge(native["border"][3]))
             right_edge = (box_model._numeric_edge(native["padding"][1])
@@ -2094,9 +2084,9 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
             is_rtl_item = dom._element_direction(item, child_computed) == "rtl"
             # Flattened into this plan: no Taffy box of its own this pass
             # (build() clears the mark when it does build the element).
-            item.__dict__["_chromonic_flattened_inline"] = True
+            box_of(item).flattened_inline = True
             child_runs = _build_text_runs_from_nodes(
-                list(dom._child_nodes(item)), item._chromonic_paint_style, item,
+                list(dom._child_nodes(item)), box_of(item).paint_style, item,
                 leading_edge=0.0 if is_rtl_item else left_edge,
                 trailing_edge=0.0 if is_rtl_item else right_edge,
                 top_edge_val=top_edge_val, extra_height=extra_height,
@@ -2106,7 +2096,7 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
             )
             child_runs = _with_pseudo_runs(item, child_runs, computed_cache)
             leading_space_run = None
-            if getattr(item, "_chromonic_leading_collapsed_space", False) and child_runs:
+            if box_of(item).get("leading_collapsed_space", False) and child_runs:
                 # A whitespace-only text node right before this element
                 # collapsed to nothing of its own (set in
                 # `_inline_mixed_content`) -- restored as its own standalone
@@ -2115,7 +2105,7 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
                 # content left a stray zero-width space on the previous
                 # line -- inline-formatting-context-013.xht.
                 leading_space_run = _make_collapsed_space_run(
-                    element._chromonic_paint_style, element, top_edge_val, extra_height)
+                    box_of(element).paint_style, element, top_edge_val, extra_height)
             if is_rtl_item:
                 non_break_runs = [r for r in child_runs if not r.get("break")]
                 if non_break_runs:
@@ -2163,7 +2153,7 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
             raw = getattr(source, "data", None) or collapsed or ""
         runs.extend(_runs_for_text(
             raw, paint_style, owner, source,
-            has_leading_space=getattr(item, "_chromonic_leading_collapsed_space", False),
+            has_leading_space=box_of(item).get("leading_collapsed_space", False),
         ))
     # DOM boundaries with identical shaping properties are not kerning
     # boundaries. Preserve the pair adjustment across adjacent text owners.
@@ -2206,7 +2196,7 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
         token, old_width = left["tokens"][-1]
         left["tokens"][-1] = (token, old_width + adjustment)
         left["intrinsic_width"] += adjustment
-    return _InlineFormattingPlan(element, runs, element._chromonic_paint_style, css_display) if runs else None
+    return _InlineFormattingPlan(element, runs, box_of(element).paint_style, css_display) if runs else None
 
 
 
@@ -2362,7 +2352,7 @@ def _make_measure(paint_style: dict, text: str, element):
                                         line_height=line_height)[0] for word in words)
         # Stashed for paint.py -- the only record of how this text wrapped;
         # paint draws exactly these lines rather than re-wrapping itself.
-        element._chromonic_text_lines = [line_text for line_text, _line_width, _line_height in lines]
+        box_of(element).text_lines = [line_text for line_text, _line_width, _line_height in lines]
         line_widths = [line_width for _line_text, line_width, _line_height in lines]
         # CSS Text 3 text-align:justify: every line but the last stretches
         # to fill the line box -- paint.py doesn't re-space individual
@@ -2378,14 +2368,14 @@ def _make_measure(paint_style: dict, text: str, element):
                 if (index != last_index or stretch_last) else line_width
                 for index, line_width in enumerate(line_widths)
             ]
-        element._chromonic_text_line_widths = line_widths
+        box_of(element).text_line_widths = line_widths
         # Per-line offsets within the content box (only when floats
         # shortened some lines; None means every line starts at x=0 and
         # they stack `line_height` apart).
-        element._chromonic_text_line_x = line_xs
-        element._chromonic_text_line_y = line_ys
-        element._chromonic_text_line_avail = line_avail
-        element._chromonic_line_height = lines[0][2] if lines else font_size * 1.2
+        box_of(element).text_line_x = line_xs
+        box_of(element).text_line_y = line_ys
+        box_of(element).text_line_avail = line_avail
+        box_of(element).line_height = lines[0][2] if lines else font_size * 1.2
         if lines:
             first_baseline = (line_ys[0] if line_ys else 0.0) + first_above
             last_top = line_ys[-1] if line_ys else sum(line_h for _t, _w, line_h in lines[:-1])

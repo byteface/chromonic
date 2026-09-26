@@ -1,6 +1,7 @@
 """Coordinate -> the topmost Domonic element painted at that point."""
 
 from __future__ import annotations
+from .tree.box import box_of
 
 
 ELEMENT_NODE = 1
@@ -32,7 +33,7 @@ def _contains_rect(rect, x: float, y: float) -> bool:
 def _contains_element(element, x: float, y: float) -> bool:
     """Prefer real inline fragments over their union bounding box."""
 
-    fragments = element.__dict__.get("_chromonic_inline_boxes")
+    fragments = box_of(element).inline_boxes
 
     if fragments:
         return any(
@@ -48,7 +49,7 @@ def _contains_element(element, x: float, y: float) -> bool:
 def _style_keyword(element, name: str) -> str:
     """Read an already-computed style without causing another resolution."""
 
-    style = element.__dict__.get("_chromonic_computed_style")
+    style = box_of(element).computed_style
 
     if style is None:
         return ""

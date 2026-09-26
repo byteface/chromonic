@@ -298,8 +298,9 @@ def _align_keyword(kw: Keyword, *, content: bool, inline_axis: bool = True) -> s
     unrecognised keyword raised a `ValueError` for the whole page -- every
     `css-flexbox/abspos/*align-self*` fixture errored out that way).
 
-    - `safe`/`unsafe` overflow-safety prefixes are dropped: Taffy has no
-      overflow-position notion, and `unsafe` is exactly the plain keyword.
+    - `safe` is kept (`safe-center`, ...): Taffy falls back to start
+      alignment when the item would overflow. `unsafe` is exactly the plain
+      keyword.
     - `first baseline` is `baseline`; `last baseline` (no Taffy equivalent)
       also falls back to `baseline` on the items axis, and to `flex-end` on
       the content axis where Box Alignment's fallback for it is `end`
@@ -311,8 +312,9 @@ def _align_keyword(kw: Keyword, *, content: bool, inline_axis: bool = True) -> s
     - Anything still unknown (`anchor-center`, an unresolved `var()`...)
       becomes `normal` rather than an error.
     """
-    parts = [part for part in kw.value.replace("-", " ").lower().split()
-             if part not in ("safe", "unsafe")]
+    raw_parts = kw.value.replace("-", " ").lower().split()
+    safe = "safe" in raw_parts
+    parts = [part for part in raw_parts if part not in ("safe", "unsafe")]
     if not parts:
         return "normal"
     if parts[-1] == "baseline":
@@ -333,7 +335,11 @@ def _align_keyword(kw: Keyword, *, content: bool, inline_axis: bool = True) -> s
     known = {"normal", "auto", "start", "end", "flex-start", "flex-end", "center", "stretch"}
     if content:
         known |= {"space-between", "space-around", "space-evenly"}
-    return word if word in known else "normal"
+    if word not in known:
+        return "normal"
+    if safe and word in ("start", "end", "flex-start", "flex-end", "center"):
+        return "safe-" + word
+    return word
 
 
 def _flex_wrap(kw: Keyword) -> str:

@@ -13,6 +13,7 @@ from chromonic import browser, browser_images, fonts, paint, tree, webfonts
 import math
 
 from .schema import RECT_FIELDS, STYLE_PROPERTIES, VIEWPORT, result, write_json
+from chromonic.tree.box import box_of
 
 
 def _rect_dict(x, y, width, height):
@@ -29,7 +30,7 @@ def _fragments(element, rect):
     # nodes) -- reported here in DOM order alongside anything the element
     # laid out itself. Recursive: an anonymous row's own cell is stored on
     # the row.
-    for anonymous in (element.__dict__.get("_chromonic_anonymous_table_boxes") or {}).values():
+    for anonymous in (box_of(element).anonymous_table_boxes or {}).values():
         if anonymous.get_layout_box() is not None:
             result["text"].extend(_fragments(anonymous, anonymous.get_layout_box())["text"])
     return result
@@ -38,13 +39,13 @@ def _fragments(element, rect):
 def _own_fragments(element, rect):
     if element.get_layout_box() is None:
         return {"element": [], "text": []}
-    inline_boxes = getattr(element, "_chromonic_inline_boxes", None)
+    inline_boxes = box_of(element).inline_boxes
     element_rects = ([_rect_dict(*box) for box in inline_boxes] if inline_boxes
                      else [_rect_dict(rect.x, rect.y, rect.width, rect.height)])
-    fragments = getattr(element, "_chromonic_owned_fragments", None)
+    fragments = box_of(element).owned_fragments
     if fragments is None:
         fragments = [fragment for fragment in
-                     (getattr(element, "_chromonic_inline_fragments", None) or [])
+                     (box_of(element).inline_fragments or [])
                      if getattr(fragment, "owner", element) is element]
     if fragments:
         text_rects = []
@@ -52,11 +53,11 @@ def _own_fragments(element, rect):
             box = fragment.__dict__.get("_layout_box")
             if box is None:
                 continue
-            lines = getattr(fragment, "_chromonic_text_lines", None) or []
-            widths = getattr(fragment, "_chromonic_text_line_widths", [])
-            line_height = float(getattr(fragment, "_chromonic_line_height", 0.0) or 0.0)
+            lines = box_of(fragment).text_lines or []
+            widths = box_of(fragment).get("text_line_widths", [])
+            line_height = float(box_of(fragment).get("line_height", 0.0) or 0.0)
             raw = getattr(getattr(fragment, "source", None), "textContent", "") or ""
-            margins = getattr(fragment, "_chromonic_native_style", {}).get("margin") or (0.0,) * 4
+            margins = box_of(fragment).get("native_style", {}).get("margin") or (0.0,) * 4
             # A text fragment's own reported rect is its *glyph* box
             # (ascent+descent), never the full line-height -- matching the
             # other, non-shared-plan branch below (already correct there)
@@ -67,7 +68,7 @@ def _own_fragments(element, rect):
             # reporting `text[].height` as the full `75`, not the real
             # `17`, and `text[].y` at the *line's* own top instead of the
             # glyph's (offset by the line's own half-leading below it).
-            fragment_paint_style = getattr(fragment, "_chromonic_paint_style", None) or {}
+            fragment_paint_style = box_of(fragment).paint_style or {}
             glyph_font_size = _fontmetrics.parse_length(fragment_paint_style.get("font_size"), default=16.0)
             glyph_family = fragment_paint_style.get("font_family", "") or ""
             glyph_weight = tree._parse_font_weight(fragment_paint_style.get("font_weight"))
@@ -89,22 +90,22 @@ def _own_fragments(element, rect):
                                              (widths[index] if index < len(widths) else box.width) + leading + trailing,
                                              glyph_height) | {"text": text})
         return {"element": element_rects, "text": text_rects}
-    lines = getattr(element, "_chromonic_text_lines", None) or []
-    line_height = float(getattr(element, "_chromonic_line_height", 0.0) or 0.0)
+    lines = box_of(element).text_lines or []
+    line_height = float(box_of(element).get("line_height", 0.0) or 0.0)
     text_rects = []
-    if lines and not getattr(element, "_chromonic_has_layout_children", False):
-        padding = getattr(element, "_chromonic_padding", (0.0, 0.0, 0.0, 0.0))
+    if lines and not box_of(element).get("has_layout_children", False):
+        padding = box_of(element).get("padding", (0.0, 0.0, 0.0, 0.0))
         # A table cell's `vertical-align: middle`/`bottom` content offset
         # (`tree._align_table_cell_content`) -- the same shift `paint.py`
         # applies when drawing these lines.
         y = (rect.y + element.get_layout_box().border_top + padding[0]
-             + float(getattr(element, "_chromonic_content_offset_y", 0.0) or 0.0))
-        widths = getattr(element, "_chromonic_text_line_widths", [])
+             + float(box_of(element).get("content_offset_y", 0.0) or 0.0))
+        widths = box_of(element).get("text_line_widths", [])
         # Lines shortened by floats start further right / lower (see
         # `tree._make_measure`); absent, lines stack `line_height` apart from x=0.
-        line_xs = getattr(element, "_chromonic_text_line_x", None) or []
-        line_ys = getattr(element, "_chromonic_text_line_y", None) or []
-        line_avail = getattr(element, "_chromonic_text_line_avail", None) or []
+        line_xs = box_of(element).text_line_x or []
+        line_ys = box_of(element).text_line_y or []
+        line_avail = box_of(element).text_line_avail or []
         for index, text in enumerate(lines):
             # Chrome's probe (`chrome_runner._instrument`) skips any text
             # node whose `textContent.trim()` is empty -- JS `trim()` strips
@@ -113,7 +114,7 @@ def _own_fragments(element, rect):
             if not (text or "").strip():
                 continue
             width = widths[index] if index < len(widths) else rect.width
-            paint_style = getattr(element, "_chromonic_paint_style", {})
+            paint_style = box_of(element).get("paint_style", {})
             font_size = _fontmetrics.parse_length(paint_style.get("font_size"), default=16.0)
             family = paint_style.get("font_family", "")
             weight = tree._parse_font_weight(paint_style.get("font_weight"))
@@ -137,7 +138,7 @@ def _own_fragments(element, rect):
                 element.get_layout_box().client_width - padding[1] - padding[3])
             line_x = line_xs[index] if index < len(line_xs) else 0.0
             line_top = line_ys[index] if index < len(line_ys) else index * line_height
-            computed_style = getattr(element, "_chromonic_computed_style", None)
+            computed_style = box_of(element).computed_style
             text_align = tree.box_model._text_align(getattr(computed_style, "textAlign", "start"))
             # CSS Text 3 `text-align-last`: the element's own final line uses
             # this instead, unless it's `auto` (same as `text-align`, except
@@ -211,7 +212,7 @@ def run(fixture: Path, output: Path, screenshot: Path, *, viewport=VIEWPORT, loa
         if element_id in elements:
             raise ValueError(f"duplicate data-layout id {element_id!r} in {fixture.name}")
         rect = element.getBoundingClientRect()
-        computed = getattr(element, "_chromonic_computed_style", None)
+        computed = box_of(element).computed_style
         if computed is None:
             computed = ComputedStyleDeclaration(element)
         elements[element_id] = {
