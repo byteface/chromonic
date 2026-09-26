@@ -25,9 +25,7 @@ _log = logging.getLogger(__name__)
 
 from . import (
     domonic_ch_unit_patch,
-    domonic_details_element_patch,
     domonic_ex_unit_patch,
-    domonic_radio_group_patch,
     # Domonic 1.8.4 expands var() in `_font_size_px` itself. This remaining
     # patch only supplies the browser-specific monospace default-size rule.
     domonic_monospace_font_size_patch,
@@ -511,45 +509,48 @@ def _shared_http_session():
 
 
 class _RequestsResponseAdapter:
-    """Adapts a `requests.Response` to the `.text()`/`.url` surface
-    `domonic._scrape._parse` expects from its own `fetch.Response` -- lets
-    `_load_remote` reuse that function's parsing/CSS-loading/window-attach
-    logic verbatim instead of duplicating it, while doing the actual HTTP
-    fetch itself (through `_shared_http_session()`, not domonic's stateless
-    `fetch()`) so cookies and `method`/`data` (form submission) are
-    available to it at all."""
-    __slots__ = ("_response", "url")
+    """Adapts a `requests.Response` to the `.bytes()`/`.text()`/`.headers`/
+    `.url` surface `domonic._scrape._parse` expects from its own
+    `fetch.Response` -- lets `_load_remote` reuse that function's parsing/
+    CSS-loading/window-attach logic verbatim instead of duplicating it,
+    while doing the actual HTTP fetch itself (through
+    `_shared_http_session()`, not domonic's stateless `fetch()`) so cookies
+    and `method`/`data` (form submission) are available to it at all.
 
-    def __init__(self, response):
+    The body is decoded the way a browser does it (BOM, then the header
+    charset, then `<meta charset>`, else UTF-8/windows-1252) by domonic's
+    own `decode_html` -- not `requests.Response.text`, which reads an
+    undeclared `text/*` body as ISO-8859-1 and keeps the BOM. `source` is
+    that decoded text, `encoding` its WHATWG name."""
+    __slots__ = ("_response", "url", "headers", "source", "encoding", "_text", "_body")
+
+    def __init__(self, response, content=None):
+        from domonic._scrape import _charset_from_headers
+        from domonic.ext._encoding import decode_html, whatwg_name
+
+        if content is None:
+            content = response.content
         self._response = response
         self.url = response.url
-
-    def text(self):
-        # `requests.Response.text` decodes a `text/*` body with no declared
-        # charset as ISO-8859-1 (the HTTP/1.1 default), so a UTF-8 file's
-        # BOM came through as the three characters `ï»¿` before the
-        # `<!DOCTYPE>` -- domonic's parser then treated that as body text
-        # (a whole first line, with `<title>`/`<link>`/`<style>` demoted
-        # into `<body>` after it, 26px below Chrome on every one of the 22
-        # BOM-prefixed `css-flexbox/*.htm` fixtures). Chrome sniffs the
-        # BOM first, then the declared charset, then falls back to UTF-8
-        # for a well-formed body; the same order here. The BOM itself is
-        # dropped: domonic keeps a leading U+FEFF as a text node (logged
-        # in PLAN.md).
-        content = self._response.content
-        content_type = (self._response.headers.get("content-type") or "").lower()
-        if content.startswith(b"\xef\xbb\xbf"):
-            text = content[3:].decode("utf-8", errors="replace")
-        elif "charset=" in content_type and self._response.encoding:
-            text = self._response.text.lstrip("﻿")
-        else:
-            try:
-                text = content.decode("utf-8")
-            except UnicodeDecodeError:
-                text = self._response.text
+        self.headers = response.headers
+        self.source, used = decode_html(content, _charset_from_headers(response))
+        self.encoding = whatwg_name(used)
+        text = self.source
+        content_type = (response.headers.get("content-type") or "").lower()
         if "xhtml+xml" in content_type or _looks_like_xhtml(text):
             text = _expand_xhtml_self_closing_tags(text)
-        return _strip_html_comments_in_style(text)
+        self._text = _strip_html_comments_in_style(text)
+        # Untouched, domonic decodes the raw bytes itself. Rewritten, the
+        # new text goes over as UTF-8 behind a BOM, which outranks both the
+        # header charset and `<meta charset>` in domonic's sniff.
+        self._body = (content if self._text == self.source
+                      else b"\xef\xbb\xbf" + self._text.encode("utf-8"))
+
+    def bytes(self):
+        return self._body
+
+    def text(self):
+        return self._text
 
 
 _STYLE_BLOCK_RE = re.compile(r"(<style\b[^>]*>)(.*?)(</style>)", re.I | re.S)
@@ -597,16 +598,153 @@ def _expand_xhtml_self_closing_tags(text: str) -> str:
     return _SELF_CLOSING_TAG_RE.sub(expand, text)
 
 
+class _StyleCommentFilter:
+    """`_strip_html_comments_in_style` over a text stream: an unclosed
+    `<style` block, or a tag split across chunks, is held back until the
+    rest of it arrives."""
+
+    def __init__(self):
+        self._held = ""
+
+    def feed(self, text: str, final: bool = False) -> str:
+        text = self._held + text
+        self._held = ""
+        if not final:
+            cut = len(text)
+            last_tag = text.rfind("<")
+            if last_tag >= 0 and text.find(">", last_tag) < 0:
+                cut = last_tag
+            lowered = text.lower()
+            for opened in _STYLE_OPEN_RE.finditer(text):
+                if lowered.find("</style>", opened.end()) < 0:
+                    cut = min(cut, opened.start())
+                    break
+            text, self._held = text[:cut], text[cut:]
+        return _strip_html_comments_in_style(text)
+
+
+_STYLE_OPEN_RE = re.compile(r"<style\b", re.I)
+_STREAM_CHUNK = 65536
+_STYLESHEET_PREFETCH_WORKERS = 6
+
+
+def _stream_document(response, source_request, request_kwargs):
+    """Parse `response` as it downloads, through domonic's streaming
+    `document.open()`/`write()`/`close()`.
+
+    A `MutationObserver` sees each `<head>` `<link rel=stylesheet>` as the
+    parser inserts it and starts that fetch on a worker straight away, so
+    stylesheets download while the rest of the page is still arriving and
+    parsing instead of one after another once it's all done. The rules are
+    applied on this thread after `close()`, in `document.styleSheets` order.
+
+    Returns `(document, decoded source)`, or `(None, raw body)` for an
+    XHTML page, which needs the whole-text rewrite in
+    `_RequestsResponseAdapter` (see `_expand_xhtml_self_closing_tags`)."""
+    import codecs
+    from concurrent.futures import ThreadPoolExecutor
+    from urllib.parse import urljoin
+
+    from domonic._scrape import (
+        _charset_from_headers,
+        _document_base_url,
+        _fetch_stylesheet_text,
+        _replace_stylesheet_rules,
+    )
+    from domonic.dom import HTMLDocument, MutationObserver
+    from domonic.ext._encoding import PRESCAN_BYTES, bom_encoding, sniff_encoding, whatwg_name
+
+    chunks = response.iter_content(_STREAM_CHUNK)
+    raw = bytearray()
+    for chunk in chunks:
+        raw += chunk
+        if len(raw) >= PRESCAN_BYTES:
+            break
+    encoding = sniff_encoding(bytes(raw), _charset_from_headers(response))
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    _, bom_length = bom_encoding(bytes(raw))
+    first = decoder.decode(bytes(raw[bom_length:]))
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "xhtml+xml" in content_type or _looks_like_xhtml(first):
+        for chunk in chunks:
+            raw += chunk
+        return None, bytes(raw)
+
+    document = HTMLDocument()
+    document.open()
+    document.URL = response.url
+    prefetched = {}
+    pool = ThreadPoolExecutor(_STYLESHEET_PREFETCH_WORKERS, thread_name_prefix="chromonic-css")
+
+    def prefetch(records, observer):
+        for record in records:
+            for node in record.addedNodes:
+                name = getattr(node, "name", "")
+                if name == "body":
+                    # Recording every body node costs more than the rare body
+                    # `<link>` saves; those are fetched after `close()`.
+                    observer.disconnect()
+                if name != "link":
+                    continue
+                href = node.getAttribute("href")
+                if not href or "stylesheet" not in (node.getAttribute("rel") or "").lower().split():
+                    continue
+                resolved = urljoin(_document_base_url(document), href)
+                if resolved not in prefetched:
+                    prefetched[resolved] = pool.submit(
+                        _fetch_stylesheet_text, resolved, source_request, request_kwargs)
+
+    observer = MutationObserver(prefetch)
+    observer.observe(document, {"childList": True, "subtree": True})
+    styles = _StyleCommentFilter()
+    try:
+        document.write(styles.feed(first))
+        for chunk in chunks:
+            raw += chunk
+            text = styles.feed(decoder.decode(chunk))
+            if text:
+                document.write(text)
+        document.write(styles.feed(decoder.decode(b"", True), final=True))
+        document.close()
+    finally:
+        observer.disconnect()
+
+    # `_scrape._load_external_stylesheets`, with the text already in flight.
+    base_url = _document_base_url(document)
+    for sheet in document.styleSheets:
+        href = getattr(sheet, "href", None)
+        owner_node = getattr(sheet, "ownerNode", None)
+        if not href or getattr(owner_node, "tagName", "").lower() != "link":
+            continue
+        if len(getattr(sheet, "cssRules", ()) or ()):
+            continue
+        resolved = urljoin(base_url, href)
+        sheet._original_href = href
+        sheet._resolved_href = resolved
+        sheet.href = resolved
+        pending = prefetched.get(resolved)
+        css_text = (pending.result() if pending is not None
+                    else _fetch_stylesheet_text(resolved, source_request, request_kwargs))
+        if css_text is not None:
+            _replace_stylesheet_rules(sheet, css_text)
+    pool.shutdown(wait=False, cancel_futures=True)
+
+    document.__dict__["_characterSet"] = whatwg_name(encoding)
+    source = bytes(raw[bom_length:]).decode(encoding, errors="replace")
+    return document, source
+
+
 def _load_remote(url: str, *, method: str = "GET", data=None, http_session=None):
     from domonic._scrape import _parse
     from domonic.webapi.fetch import Request
+    from domonic.window import Window
 
     from . import netlog
 
     session = http_session or _shared_http_session()
     netlog.log("net", f"{method} {url}")
-    response = session.request(method, url, data=data, timeout=30, allow_redirects=True)
-    netlog.log("net", f"{response.status_code} {response.url} ({len(response.content)} bytes)")
+    response = session.request(method, url, data=data, timeout=30, allow_redirects=True, stream=True)
+    netlog.log("net", f"{response.status_code} {response.url}")
     # Domonic 1.8.4 requires the source Request so external stylesheets can
     # inherit credentials/headers only when they are same-origin. Build it
     # from requests' actual prepared request (which includes session headers
@@ -618,21 +756,24 @@ def _load_remote(url: str, *, method: str = "GET", data=None, http_session=None)
         headers=dict(prepared.headers),
         redirect="follow",
     )
-    document = _parse(
-        _RequestsResponseAdapter(response), None,
-        source_request=source_request,
-        css=True,
-        attach=True,
-        request_kwargs={"timeout": 30, "allow_redirects": True},
-    )
-    default_view = getattr(document, "defaultView", None)
+    request_kwargs = {"timeout": 30, "allow_redirects": True}
+    with response:
+        document, source = _stream_document(response, source_request, request_kwargs)
+    if document is None:
+        adapted = _RequestsResponseAdapter(response, source)
+        document = _parse(adapted, None, source_request=source_request, css=True,
+                          request_kwargs=request_kwargs)
+        # A rewritten body reached domonic as BOM'd UTF-8; report the page's own.
+        document.__dict__["_characterSet"] = adapted.encoding
+        source = adapted.source
+    Window().attach(document)
     page = SimpleNamespace(
         document=document,
         url=response.url,
-        session=SimpleNamespace(window=default_view),
-        # The raw response body, before domonic parsed it -- what
+        session=SimpleNamespace(window=document.defaultView),
+        # The decoded response body, before domonic parsed it -- what
         # `native_browser.py`'s view-source (F8) shows.
-        source=response.text,
+        source=source,
     )
     return page
 
@@ -695,7 +836,7 @@ def _ensure_window(page) -> None:
 
 
 def load(url: str, *, method: str = "GET", data=None, http_session=None, run_scripts: bool = True):
-    """Fetch + parse `url` with domonic 1.8.4 for HTTP(S), myjs for local files.
+    """Fetch + parse `url` with domonic for HTTP(S), myjs for local files.
 
     `run_scripts=False` skips the remote-page JS execution step below
     entirely -- used by the WPT conformance harness (`tests/layout/

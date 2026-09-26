@@ -243,12 +243,11 @@ def _install_video_element_api() -> None:
     """Attach `currentTime`/`duration`/`paused`/`videoWidth`/`videoHeight`/
     `play()`/`pause()` onto the real `video` tag class -- domonic's own
     `HTMLVideoElement` is attribute plumbing only (no playback state at
-    all, and doesn't even inherit `HTMLMediaElement`), so unlike
-    `domonic_details_element_patch.py` this isn't recovering something
-    that already existed -- it's chromonic's own new API surface, added
-    the same way (attached onto the live class via `sys.modules`, since
-    the `domonic.html` *attribute* is shadowed by the `<html>` tag class
-    itself -- see that patch module's docstring)."""
+    all, and doesn't even inherit `HTMLMediaElement`), so this isn't
+    recovering something that already existed -- it's chromonic's own new
+    API surface, attached onto the live class via `sys.modules`, since the
+    `domonic.html` *attribute* is shadowed by the `<html>` tag class
+    itself."""
     import domonic.html  # noqa: F401 -- ensures the real submodule is registered in `sys.modules`
     video_cls = sys.modules["domonic.html"].video
 

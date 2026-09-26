@@ -2601,7 +2601,7 @@ def run(url='chromonic://home', *, width=1000, height=800, title='chromonic — 
                 # not the next one; `request_relayout()`'s default zero
                 # delay means that deferred pass fires immediately, in
                 # this same iteration.
-                if host.window is not None and host.flush_animation_frames(host.window.performance.now() * 1000.0):
+                if host.window is not None and host.flush_animation_frames(host.window.performance.now()):
                     view.request_relayout()
 
                 navigation.poll()

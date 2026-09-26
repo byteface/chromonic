@@ -677,7 +677,7 @@ def run(
         while not glfw.window_should_close(win):
             glfw.poll_events()
 
-            if host.flush_animation_frames(dom_window.performance.now() * 1000.0):
+            if host.flush_animation_frames(dom_window.performance.now()):
                 interaction.relayout()
 
             if on_tick is not None:

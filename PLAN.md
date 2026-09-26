@@ -179,19 +179,6 @@ returns `True`. Minor, pre-existing, not chromonic's to fix.
 ------
 
 
-`domonic/html.py`'s per-tag class table wires `progress`/`meter`/`dialog`/
-`select`/`textarea`/... to their real `HTMLXxxElement` subclass, but
-`details = type("details", (Element,), {"name": "details"})` is left on
-bare `Element` -- every parsed `<details>` (and `document.createElement
-('details')`) comes back with no `.open`/`.toggle()` at all, despite
-domonic's dom.py defining a full `HTMLDetailsElement` for exactly this.
-Worked around in `domonic_details_element_patch.py` (attaches
-`HTMLDetailsElement.open`/`.toggle` onto the existing class in place).
-
-
-------
-
-
 Inline HTML event-handler attributes (`onclick="..."`, `onchange="..."`,
 ...) parse but never run: `element.onclick` after parsing `<button
 onclick="foo()">` returns the literal *string* `"foo()"`, not a callable --
@@ -204,22 +191,6 @@ patched -- `examples/forms_demo.html` uses `addEventListener` instead.
 
 
 ------
-
-SHOULD BE FIXED in 1.8.5
-
-A radio's group (which other same-`name` radios share `checked`
-exclusivity with) is spec'd as its `<form>` owner, or the whole document
-if it has none -- `domonic.dom._radio_group_members` gets the no-form
-case wrong, falling back to the radio's *immediate parent* instead of the
-document. Three radios each wrapped in their own `<label>` (common real
-markup, not just this project's demo) are then never found as a group at
-all, so nothing ever clears the others' `checked` state. Worked around in
-`domonic_radio_group_patch.py` (replaces the module-level function in
-place, falling back to `ownerDocument`).
-
-
-------
-
 
 `_ABSOLUTE_FONT_SIZE_KEYWORDS` in `domonic/style.py` scales the `font-size`
 keywords by CSS 2's 1.2 ratio (`small` 13.333px, `large` 18.667px); browsers
@@ -272,21 +243,6 @@ I looked at that one but I'm not going to patch it, and here's why:
 I tried the literal fix — skip resolving width/height for non-replaced inline elements — but it broke real tests immediately. The reason: domonic has no UA default stylesheet. A plain <div> with no explicit display computes as "inline" (CSS's actual initial value), since nothing in domonic ever sets div { display: block }. So a check like "is this element's computed display inline?" can't distinguish a genuinely inline element (<span>) from an ordinary <div> that a real layout engine has already sized as a block — both report display: inline from domonic's cascade alone.
 
 Getting this right would require adding a UA default-display stylesheet to domonic first — a real, separate piece of work, not a one-line guard. And notably, the chromonic report itself ends with "Not patched ... left alone each time" — they already reached the same conclusion for their harness. So I left it as-is rather than trade a narrow harness-comparison nicety for breaking real auto-width resolution on every unstyled <div>.
-
-
-
-2
-
-------
-
-REPORTED:
-`Window.requestAnimationFrame()` passes `window.performance.now()` directly
-to the callback, but domonic's `Performance.now()` currently returns seconds
-(`time.time() - start`) rather than a DOMHighResTimeStamp in milliseconds.
-That makes spec-style RAF code that divides by 1000 appear frozen because it
-is running 1000x too slowly. Chromonic's GLFW hosts temporarily multiply the
-timestamp by 1000 when flushing queued RAF callbacks; domonic should either
-make `Performance.now()` return milliseconds or convert at RAF dispatch.
 
 
 
@@ -381,9 +337,8 @@ selector` accepts) has no `link`/`visited` case, so a rule like `a:link
 { color: #000 }` silently never applies; every link kept chromonic's own
 UA-stylesheet blue instead of the page's real black. Fixed upstream in
 Domonic 1.8.4; the former local workaround was removed. Domonic never
-simulates navigation history, so `:link` matches any `<a>`/`<area>` with a non-empty
-`href` (the honest, privacy-safe stance a fresh browser profile already
-takes) and `:visited` never matches anything.
+simulates navigation history, so `:link` matches any `<a>`/`<area>`/`<link>`
+with an `href` (1.8.5) and `:visited` never matches anything.
 
 
 
@@ -443,14 +398,11 @@ unchanged). Not patched upstream.
 ------
 
 Found in `css-flexbox` (`align-items-001.htm` and 21 other BOM-prefixed
-`.htm` fixtures): a leading U+FEFF (UTF-8 byte-order mark) in the source
-is kept as a text node before `<!DOCTYPE>`, so the parser treats it as
-body text and demotes `<title>`/`<link>`/`<style>` into `<body>` after
-it (a rendered first line, everything 26px lower than Chrome). Chrome
-strips the BOM before parsing. Worked around in `browser.py`'s
-`_RequestsResponseAdapter.text()` (which also decodes an undeclared-
-charset body as UTF-8 rather than requests' ISO-8859-1 default). Not
-patched upstream.
+`.htm` fixtures): `parseString(str)` keeps a leading U+FEFF as a text node
+before `<!DOCTYPE>`, demoting `<title>`/`<link>`/`<style>` into `<body>`.
+`parseString(bytes)` (1.8.5) strips it; chromonic now hands domonic the raw
+bytes (`browser._RequestsResponseAdapter.bytes()`). The `str` path is still
+unfixed upstream.
 
 
 
