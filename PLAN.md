@@ -154,6 +154,15 @@ aware real browsers are. Not investigated further.
 
 ## log domonic issues here to be fixed upstream
 
+PERF: Wikipedia's Python article: load (fetch+parse+CSS) ~0.5s, layout ~8.4s,
+almost all of it domonic's cascade. `_collect_author_declarations` runs
+19,861 times for 1,423 elements (~14x, about the tree depth: ancestors'
+styles get re-cascaded instead of hitting `_computed_style_cache`), giving
+709k `_matches_selector_chain` calls. Each of those also re-runs the
+`from domonic.bs4 import (...)` at the top of `_matches_selector_chain`
+(~1.1s of import machinery under cProfile). GC and streaming/progressive
+parse are not the bottleneck (GC off saves ~0.25s total).
+
 domonic doesn't drop an invalid declaration in favour of an earlier valid
 one: python.org's `white-space: pre-wrap; white-space: -o-pre-wrap;` computes
 to `-o-pre-wrap`. Worked around in `dom._white_space`.
