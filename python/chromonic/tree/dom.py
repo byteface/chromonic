@@ -192,6 +192,7 @@ def _extract_paint_style(computed) -> dict:
 
     return {
         "background_color": computed.getPropertyValue("background-color"),
+        "opacity": computed.getPropertyValue("opacity"),
         "background_image": computed.getPropertyValue("background-image"),
         "background_size": computed.getPropertyValue("background-size"),
         "background_position": computed.getPropertyValue("background-position"),

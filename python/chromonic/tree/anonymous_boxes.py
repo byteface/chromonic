@@ -409,9 +409,11 @@ def _wrap_inline_runs(element, nodes, computed_cache) -> list:
     if _table_part_kind(element, computed_cache) in ("table", "row-group", "row"):
         return nodes
     computed, style_obj = dom._describe(element, computed_cache)
-    if box_model._is_inline_level(element, style_obj):
-        return nodes
     display = (getattr(computed, "display", "") or "").strip().lower()
+    if box_model._is_inline_level(element, style_obj) and display != "inline-block":
+        # An inline-block is still a block container -- its own mixed
+        # children get anonymous blocks (inline-block-baseline-015.html).
+        return nodes
     flex_or_grid = display in ("flex", "inline-flex", "grid", "inline-grid")
 
     def classify(node) -> str:

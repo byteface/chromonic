@@ -186,6 +186,7 @@ impl BlockContext<'_> {
     pub fn find_bfc_slot(
         &self,
         min_y: f32,
+        height: f32,
         margins: [f32; 2],
         direction: Direction,
         clear: Clear,
@@ -193,6 +194,7 @@ impl BlockContext<'_> {
     ) -> BfcSlot {
         let mut slot = self.bfc.float_context.find_bfc_slot(
             min_y + self.y_offset,
+            height,
             self.content_box_insets,
             margins,
             direction,
@@ -1188,15 +1190,74 @@ fn perform_final_layout_on_in_flow_children(
                         // for the item's border box, which must not overlap any float
                         let mut slot_segment = None;
                         let slot = loop {
-                            let slot = block_ctx.find_bfc_slot(min_y, x_margins, direction, item.clear, slot_segment);
+                            let slot = block_ctx.find_bfc_slot(min_y, 0.0, x_margins, direction, item.clear, slot_segment);
                             let Some(segment_id) = slot.segment_id else { break slot };
-                            let width = item
-                                .size
-                                .width
-                                .unwrap_or(slot.stretch_width.max(min_auto_width))
+                            // chromonic patch: the border box must clear floats over its whole
+                            // height (CSS 2.1 9.5), not just beside its top edge -- lay it out at
+                            // the slot's width, then check every segment its height reaches,
+                            // narrowing until stable (floats-wrap-top-below-bfc-001l.xht).
+                            let mut candidate = slot;
+                            let mut fits = false;
+                            for _ in 0..16 {
+                                // A table or replaced box isn't stretched: it is as wide as its
+                                // own content allows in the slot (floats-wrap-bfc-004.xht).
+                                let width = match item.size.width {
+                                    Some(width) => width,
+                                    None if item.is_table || item.is_replaced => tree.measure_child_size(
+                                        item.node_id,
+                                        Size::NONE,
+                                        parent_size,
+                                        Size {
+                                            width: AvailableSpace::Definite(candidate.stretch_width.max(0.0)),
+                                            height: AvailableSpace::MaxContent,
+                                        },
+                                        SizingMode::InherentSize,
+                                        crate::AbsoluteAxis::Horizontal,
+                                        Line::FALSE,
+                                    ),
+                                    None => candidate.stretch_width.max(min_auto_width),
+                                }
                                 .maybe_clamp(item.min_size.width, item.max_size.width);
-                            if width <= slot.border_width + 0.001 {
-                                break slot;
+                                // A border box is never narrower than 0: a slot with negative
+                                // room beside a float never fits (floats-wrap-bfc-with-margin-004).
+                                if width.max(0.0) > candidate.border_width + 0.001 {
+                                    break;
+                                }
+                                let height = item
+                                    .size
+                                    .height
+                                    .unwrap_or_else(|| {
+                                        let known_width =
+                                            if item.is_table || item.is_replaced { None } else { Some(width) };
+                                        tree.measure_child_size(
+                                            item.node_id,
+                                            Size { width: known_width, height: None },
+                                            parent_size,
+                                            Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent },
+                                            SizingMode::InherentSize,
+                                            crate::AbsoluteAxis::Vertical,
+                                            Line::FALSE,
+                                        )
+                                    })
+                                    .maybe_clamp(item.min_size.height, item.max_size.height);
+                                let spanning = block_ctx.find_bfc_slot(
+                                    candidate.y,
+                                    height,
+                                    x_margins,
+                                    direction,
+                                    item.clear,
+                                    slot_segment,
+                                );
+                                if (spanning.x - candidate.x).abs() < 0.001
+                                    && (spanning.border_width - candidate.border_width).abs() < 0.001
+                                {
+                                    fits = true;
+                                    break;
+                                }
+                                candidate = spanning;
+                            }
+                            if fits {
+                                break candidate;
                             }
                             slot_segment = Some(segment_id);
                         };

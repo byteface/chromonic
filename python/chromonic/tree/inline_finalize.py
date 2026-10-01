@@ -18,7 +18,7 @@ def _merge_adjacent_same_line_rects(rects) -> list:
     nested `<b>`) collapse into a single `getClientRects()` entry."""
     merged = []
     for rect in rects:
-        if merged and abs(merged[-1][1] - rect[1]) < 0.01:
+        if merged and abs(merged[-1][1] - rect[1]) < 0.01 and not isinstance(rect, inline_formatting._AfterFloatRect):
             previous = merged[-1]
             merged[-1] = (previous[0], previous[1],
                           rect[0] + rect[2] - previous[0],
@@ -71,6 +71,14 @@ def _inline_relative_offset(owner, stop, container_box) -> "tuple[float, float]"
         node = getattr(node, "parentElement", None)
     return dx, dy
 
+
+
+def _is_relatively_positioned(element) -> bool:
+    resolved = box_of(element).resolved_style if dom._is_element(element) else None
+    if resolved is None:
+        return False
+    position = resolved[1].position
+    return getattr(position, "value", position) == "relative"
 
 
 def _is_flattened_inline(element) -> bool:
@@ -143,13 +151,20 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
     # descendants, excluding key's own -- kept separate since only the
     # horizontal extent folds upward, never the vertical.
     descendant_only = {key: [] for key in own_merged}
+    # ...and the subset from relatively positioned descendants, the only
+    # ones that stretch an ancestor's rect vertically.
+    descendant_shifted = {key: [] for key in own_merged}
     for key in sorted(own_merged, key=lambda key: _depth(owner_accum[key][0]), reverse=True):
-        parent = getattr(owner_accum[key][0], "parentElement", None)
+        owner = owner_accum[key][0]
+        parent = getattr(owner, "parentElement", None)
         while parent is not None:
             parent_key = id(parent)
             if parent_key in descendant_only:
                 descendant_only[parent_key].extend(own_merged_outer[key])
                 descendant_only[parent_key].extend(descendant_only[key])
+                if _is_relatively_positioned(owner):
+                    descendant_shifted[parent_key].extend(own_merged_outer[key])
+                descendant_shifted[parent_key].extend(descendant_shifted[key])
                 break
             parent = getattr(parent, "parentElement", None)
 
@@ -165,16 +180,19 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
         if desc:
             desc_left = min(r[0] for r in desc)
             desc_right = max(r[0] + r[2] for r in desc)
-            # Vertically too: a position:relative descendant's shifted box
-            # stretches its inline ancestor's rect -- position-relative-032.xht.
-            desc_top = min(r[1] for r in desc)
-            desc_bottom = max(r[1] + r[3] for r in desc)
-            all_merged = [
-                (min(rx, desc_left), min(ry, desc_top),
-                 max(rx + rw, desc_right) - min(rx, desc_left),
-                 max(ry + rh, desc_bottom) - min(ry, desc_top))
-                for rx, ry, rw, rh in own_merged[key]
-            ]
+            # Vertically only for a position:relative descendant, whose
+            # shifted box stretches its inline ancestor's rect --
+            # position-relative-032.xht; a taller (bigger-font) child
+            # doesn't -- anonymous-inline-inherit-001.html.
+            shifted = descendant_shifted[key]
+            all_merged = []
+            for rx, ry, rw, rh in own_merged[key]:
+                top, bottom = ry, ry + rh
+                if shifted:
+                    top = min(top, min(r[1] for r in shifted))
+                    bottom = max(bottom, max(r[1] + r[3] for r in shifted))
+                left, right = min(rx, desc_left), max(rx + rw, desc_right)
+                all_merged.append((left, top, right - left, bottom - top))
         else:
             all_merged = own_merged[key]
         # getClientRects(): real Chrome exposes one extra rect per in-flow
@@ -188,8 +206,13 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
             container_box = container.__dict__.get("_layout_box") if container is not None else None
             cpt, cpr, cpb, cpl = (box_of(container).get("padding", (0.0,) * 4)
                                   if container is not None else (0.0,) * 4)
-            group_keys = sorted(groups, key=lambda key: (key is not None, key))
-            merged_groups = [_merge_adjacent_same_line_rects(groups[key]) for key in group_keys]
+            if None in groups:
+                group_keys = sorted(groups, key=lambda key: (key is not None, key))
+            else:
+                # One group per segment, empty ones included, so each
+                # interruption marker lands after its own segment.
+                group_keys = range(max(len(interruption_blocks), max(groups)) + 1)
+            merged_groups = [_merge_adjacent_same_line_rects(groups.get(key, [])) for key in group_keys]
             self_edges = box_of(owner).split_self_edges
             self_left, self_right, self_top = self_edges or (0.0, 0.0, 0.0)
             if self_edges and merged_groups:
@@ -215,9 +238,10 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
                         [(rx - self_left, ry, rw, rh) for rx, ry, rw, rh in group]
                         for group in merged_groups
                     ]
-                    first = merged_groups[0][0]
-                    merged_groups[0][0] = (first[0], first[1], first[2] + self_left, first[3])
-                if self_right:
+                    if merged_groups[0]:
+                        first = merged_groups[0][0]
+                        merged_groups[0][0] = (first[0], first[1], first[2] + self_left, first[3])
+                if self_right and merged_groups[-1]:
                     last = merged_groups[-1][-1]
                     merged_groups[-1][-1] = (last[0], last[1], last[2] + self_right, last[3])
             final_rects: list = []
@@ -237,7 +261,8 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
                 # remaining content on that side.
                 interior_empty = (
                     0 < index < len(merged_groups) - 1
-                    and len(group) == 1 and group[0][2] == 0.0 and group[0][3] == 0.0
+                    and (not group or (len(group) == 1 and group[0][2] == 0.0 and group[0][3] == 0.0))
+                    and index not in (box_of(owner).split_float_segments or ())
                 )
                 if not interior_empty:
                     final_rects.extend(group)
@@ -246,6 +271,16 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
                     block_box = block.__dict__.get("_layout_box")
                     if block_box is not None and container_box is not None:
                         block_y = block_box.y
+                        native = box_of(block).native_style or {}
+                        if native.get("position") == "relative":
+                            # The anonymous block box around it stays put;
+                            # only the block itself is offset --
+                            # block-in-inline-008.xht.
+                            top, _right, bottom, _left = native.get("inset") or ("auto",) * 4
+                            basis = container_box.client_height
+                            top_v = positioning._resolve_inset(top, basis)
+                            bottom_v = positioning._resolve_inset(bottom, basis)
+                            block_y -= top_v if top_v is not None else (-bottom_v if bottom_v is not None else 0.0)
                         if container is owner:
                             # The direct-child shape: container is owner
                             # itself, forced to width:100% of its own
@@ -264,15 +299,18 @@ def _finalize_inline_owner_boxes(owner_accum) -> None:
                         # the block's own border box, not a margin-inflated
                         # union.
                         marker_rect = (marker_x, block_y, marker_width, block_box.height)
-                        # Two markers with a skipped, genuinely-empty
-                        # interior segment between them are visually
-                        # contiguous -- Chrome reports one merged rect.
+                        # Blocks with only a skipped, genuinely-empty
+                        # interior segment between them share one anonymous
+                        # block box -- Chrome reports one rect spanning them,
+                        # margins between included --
+                        # multiple-block-in-inlines-margins-collapse.html.
                         prev = final_rects[-1] if final_rects else None
-                        if (interior_empty and prev is not None
+                        if (interior_empty and prev is not None and marker_positions
+                                and marker_positions[-1][0] == len(final_rects) - 1
                                 and abs(prev[0] - marker_rect[0]) < 0.01
-                                and abs(prev[2] - marker_rect[2]) < 0.01
-                                and abs(prev[1] + prev[3] - marker_rect[1]) < 0.01):
-                            final_rects[-1] = (prev[0], prev[1], prev[2], prev[3] + marker_rect[3])
+                                and abs(prev[2] - marker_rect[2]) < 0.01):
+                            final_rects[-1] = (prev[0], prev[1], prev[2],
+                                               marker_rect[1] + marker_rect[3] - prev[1])
                             marker_positions[-1][1].append(block)
                         else:
                             final_rects.append(marker_rect)
@@ -357,20 +395,33 @@ def _fix_split_inline_relative_offset(owners) -> None:
         dx = left_v if left_v is not None else (-right_v if right_v is not None else 0.0)
         if abs(dx) < 1e-6 and abs(dy) < 1e-6:
             continue
-        box = owner.__dict__.get("_layout_box")
-        if box is not None:
-            owner.__dict__["_layout_box"] = dataclasses.replace(box, x=box.x + dx, y=box.y + dy)
-        inline_boxes = box_of(owner).inline_boxes
-        if inline_boxes:
-            box_of(owner).inline_boxes = [
-                (rx + dx, ry + dy, rw, rh) for rx, ry, rw, rh in inline_boxes
-            ]
-        for fragment in box_of(owner).owned_fragments or ():
-            fbox = fragment.__dict__.get("_layout_box")
-            if fbox is not None:
-                fragment._layout_box = dataclasses.replace(fbox, x=fbox.x + dx, y=fbox.y + dy)
+        _shift_inline_owner(owner, dx, dy)
         for block in interruption_blocks:
             geometry._shift_subtree(block, dx, dy)
+        # Floats, atomic inlines and nested inlines inside its pieces move
+        # with it too -- block-in-inline-relpos-002.xht.
+        for item in (box_of(owner).split_contents or {}).values():
+            if _is_flattened_inline(item):
+                _shift_inline_owner(item, dx, dy)
+            elif item.__dict__.get("_layout_box") is not None:
+                previous = box_of(item).inline_rel_offset or (0.0, 0.0)
+                inline_formatting._apply_inline_rel_offset(item, previous[0] + dx, previous[1] + dy)
+
+
+def _shift_inline_owner(owner, dx, dy) -> None:
+    """Move an inline's published box, client rects and text fragments."""
+    box = owner.__dict__.get("_layout_box")
+    if box is not None:
+        owner.__dict__["_layout_box"] = dataclasses.replace(box, x=box.x + dx, y=box.y + dy)
+    inline_boxes = box_of(owner).inline_boxes
+    if inline_boxes:
+        box_of(owner).inline_boxes = [
+            (rx + dx, ry + dy, rw, rh) for rx, ry, rw, rh in inline_boxes
+        ]
+    for fragment in box_of(owner).owned_fragments or ():
+        fbox = fragment.__dict__.get("_layout_box")
+        if fbox is not None:
+            fragment._layout_box = dataclasses.replace(fbox, x=fbox.x + dx, y=fbox.y + dy)
 
 
 

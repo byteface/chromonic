@@ -168,6 +168,13 @@ def _setup_table_root(element, style, computed, computed_cache, tag_name):
             # PLAN.md), reproduced here.
             spacing_h = spacing_v = 2.0
         box_of(element).border_spacing = (spacing_h, spacing_v)
+        # No rows (columns): no spacing on that axis at the table's edges
+        # either -- a caption-only table is its caption's height, as in
+        # Chrome (floats-in-table-caption-001.html).
+        if not box_of(element).table_rows:
+            spacing_v = 0.0
+        if not box_of(element).table_columns:
+            spacing_h = 0.0
         if spacing_h or spacing_v:
             # The same gap also separates the table's own edge from
             # its outermost row/column (CSS 2.1 17.6.1's spacing
@@ -847,6 +854,10 @@ def build(
             or getattr(style_obj.display, "value", "") in ("inline-flex", "inline-grid")):
         # inline-block establishes its own BFC (CSS 2.1 9.2.1) -- signalled
         # to Taffy via Contain::PAINT, same as overflow.
+        style["establishes_bfc"] = True
+    elif (getattr(computed, "display", "") or "").strip().lower() == "flow-root":
+        # CSS Display 3: flow-root is a block container that establishes a
+        # new BFC -- it contains its floats (floats-placement-005.html).
         style["establishes_bfc"] = True
     is_table_root = tag_name == "table" or table_layout._is_table_root_display(computed)
     is_table_row = not box_model._is_absolutely_positioned(style_obj) and (

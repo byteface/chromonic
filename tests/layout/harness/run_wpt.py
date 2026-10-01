@@ -367,8 +367,11 @@ def run_folder(folder, output, base_url, tolerance, chrome=None, limit=None, sta
                 except ValueError:
                     stored = None
                 # Only a baseline for the very same tagging is reusable: an
-                # older tagger numbered elements differently.
-                if stored is not None and set(stored.get("elements", {})) != set(
+                # older tagger numbered elements differently. Author ids
+                # (`div1`) are in `elements` too but never in the regex.
+                if stored is not None and {
+                        key for key in stored.get("elements", {})
+                        if key.startswith("__chromonic_wpt_")} != set(
                         re.findall(r'id="(__chromonic_wpt_\d+)"', tagged)):
                     stored = None
             if stored is not None:

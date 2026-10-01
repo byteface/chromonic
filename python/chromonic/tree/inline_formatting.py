@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import math
 import re
 
@@ -58,6 +59,10 @@ class _InlineFormattingPlan:
         non-float atomic's border-box position."""
         self._atomic_info = {info[0]: info for info in atomics}
         self._placed_floats = {k: (x, y) for k, x, y in placed_floats}
+        if not placed_floats:
+            # float index -> the y of the line it was placed beside, when
+            # it went on the line it was met on (see the float branch).
+            self._floats_on_line = {}
         width = float(available_width or 0.0)
         min_content_probe = width < 0
         if min_content_probe:
@@ -74,7 +79,7 @@ class _InlineFormattingPlan:
             self.parent_style["font_family"], base_font,
             _parse_font_weight(self.parent_style["font_weight"]) >= 600,
             fonts.is_italic(self.parent_style["font_style"]))
-        base_height = base_height or normal
+        base_height = normal if base_height is None else base_height
         base_above = base_ascent + math.floor((base_height - base_ascent - base_descent) / 2)
         base_below = base_height - base_above
         # CSS 2.1 10.8: how each atomic box sits on its line, per its own
@@ -110,6 +115,26 @@ class _InlineFormattingPlan:
         # position wherever it falls; `publish()` turns this into a page position.
         self._escapee_positions = {}
         placed = []
+        # (run index, token index) of each `placed` entry, and the tokens a
+        # line must end before -- its last break opportunity when a later
+        # token overflowed with none of its own (CSS Text 3 5).
+        placed_at = []
+        forced_breaks = set()
+        # (float index, run index) of floats met on the current line that
+        # didn't fit beside it: placed at the next line's top once this
+        # line has broken (CSS 2.1 9.5 rules 6 and 8) --
+        # floats-line-wrap-shifted-001.html.
+        pending_floats = []
+
+        def prune_pending():
+            pending_floats[:] = [(k, i) for k, i in pending_floats if i < checkpoint[0]]
+
+        def pending_request():
+            if not pending_floats:
+                return None
+            k = pending_floats[0][0]
+            self._floats_on_line[k] = state.y
+            return ("float", k, state.y)
         first_line_y = [None]
         runs = self.runs
         # A line is laid against the band at its top, then checked against
@@ -132,9 +157,65 @@ class _InlineFormattingPlan:
             top, bottom, left, band_width = band_list[-1]
             return left, left + band_width, math.inf
 
-        def start_line(new_y, *, first=False):
+        def following_items(float_index):
+            """(item, width) of each token after run `float_index`, up to
+            the next forced break -- out-of-flow runs skipped."""
+            for later in runs[float_index + 1:]:
+                if later.get("break"):
+                    return
+                if later.get("escapee") or later.get("float"):
+                    continue
+                if later.get("atomic"):
+                    later_metrics = self._atomic_metrics.get(later.get("atomic_index"))
+                    yield _break_item(later, "￼"), later_metrics["advance"] if later_metrics else 0.0, 0.0
+                    continue
+                for token_index, (text, token_width) in enumerate(later["tokens"]):
+                    extra = ((later["leading"] if token_index == 0 else 0.0)
+                             + (later["trailing"] if token_index == len(later["tokens"]) - 1 else 0.0))
+                    yield _break_item(later, text), token_width + extra, _hanging_space(later, text)
+
+        def unbreakable_width_after(float_index):
+            """How wide the content after a float is up to its first break
+            opportunity (the float itself is none)."""
+            line = [_break_item(entry[0], entry[1]) for entry in placed[checkpoint[2]:]]
+            total = hang = 0.0
+            first = True
+            for item, item_width, item_hang in following_items(float_index):
+                if not (item[0] or item[1]):
+                    continue
+                # An opportunity right at the float is one the line breaks
+                # at before it; only a later one helps.
+                if not first and _break_allowed_before(line + [item], len(line)):
+                    break
+                first = False
+                total += item_width
+                hang = item_hang
+                line.append(item)
+            return total - hang
+
+        def line_can_break_before(float_index):
+            """Whether this line has a break opportunity at or before the
+            float's position."""
+            line = [_break_item(entry[0], entry[1]) for entry in placed[checkpoint[2]:]]
+            following = next((item for item, _w, _h in following_items(float_index) if item[0] or item[1]), None)
+            if following is not None:
+                line.append(following)
+            return any(_break_allowed_before(line, pos) for pos in range(1, len(line)))
+
+        def cleared_y(side, from_y):
+            """The first y at or below `from_y` clear of floats on `side`."""
+            y = from_y
+            for top, bottom, left, band_width in band_list:
+                if bottom <= y or top > y + 1e-6:
+                    continue
+                if ((side in ("left", "both") and left > 1e-6)
+                        or (side in ("right", "both") and left + band_width < width - 1e-6)):
+                    y = bottom
+            return y
+
+        def start_line(new_y, *, first=False, band=None):
             state.y = new_y
-            state.line_left, state.line_right, state.line_bottom = band_for(new_y)
+            state.line_left, state.line_right, state.line_bottom = band if band is not None else band_for(new_y)
             # CSS 2.1 16.1: text-indent only offsets the first formatted line.
             state.x = state.line_left + (self.text_indent if first else 0.0)
             state.x_pre_trailing = state.x
@@ -143,6 +224,8 @@ class _InlineFormattingPlan:
             state.line_leading_total = 0.0
             state.above, state.below = base_above, base_below
             state.line_has_content = False
+            state.line_has_ink = False
+            state.line_has_items = False
             state.top_aligned = []
             state.bottom_aligned = []
             checkpoint[0], checkpoint[1], checkpoint[2] = cursor[0], cursor[1], len(placed)
@@ -155,35 +238,50 @@ class _InlineFormattingPlan:
             for extent in state.bottom_aligned:
                 state.above = max(state.above, extent - state.below)
 
-        def line_retry_y():
-            """The y to lay this line again from, when a band it crosses
-            below its top leaves less room than its content took; None
-            when it fits as placed."""
+        def line_retry():
+            """None when the line fits as placed, else `(y, band)` to lay it
+            again from. CSS 2.1 9.5: a line box beside floats is shortened to
+            the space free over its whole height -- first the line is laid
+            again at its own y against that space; only when it already was
+            does it move down, to the top of the band it doesn't fit beside
+            (floats-wrap-top-below-inline-001l.xht). A line that fits is
+            still narrowed, so it aligns within the right space."""
             entries = placed[checkpoint[2]:]
             if not entries:
                 return None
             height = state.above + state.below
             content_left = min(px - leading - entry_run.get("margin_start", 0.0)
                                for entry_run, _t, px, _y, _tw, _th, leading, _tr, _a in entries)
-            content_right = max(px + advance + trailing
-                                for _r, _t, px, _y, _tw, _th, _l, trailing, advance in entries)
+            content_right = max(px + advance + trailing - _hanging_space(entry_run, text)
+                                for entry_run, text, px, _y, _tw, _th, _l, trailing, advance in entries)
+            left, right = state.line_left, state.line_right
+            offending_top = None
             for top, _bottom, band_left, band_width in band_list:
                 if top <= state.y + 1e-6 or top >= state.y + height - 1e-6:
                     continue
-                if content_left < band_left - 1e-6 or content_right > band_left + band_width + 1e-6:
-                    return top
-            return None
+                left, right = max(left, band_left), min(right, band_left + band_width)
+                if offending_top is None and (content_left < band_left - _FIT_EPSILON
+                                              or content_right > band_left + band_width + _FIT_EPSILON):
+                    offending_top = top
+            if offending_top is None:
+                state.line_left, state.line_right = left, right
+                return None
+            if left > state.line_left + _FIT_EPSILON or right < state.line_right - _FIT_EPSILON:
+                return state.y, (left, right, state.line_bottom)
+            return offending_top, None
 
         def close_line() -> bool:
-            """Finalize the current line, or roll it back to be laid lower
-            down (True): `placed` and `cursor` return to its checkpoint."""
+            """Finalize the current line, or roll it back to be laid again
+            (True): `placed` and `cursor` return to its checkpoint."""
             settle_line_metrics()
-            retry_y = line_retry_y() if relaid[0] < 64 else None
-            if retry_y is not None:
+            retry = line_retry() if relaid[0] < 64 else None
+            if retry is not None:
                 del placed[checkpoint[2]:]
+                del placed_at[checkpoint[2]:]
                 cursor[0], cursor[1] = checkpoint[0], checkpoint[1]
+                prune_pending()
                 relaid[0] += 1
-                start_line(retry_y)
+                start_line(retry[0], first=first_line_y[0] is None, band=retry[1])
                 return True
             self._line_baselines[state.y] = state.above
             self._line_belows[state.y] = state.below
@@ -226,9 +324,19 @@ class _InlineFormattingPlan:
                         state.line_margin_start, state.line_leading_total)
                     break_precedes_run[run_index] = state.last_real_run
                     next_y = state.y + state.above + state.below
+                    if bands is not None:
+                        if "clear" not in run:
+                            run["clear"] = _br_clear(run["element"])
+                        if run["clear"]:
+                            # `<br style="clear: both">`: the next line starts
+                            # below those floats -- hit-test-floats-001.html.
+                            next_y = cleared_y(run["clear"], next_y)
                     cursor[0] += 1
                     cursor[1] = 0
                     start_line(next_y)
+                    request = pending_request()
+                    if request is not None:
+                        return request
                     continue
                 metrics = None
                 if run.get("atomic"):
@@ -244,9 +352,27 @@ class _InlineFormattingPlan:
                             # line's top when it fits beside what's already on
                             # it (or the line is still empty and the float
                             # context decides), else below this line.
-                            if state.x <= state.line_left + 1e-6 or state.x + float_width <= state.line_right + 1e-6:
+                            fits_here = (state.x <= state.line_left + 1e-6
+                                         or state.x + float_width <= state.line_right + _FIT_EPSILON)
+                            if (fits_here and state.line_has_items
+                                    and state.x + float_width + unbreakable_width_after(run_index)
+                                    > state.line_right + _FIT_EPSILON
+                                    and line_can_break_before(run_index)):
+                                # The content right after it can't share this
+                                # line and the line breaks before it: the
+                                # float goes with that content onto the next
+                                # line (float-nowrap-4.html).
+                                fits_here = False
+                            if fits_here and not pending_floats:
+                                self._floats_on_line[run["atomic_index"]] = state.y
                                 return ("float", run["atomic_index"], state.y)
-                            return ("float", run["atomic_index"], state.y + state.above + state.below)
+                            # (Behind a pending one it waits too: floats are
+                            # placed in order -- floats-placement-vertical-003.)
+                            if all(k != run["atomic_index"] for k, _i in pending_floats):
+                                pending_floats.append((run["atomic_index"], run_index))
+                            cursor[0] += 1
+                            cursor[1] = 0
+                            continue
                         # Intrinsic sizing: a float contributes its margin-box
                         # width like an atomic inline, and no height.
                     tokens = [("￼", metrics["advance"] if metrics else 0.0)]
@@ -256,6 +382,16 @@ class _InlineFormattingPlan:
                 while cursor[1] < len(tokens):
                     index = cursor[1]
                     text, token_width = tokens[index]
+                    if (run_index, index) in forced_breaks and state.line_has_items:
+                        # The last break opportunity before content that
+                        # overflowed: end the line here.
+                        if close_line():
+                            rolled_back = True
+                            break
+                        start_line(state.y + state.above + state.below)
+                        request = pending_request()
+                        if request is not None:
+                            return request
                     leading = run["leading"] if index == 0 else 0.0
                     trailing = run["trailing"] if index == len(tokens) - 1 else 0.0
                     # margin-start shifts the whole run right on the first token
@@ -265,8 +401,20 @@ class _InlineFormattingPlan:
                         state.line_margin_start += run.get("margin_start", 0.0)
                     advance_width = (max(token_width, run["atomic_width"])
                                      if len(tokens) == 1 else token_width)
+                    removed_space = (
+                        not state.line_has_ink and not run.get("atomic")
+                        and text and not text.strip(_CSS_WHITESPACE_STRIP_CHARS)
+                        and (run["paint_style"].get("white_space") or "normal").strip().lower()
+                        not in ("pre", "pre-wrap", "break-spaces"))
+                    if removed_space:
+                        # CSS Text 3 4.1.2: collapsible spaces at a line's
+                        # start are removed, ignoring inline box boundaries
+                        # -- a space after an empty split fragment or an
+                        # empty <span> -- inline-text-after-block-in-inline-
+                        # with-intervening-float.html.
+                        token_width = advance_width = 0.0
                     total = leading + advance_width + trailing
-                    fit_total = total - (run["space_width"] if text[-1:].isspace() else 0.0)
+                    fit_total = total - (run["space_width"] if text[-1:] in _CSS_SPACE_CHARS else 0.0)
                     following_space = 0.0
                     if index == len(tokens) - 1 and run["owner"] is not self.element:
                         for later in runs[run_index + 1:]:
@@ -283,19 +431,51 @@ class _InlineFormattingPlan:
                                     following_space = later["tokens"][0][1]
                                 break
                     is_content = bool(text.strip())
-                    line_empty = state.last_real_run is None
+                    # Only removed line-start spaces so far: no break
+                    # opportunity before this token (CSS Text 3 4.1.2).
+                    line_empty = not state.line_has_items
                     guard = 0
-                    while (is_content and state.x + fit_total + following_space > state.line_right + 1e-6
+                    while (is_content and state.x + fit_total + following_space > state.line_right + _FIT_EPSILON
                            and guard < 64):
                         guard += 1
                         margin_carry = run.get("margin_start", 0.0) if index == 0 else 0.0
                         if not line_empty:
+                            line_items = [_break_item(entry[0], entry[1]) for entry in placed[checkpoint[2]:]]
+                            line_items.append(_break_item(run, text))
+                            if not _break_allowed_before(line_items, len(line_items) - 1):
+                                # No break opportunity right here: end the
+                                # line at its last one instead, or overflow
+                                # when it has none ("magnitudedev" + ")").
+                                last = next((pos for pos in range(len(line_items) - 2, 0, -1)
+                                             if _break_allowed_before(line_items, pos)), None)
+                                if last is not None and relaid[0] < 64:
+                                    forced_breaks.add(placed_at[checkpoint[2] + last])
+                                    del placed[checkpoint[2]:]
+                                    del placed_at[checkpoint[2]:]
+                                    cursor[0], cursor[1] = checkpoint[0], checkpoint[1]
+                                    prune_pending()
+                                    relaid[0] += 1
+                                    start_line(state.y, first=first_line_y[0] is None)
+                                    rolled_back = True
+                                    break
+                                if state.line_has_ink and any(
+                                        abs(float_y - state.y) < 1e-6
+                                        for float_y in getattr(self, "_floats_on_line", {}).values()):
+                                    # A float placed on this very line after its
+                                    # content narrowed it: the line overflows,
+                                    # it doesn't move -- float-nowrap-7.html.
+                                    break
+                                line_empty = True
+                                continue
                             # Wrap: this token starts the next line.
                             if close_line():
                                 rolled_back = True
                                 break
                             next_y = state.y + state.above + state.below
                             start_line(next_y)
+                            request = pending_request()
+                            if request is not None:
+                                return request
                             state.x += margin_carry
                             state.line_margin_start += margin_carry
                             line_empty = True
@@ -303,6 +483,16 @@ class _InlineFormattingPlan:
                         if state.line_bottom < math.inf and state.line_right - state.line_left < width - 1e-6:
                             # CSS 2.1 9.5: a line box shortened by a float that
                             # can't fit any content shifts down until it can.
+                            if len(placed) > checkpoint[2]:
+                                # Whatever empty lead-in the line already
+                                # holds moves down with it: lay it again.
+                                del placed[checkpoint[2]:]
+                                del placed_at[checkpoint[2]:]
+                                cursor[0], cursor[1] = checkpoint[0], checkpoint[1]
+                                prune_pending()
+                                start_line(state.line_bottom)
+                                rolled_back = True
+                                break
                             start_line(state.line_bottom)
                             state.x += margin_carry
                             state.line_margin_start += margin_carry
@@ -322,17 +512,24 @@ class _InlineFormattingPlan:
                             state.above = max(state.above, metrics["above"])
                             state.below = max(state.below, metrics["below"])
                     else:
-                        state.above = max(state.above, run["above"])
-                        state.below = max(state.below, run["below"])
+                        shift = self._run_shift(run)
+                        state.above = max(state.above, run["above"] + shift)
+                        state.below = max(state.below, run["below"] - shift)
                     # A 9.2.1.1 split segment's decoration-only marker
                     # (`_empty_decoration_only_run`) never counts as real content
                     # by itself -- `publish()` uses this to decide whether it
                     # should inherit its line's real geometry instead of 0x0.
-                    if not (run.get("empty_strut") and run["ascent"] == 0.0
-                            and run["above"] == 0.0 and run["below"] == 0.0):
+                    if not removed_space and not (run.get("empty_strut") and run["ascent"] == 0.0
+                                                  and run["above"] == 0.0 and run["below"] == 0.0):
                         state.line_has_content = True
+                    if not removed_space:
+                        state.line_has_items = True
+                    if (text.strip(_CSS_WHITESPACE_STRIP_CHARS) or (run.get("atomic") and not run.get("float"))
+                            or (not removed_space and (leading or trailing or run.get("margin_start", 0.0)))):
+                        state.line_has_ink = True
                     placed.append((run, text, state.x + leading, state.y, token_width, token_height,
                                    leading, trailing, advance_width))
+                    placed_at.append((run_index, index))
                     state.x_pre_trailing = state.x + leading + advance_width
                     state.last_real_run = run
                     state.x += total
@@ -348,23 +545,31 @@ class _InlineFormattingPlan:
                 cursor[0] += 1
                 cursor[1] = 0
             if not close_line():
+                if pending_floats:
+                    # Met on the last line without fitting: below it.
+                    k = pending_floats[0][0]
+                    below_y = state.y + state.above + state.below
+                    self._floats_on_line[k] = below_y
+                    return ("float", k, below_y)
                 break
-        above, below, y, last_real_run = state.above, state.below, state.y, state.last_real_run
+        above, below, y, final_line_empty = state.above, state.below, state.y, not state.line_has_content
         # CSS 2.1 9.4.2: a line box collapses to zero height when every run
         # on it is a zero-edge empty strut (no text, no border/padding/
         # margin) -- any real content alongside one keeps normal height.
-        is_all_zero_edge_empty = placed and all(
+        is_all_zero_edge_empty = placed and not any(run.get("break") for run in self.runs) and all(
             run.get("empty_strut") and run["leading"] == 0.0 and run["trailing"] == 0.0
             and run["box_height"] <= run["glyph_height"] + 1e-6 and run.get("margin_start", 0.0) == 0.0
             for run in self.runs if not run.get("break") and not run.get("escapee") and not run.get("float"))
-        if last_real_run is None and any(run.get("break") for run in self.runs):
-            # Nothing placed after the final forced break: that line holds
-            # no content and collapses (CSS 2.1 9.4.2) -- `a<br>` is one
-            # line, `a<br><br>` two -- table-height-algorithm-004.xht.
+        if final_line_empty and any(run.get("break") for run in self.runs):
+            # Nothing (or only a zero-size split fragment) after the final
+            # forced break: that line holds no content and collapses (CSS
+            # 2.1 9.4.2) -- `a<br>` is one line, `a<br><br>` two --
+            # table-height-algorithm-004.xht.
             self.height = y
         else:
             self.height = 0.0 if is_all_zero_edge_empty else (y + above + below if placed else 0.0)
         if is_all_zero_edge_empty:
+            self._line_has_content = dict.fromkeys(self._line_has_content, False)
             # Each such strut reports zero height too, not its font-metrics
             # box_height -- the line it sits on doesn't exist.
             placed = [
@@ -380,7 +585,7 @@ class _InlineFormattingPlan:
                 if metrics is not None:
                     self.height = max(self.height, fy + metrics["extent"])
         # Trailing white space hangs past the line end (CSS Text 3 4.1.2).
-        widest_line = max((px + advance - (run.get("space_width", 0.0) if text[-1:].isspace() else 0.0)
+        widest_line = max((px + advance - (run.get("space_width", 0.0) if text[-1:] in _CSS_SPACE_CHARS else 0.0)
                            for run, text, px, _y, _pw, _h, _l, _tr, advance in placed), default=0.0)
         # A min-content probe's answer is its widest unbreakable piece, which
         # overflows the ~zero probe width -- not the probe width itself.
@@ -493,6 +698,32 @@ class _InlineFormattingPlan:
         _k, w, _h, _baseline, mt, mr, mb, ml, _float = info
         return {"advance": ml + w + mr, "extent": mt + _h + mb}
 
+    def _run_shift(self, run) -> float:
+        """How far a text run's baseline sits above the line's (its
+        inline ancestors' vertical-align), cached on the run."""
+        shift = run.get("_shift")
+        if shift is None:
+            shift = run["_shift"] = self._inline_shift(run.get("owner"))
+        return shift
+
+    def _inline_shift(self, owner) -> float:
+        """CSS 2.1 10.8.1: how far the inline boxes from `owner` up to
+        this plan's element raise their content -- each one's own
+        vertical-align against its parent, summed down the chain
+        (`<sup><b>1</b></sup>` raises the "1") --
+        inline-formatting-context-010c.xht."""
+        cache = self.__dict__.setdefault("_shift_cache", {})
+        if id(owner) in cache:
+            return cache[id(owner)]
+        total = 0.0
+        node = owner
+        while (node is not None and node is not self.element and dom._is_element(node)
+               and not isinstance(node, anonymous_boxes._AnonymousTableBox)):
+            total += _own_vertical_shift(node, self.element, self.parent_style)
+            node = getattr(node, "parentElement", None)
+        cache[id(owner)] = total
+        return total
+
     def _atomic_line_metrics(self, run, base_ascent, base_descent, base_height, base_font):
         """CSS 2.1 10.8.1 vertical-align for one atomic inline-level box:
         its extent above and below the line's baseline (`above`/`below`),
@@ -536,6 +767,9 @@ class _InlineFormattingPlan:
                 shift = 0.0
         elif align not in ("baseline", ""):
             shift = _fontmetrics.parse_length(align, default=0.0) or 0.0
+        if mode == "baseline":
+            # Raised with any vertically aligned inline it sits in.
+            shift += self._inline_shift(run.get("owner"))
         top_to_baseline = mt + box_baseline + shift
         return {
             "advance": advance, "extent": extent, "mode": mode,
@@ -550,7 +784,6 @@ class _InlineFormattingPlan:
         distributes leftover space at each whitespace-ending token
         boundary, every line but the last -- each 9.2.1.1 split segment is
         its own anonymous block, so its own last line is independent."""
-        self._justified_lines = set()
         if not placed:
             return placed
         text_align = "left" if self.text_align in ("start", "") else (
@@ -584,21 +817,22 @@ class _InlineFormattingPlan:
                 result.extend(line_entries)
                 continue
             line_start = min(e[2] - e[6] for e in line_entries)
-            line_end = max(e[2] + e[8] + e[7] for e in line_entries)
+            # A line's trailing white space hangs (CSS Text 3 4.1.2): it
+            # doesn't count toward what gets aligned --
+            # floats-wrap-top-below-001r-notref.xht.
+            line_end = max(e[2] + e[8] + e[7] - _hanging_space(e[0], e[1]) for e in line_entries)
             band_left, band_right = self._line_bands.get(line_entries[0][3], (0.0, width))
             slack = (band_right - band_left) - (line_end - line_start)
             if align == "justify":
-                gap_after = [i for i, e in enumerate(line_entries[:-1]) if e[1][-1:].isspace()]
+                # (A space removed at the line's start isn't a gap.)
+                gap_after = [i for i, e in enumerate(line_entries[:-1])
+                             if e[1][-1:] in _CSS_SPACE_CHARS and e[8] > 0.0]
                 if not gap_after or slack <= 0:
                     result.extend(line_entries)
                     continue
                 extra_per_gap = slack / len(gap_after)
                 gap_set = set(gap_after)
                 cumulative = 0.0
-                # `publish()`'s trailing-whitespace collapse would otherwise
-                # trim this same slack back off the last token -- recorded
-                # here so `publish()` can skip it for a justified line.
-                self._justified_lines.add(line_entries[0][3])
                 for index, (run, text, px, y, token_width, token_height, leading, trailing, advance) in enumerate(line_entries):
                     result.append((run, text, px + cumulative, y, token_width, token_height, leading, trailing, advance))
                     if index in gap_set:
@@ -631,25 +865,43 @@ class _InlineFormattingPlan:
         owner_rects = {}
         grouped = {}
         placed = getattr(self, "_placed", ())
+        run_indices = {id(run): index for index, run in enumerate(self.runs)}
+        float_runs = [(index, run["owner"]) for index, run in enumerate(self.runs) if run.get("float")]
+        last_run_of_owner: dict = {}
         first_of_run: dict = {}
         last_of_run: dict = {}
         for placed_index, entry in enumerate(placed):
             first_of_run.setdefault(id(entry[0]), placed_index)
             last_of_run[id(entry[0])] = placed_index
+        # Whether anything with content follows each entry on its line: a
+        # collapsed-away space or an empty inline after a token doesn't stop
+        # its trailing space hanging -- inline-box-border-line-break.html.
+        content_follows = [False] * len(placed)
+        seen_content = False
+        for index in range(len(placed) - 1, -1, -1):
+            if index + 1 < len(placed) and placed[index + 1][3] != placed[index][3]:
+                seen_content = False
+            content_follows[index] = seen_content
+            entry_run, entry_text = placed[index][0], placed[index][1]
+            if entry_text.strip(_CSS_WHITESPACE_STRIP_CHARS) or (entry_run.get("atomic") and not entry_run.get("float")):
+                seen_content = True
         for placed_index, (run, text, x, y, width, token_height, leading, trailing, advance) in enumerate(placed):
-            ends_line = placed_index + 1 == len(placed) or placed[placed_index + 1][3] != y
-            # A justified line's trailing space was already redistributed
-            # into real inter-word gaps -- nothing left to collapse
-            # (see `_apply_text_align`'s `_justified_lines`).
-            collapsed_space = (run["space_width"]
-                               if text[-1:].isspace() and ends_line
-                               and y not in getattr(self, "_justified_lines", ()) else 0.0)
+            ends_line = not content_follows[placed_index]
+            # A line's trailing space hangs, justified lines included
+            # (`_apply_text_align` stretches the line without it).
+            collapsed_space = _hanging_space(run, text) if ends_line else 0.0
             visual_width = max(0.0, width - collapsed_space)
             visual_advance = max(0.0, advance - collapsed_space)
             glyph_height = min(token_height, run["glyph_height"])
-            glyph_y = y + self._line_baselines[y] - run["ascent"]
+            glyph_y = y + self._line_baselines[y] - run["ascent"] - self._run_shift(run)
             key = (id(run["source"]), y)
             entry = grouped.get(key)
+            if (not run.get("atomic") and text and not text.strip(_CSS_WHITESPACE_STRIP_CHARS)
+                    and advance == 0.0):
+                # A space removed at the line's start draws nothing: kept
+                # in the fragment, paint drew it and pushed the text right
+                # (csszengarden.com's "by Andrew" read "byAndrew").
+                text = ""
             # A genuinely empty inline's strut run (`_empty_inline_strut_run`,
             # one ("", 0.0) token) places a real element rect via
             # `owner_rects` below but is never a text-range fragment --
@@ -691,22 +943,37 @@ class _InlineFormattingPlan:
             # normally sits alone on its own zero-height line, but when real
             # sibling content shares that line it belongs at the top of the
             # real line instead, sized to that line's real height.
-            is_decoration_only_marker = (
-                run.get("empty_strut") and run["ascent"] == 0.0
-                and run["above"] == 0.0 and run["below"] == 0.0
-            )
+            # (Not a `font-size: 0` empty inline: that one sits on the
+            # baseline, 0 tall -- line-breaking-font-size-zero-001.html.)
+            is_decoration_only_marker = run.get("decoration_only", False)
             if is_decoration_only_marker:
                 # No ascent of its own to place a baseline against -- always
                 # the top of whatever line it's on.
                 owner_y = origin_y + y
                 marker_height = (self._line_baselines[y] + self._line_belows[y]
                                   if self._line_has_content.get(y) else token_height)
+            elif (run.get("atomic") and not run.get("float") and owner is not self.element
+                    and "ascent" in run):
+                # An inline's fragment around an atomic child is its own
+                # glyph box on the line, not the child's height --
+                # iframe-in-wrapped-span.html.
+                owner_y = origin_y + glyph_y - run.get("own_top_edge", run["top_edge"])
+                marker_height = run["glyph_height"] + run.get("own_extra_height", run["box_height"] - run["glyph_height"])
+            elif not run["atomic_width"] and "own_top_edge" in run:
+                owner_y = origin_y + glyph_y - run["own_top_edge"]
+                marker_height = min(token_height, run["glyph_height"] + run["own_extra_height"])
             else:
                 owner_y = origin_y + (y if run["atomic_width"] else glyph_y - run["top_edge"])
                 marker_height = token_height
             rel_dx, rel_dy = inline_finalize._inline_relative_offset(owner, self.element, box)
-            rect = (origin_x + x - leading + rel_dx, owner_y + rel_dy,
-                    visual_advance + leading + trailing, marker_height)
+            # Its own box takes only its own edges; the margin box an
+            # enclosing inline borrows (`outer_rect`) keeps theirs too.
+            own_leading = min(leading, run.get("own_leading", leading))
+            own_trailing = min(trailing, run.get("own_trailing", trailing))
+            full_rect = (origin_x + x - leading + rel_dx, owner_y + rel_dy,
+                         visual_advance + leading + trailing, marker_height)
+            rect = (origin_x + x - own_leading + rel_dx, owner_y + rel_dy,
+                    visual_advance + own_leading + own_trailing, marker_height)
             # Split/document-order segment index (None for a non-split
             # owner), so `_finalize_inline_owner_boxes` can place
             # interruption-marker rects logically, not via a geometric sort.
@@ -718,9 +985,26 @@ class _InlineFormattingPlan:
                              if first_of_run.get(id(run)) == placed_index else 0.0)
             margin_after = (run.get("own_margin_end", run.get("margin_end", 0.0))
                             if last_of_run.get(id(run)) == placed_index else 0.0)
-            outer_rect = (rect[0] - margin_before, rect[1], rect[2] + margin_before + margin_after, rect[3])
+            outer_rect = (full_rect[0] - margin_before, full_rect[1],
+                          full_rect[2] + margin_before + margin_after, full_rect[3])
+            run_index = run_indices.get(id(run), 0)
+            previous_index = last_run_of_owner.get(id(owner))
+            last_run_of_owner[id(owner)] = run_index
+            if previous_index is not None and previous_index < run_index and any(
+                    previous_index < float_index < run_index and _is_inside(float_owner, owner)
+                    for float_index, float_owner in float_runs):
+                # A float inside this inline splits its fragment on the
+                # line -- getClientRects() reports both sides
+                # (float-nowrap-3.html).
+                rect = _AfterFloatRect(rect)
             owner_rects.setdefault(owner, []).append((rect, run.get("split_group"), outer_rect))
             if run.get("atomic") and not run.get("float") and (rel_dx or rel_dy) and hasattr(run["element"], "__dict__"):
+                _apply_inline_rel_offset(run["element"], rel_dx, rel_dy)
+        for run in self.runs:
+            # A float never reaches `placed`, but moves with a relatively
+            # positioned inline around it too -- block-in-inline-relpos-002.xht.
+            if run.get("float") and hasattr(run["element"], "__dict__"):
+                rel_dx, rel_dy = inline_finalize._inline_relative_offset(run["owner"], self.element, box)
                 _apply_inline_rel_offset(run["element"], rel_dx, rel_dy)
         # inline-block/block owners keep their atomic Taffy box; a real
         # display:inline owner's rects come from owner_rects[self.element]
@@ -800,6 +1084,15 @@ def _resolve_text_indent(computed) -> float:
 _CSS_COLLAPSIBLE_WHITESPACE_RE = re.compile(r"[ \t\n\r\f]+")
 
 _CSS_WHITESPACE_STRIP_CHARS = " \t\n\r\f"
+# Non-empty CSS white space (for `in` tests: `"" in str` is always true),
+# and word tokens split only on it -- U+00A0 is neither collapsible nor a
+# break opportunity, unlike Python's `\s`.
+_CSS_SPACE_CHARS = frozenset(_CSS_WHITESPACE_STRIP_CHARS)
+# How far content may pass a line's end and still fit: a width measured
+# here comes back from `src/lib.rs` as f32, and a max-content line laid at
+# its own width must not wrap its last word over that rounding.
+_FIT_EPSILON = 0.01
+_CSS_WORD_RE = re.compile(r"[^ \t\n\r\f]+[ \t\n\r\f]*|[ \t\n\r\f]+")
 
 
 
@@ -1020,7 +1313,8 @@ def _empty_inline_strut_run(owner, leading_edge, trailing_edge, top_edge_val, ex
         "above": above, "below": below, "top_edge": top_edge_val,
         "space_width": 0.0, "atomic_width": 0.0, "margin_start": margin_start,
         "own_margin_start": margin_start, "own_margin_end": 0.0,
-        "intrinsic_width": 0.0, "empty_strut": True,
+        # Its edges still take room on the line -- content-height-005.html.
+        "intrinsic_width": leading_edge + trailing_edge + margin_start, "empty_strut": True,
     }
 
 
@@ -1039,7 +1333,7 @@ def _empty_decoration_only_run(owner, leading_edge, trailing_edge, top_edge_val,
         "glyph_height": 0.0, "ascent": 0.0,
         "above": 0.0, "below": 0.0, "top_edge": top_edge_val,
         "space_width": 0.0, "atomic_width": 0.0, "margin_start": margin_start,
-        "intrinsic_width": 0.0, "empty_strut": True,
+        "intrinsic_width": 0.0, "empty_strut": True, "decoration_only": True,
     }
 
 
@@ -1084,12 +1378,129 @@ def _make_collapsed_space_run(paint_style, owner, top_edge_val: float, extra_hei
 
 
 
+def _br_clear(element) -> str:
+    """A `<br>`'s `clear` side ("left"/"right"/"both"), or "" -- from CSS
+    or the legacy `clear` attribute (`<br clear=all>`)."""
+    if (getattr(element, "tagName", "") or "").lower() != "br":
+        return ""
+    computed = box_of(element).computed_style
+    if computed is None:
+        from domonic.style import ComputedStyleDeclaration
+        computed = ComputedStyleDeclaration(element)
+    value = (getattr(computed, "clear", "") or "").strip().lower()
+    if value in ("left", "right", "both"):
+        return value
+    attr = (element.getAttribute("clear") or "").strip().lower() if hasattr(element, "getAttribute") else ""
+    return {"all": "both", "both": "both", "left": "left", "right": "right"}.get(attr, "")
+
+
+def _hanging_space(run, text) -> float:
+    """The width a token's trailing white space hangs past the line end
+    by (CSS Text 3 4.1.2): collapsible and pre-wrap spaces hang."""
+    if text[-1:] in _CSS_SPACE_CHARS and (run.get("paint_style") or {}).get(
+            "white_space", "normal") not in ("pre", "break-spaces"):
+        return run.get("space_width", 0.0)
+    return 0.0
+
+
+class _AfterFloatRect(tuple):
+    """A client rect that follows a float inside its own inline on the
+    same line, never merged with the rect before it."""
+
+
+def _is_inside(node, owner) -> bool:
+    while node is not None:
+        if node is owner:
+            return True
+        node = getattr(node, "parentElement", None)
+    return False
+
+
+def _own_vertical_shift(node, plan_element, plan_parent_style) -> float:
+    """One inline box's own vertical-align (CSS 2.1 10.8.1) as a raise
+    of its baseline over its parent's, in px. `top`/`bottom` (line-
+    relative) aren't handled here."""
+    computed = box_of(node).computed_style
+    align = (getattr(computed, "verticalAlign", "") or "baseline").strip().lower() if computed is not None else ""
+    if align in ("", "baseline", "top", "bottom", "initial", "inherit", "unset"):
+        return 0.0
+    parent = getattr(node, "parentElement", None)
+    parent_style = (plan_parent_style if parent is None or parent is plan_element
+                    else (box_of(parent).paint_style or plan_parent_style))
+    own_style = box_of(node).paint_style or parent_style
+    parent_font = _fontmetrics.parse_length(parent_style["font_size"], default=16.0)
+    if align == "sub":
+        # Blink's offsets, off the parent's whole-pixel font size.
+        return -(math.floor(round(parent_font) / 5) + 1)
+    if align == "super":
+        return math.floor(round(parent_font) / 3) + 1
+    own = _run_font_metrics(own_style)
+    if align.endswith("%"):
+        try:
+            return float(align[:-1]) / 100.0 * (own["above"] + own["below"])
+        except ValueError:
+            return 0.0
+    if align in ("middle", "text-top", "text-bottom"):
+        parent_metrics = _run_font_metrics(parent_style)
+        if align == "middle":
+            x_height = fonts.x_height(parent_metrics["family"], parent_font,
+                                      parent_metrics["weight"] >= 600, parent_metrics["italic"])
+            return x_height / 2.0 - (own["above"] - own["below"]) / 2.0
+        if align == "text-top":
+            return parent_metrics["ascent"] - own["above"]
+        return own["below"] - parent_metrics["descent"]
+    return _fontmetrics.parse_length(align, default=0.0) or 0.0
+
+
+def _break_item(run, text) -> tuple:
+    """(text, is an atomic box, wraps) of one placed token, for break
+    opportunities -- `white-space: nowrap`/`pre` text has none."""
+    white_space = ((run.get("paint_style") or {}).get("white_space") or "normal").strip().lower()
+    return (text or "", bool(run.get("atomic")), white_space not in ("nowrap", "pre"))
+
+
+def _is_cjk(char: str) -> bool:
+    code = ord(char)
+    return (0x2E80 <= code <= 0x9FFF or 0xAC00 <= code <= 0xD7AF
+            or 0xF900 <= code <= 0xFAFF or 0xFF00 <= code <= 0xFFEF)
+
+
+def _break_allowed_before(items, pos) -> bool:
+    """Whether a line may break before `items[pos]` (CSS Text 3 5.1, a
+    working subset of UAX #14): at white space, around atomic inlines,
+    after a hyphen, around CJK and at U+200B. A run boundary alone is not
+    one -- `<a>magnitudedev</a>)` stays together. Empty tokens (empty
+    inline boxes) are transparent."""
+    prev = next((items[i] for i in range(pos - 1, -1, -1) if items[i][0] or items[i][1]), None)
+    nxt = next((items[i] for i in range(pos, len(items)) if items[i][0] or items[i][1]), None)
+    if prev is None or nxt is None:
+        return False
+    (prev_text, prev_atomic, prev_wraps), (next_text, next_atomic, next_wraps) = prev, nxt
+    # `white-space` decides: a break at a space follows the run holding
+    # that space (`Some <span nowrap>text</span>` breaks after "Some " --
+    # float-nowrap-3.html); any other needs both sides wrapping.
+    if not prev_atomic and prev_text[-1] in _CSS_SPACE_CHARS:
+        return prev_wraps
+    if not next_atomic and next_text[0] in _CSS_SPACE_CHARS:
+        return next_wraps
+    if not (prev_wraps and next_wraps):
+        return False
+    if prev_atomic or next_atomic:
+        return True
+    last, first = prev_text[-1], next_text[0]
+    if "\u200b" in (last, first):
+        return True
+    if last in "-\u2010" and not first.isdigit():
+        return True
+    return _is_cjk(last) or _is_cjk(first)
+
+
 class _LineState:
     """Mutable cursor for one `_InlineFormattingPlan.measure` pass."""
 
     __slots__ = ("x", "y", "x_pre_trailing", "line_left", "line_right", "line_bottom", "above", "below",
-                 "line_has_content", "line_margin_start", "line_leading_total", "last_real_run",
-                 "top_aligned", "bottom_aligned")
+                 "line_has_content", "line_has_ink", "line_has_items", "line_margin_start", "line_leading_total",
+                 "last_real_run", "top_aligned", "bottom_aligned")
 
     def __init__(self):
         self.x = self.y = self.x_pre_trailing = 0.0
@@ -1097,6 +1508,8 @@ class _LineState:
         self.line_bottom = math.inf
         self.above = self.below = 0.0
         self.line_has_content = False
+        self.line_has_ink = False
+        self.line_has_items = False
         self.line_margin_start = self.line_leading_total = 0.0
         self.last_real_run = None
         self.top_aligned = []
@@ -1318,6 +1731,17 @@ def _run_font_metrics(paint_style) -> dict:
     }
 
 
+@functools.lru_cache(maxsize=4096)
+def _pair_kerning(pair, family, font_size, weight, italic, letter_spacing, word_spacing) -> float:
+    """How much shaping `pair` together changes its advance from its two
+    glyphs shaped apart."""
+    def advance(text):
+        return sum(line[1] for line in layout_text(
+            text, family, font_size, font_weight=weight, italic=italic,
+            letter_spacing=letter_spacing, word_spacing=word_spacing)[2])
+    return advance(pair) - advance(pair[0]) - advance(pair[1])
+
+
 def _text_run(source, owner, paint_style, metrics, token_texts, *, leading=0.0, trailing=0.0,
               top_edge=0.0, extra_height=0.0, margin_start=0.0, margin_end=0.0, no_wrap=False,
               own_margin_start=None, own_margin_end=None) -> dict:
@@ -1325,12 +1749,21 @@ def _text_run(source, owner, paint_style, metrics, token_texts, *, leading=0.0, 
     `own_margin_*` is the part of `margin_*` that is the owner's own (the
     rest belongs to enclosing inline wrappers flattened into this run)."""
     tokens = []
+    font = (metrics["family"], metrics["font_size"], metrics["weight"], metrics["italic"],
+            metrics["letter_spacing"], metrics["word_spacing"])
     for token in token_texts:
         _measured, _height, lines = layout_text(
             token, metrics["family"], metrics["font_size"], font_weight=metrics["weight"], italic=metrics["italic"],
             letter_spacing=metrics["letter_spacing"], word_spacing=metrics["word_spacing"],
         )
-        tokens.append((token, sum(line[1] for line in lines)))
+        width = sum(line[1] for line in lines)
+        if tokens and tokens[-1][0] and token:
+            # The kerning pair across the token boundary ("r T" in
+            # "Filler Text") goes on the earlier glyph's advance, as the
+            # shaper puts it -- display-initial-001.xht.
+            previous, previous_width = tokens[-1]
+            tokens[-1] = (previous, previous_width + _pair_kerning(previous[-1] + token[0], *font))
+        tokens.append((token, width))
     return {
         "source": source, "owner": owner, "paint_style": paint_style,
         "font_size": metrics["font_size"], "tokens": tokens,
@@ -1373,7 +1806,10 @@ def _runs_for_text(raw, paint_style, owner, source, *, has_leading_space=False, 
         text = ((" " if (raw[:1] and raw[:1] in _CSS_WHITESPACE_STRIP_CHARS) or has_leading_space else "")
                 + text.strip(_CSS_WHITESPACE_STRIP_CHARS)
                 + (" " if raw[-1:] and raw[-1:] in _CSS_WHITESPACE_STRIP_CHARS else ""))
-        return [_text_run(source, owner, paint_style, metrics, [text] if no_wrap else re.findall(r"\S+\s*|\s+", text),
+        # A nowrap run is one unbreakable token, but its leading space stays
+        # separate so a line start can still remove it (CSS Text 3 4.1.2).
+        nowrap_tokens = [" ", text[1:]] if text[:1] == " " and len(text) > 1 else [text]
+        return [_text_run(source, owner, paint_style, metrics, nowrap_tokens if no_wrap else _CSS_WORD_RE.findall(text),
                           leading=leading, trailing=trailing, top_edge=top_edge, extra_height=extra_height,
                           margin_start=margin_start, margin_end=margin_end, no_wrap=no_wrap,
                           own_margin_start=margin_start if margins_are_own else 0.0,
@@ -1392,7 +1828,7 @@ def _runs_for_text(raw, paint_style, owner, source, *, has_leading_space=False, 
         if not segment:
             continue
         runs.append(_text_run(source, owner, paint_style, metrics,
-                              [segment] if no_wrap else re.findall(r"\S+\s*|\s+", segment),
+                              [segment] if no_wrap else _CSS_WORD_RE.findall(segment),
                               top_edge=top_edge, extra_height=extra_height, no_wrap=no_wrap))
     real = [run for run in runs if not run.get("break")]
     if real:
@@ -1452,10 +1888,28 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                 return any(is_text_bearing(child, depth + 1) for child in dom._child_nodes(node))
         return bool((getattr(node, "textContent", "") or "").strip())
 
+    def has_forced_break(node, depth: int = 0) -> bool:
+        """A `<br>` in `node`, directly or through genuine inline wrappers
+        -- it ends a line even with no text around it."""
+        if (getattr(node, "tagName", "") or "").lower() == "br":
+            return True
+        if depth >= 32 or computed_cache is None or not dom._is_element(node):
+            return False
+        _node_computed, node_style_obj = dom._describe(node, computed_cache)
+        return (not box_model._is_absolutely_positioned(node_style_obj)
+                and _is_genuine_inline_wrapper(node, node_style_obj)
+                and any(has_forced_break(child, depth + 1) for child in dom._child_nodes(node)))
+
     text_node_indices = [i for i, n in enumerate(child_nodes) if is_text_bearing(n)]
-    if not text_node_indices:
+    if not text_node_indices and not any(has_forced_break(n) for n in child_nodes):
         return []
+    first_text_index = text_node_indices[0] if text_node_indices else None
+    last_text_index = text_node_indices[-1] if text_node_indices else None
     runs = []
+    # Whether `owner` has put anything on the current line yet: a line it
+    # holds only a `<br>` on still gets its own empty fragment there, like
+    # an empty inline (block-in-inline-followed-by-line-break-and-text.html).
+    line_has_run = False
     # Whitespace collapses across sibling-node boundaries the same way it
     # does across run boundaries in `_make_inline_formatting_plan`, but every
     # text run built below unconditionally strips both ends of its own
@@ -1468,7 +1922,14 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
     # Same CSS 2.1 16.6.1 reasoning as `_inline_mixed_content`'s has_content
     # guard: no leading-space token until real content has been emitted.
     has_content = False
+    scanned = 0
     for node_index, child_node in enumerate(child_nodes):
+        for run in runs[scanned:]:
+            if run.get("break"):
+                line_has_run = False
+            elif not run.get("escapee") and not run.get("float"):
+                line_has_run = True
+        scanned = len(runs)
         node_tag = (getattr(child_node, "tagName", "") or "").lower()
         if getattr(child_node, "nodeType", None) == dom.TEXT_NODE:
             node_raw = getattr(child_node, "textContent", None)
@@ -1484,8 +1945,8 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                 node_raw[:1] and node_raw[:1] in _CSS_WHITESPACE_STRIP_CHARS))
             pending_space = False
             has_content = True
-            is_first_text = node_index == text_node_indices[0]
-            is_last_text = node_index == text_node_indices[-1]
+            is_first_text = node_index == first_text_index
+            is_last_text = node_index == last_text_index
             runs.extend(_runs_for_text(
                 node_raw, paint_style, owner, child_node, has_leading_space=has_leading_space,
                 leading=leading_edge if is_first_text else 0.0,
@@ -1500,6 +1961,8 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
             # A forced line break starts a fresh line, same as this
             # container's own start -- whitespace right after it collapses too.
             has_content = False
+            if not line_has_run:
+                runs.append(_empty_inline_strut_run(owner, 0.0, 0.0, top_edge_val, extra_height, 0.0))
             runs.append({"break": True, "element": child_node})
         elif dom._is_element(child_node) and computed_cache is not None:
             child_computed, child_style = dom._describe(child_node, computed_cache)
@@ -1517,8 +1980,8 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                 # invisible to white-space collapsing, so a pending space
                 # carries past it to whatever real content follows.
                 floated = box_model._is_floated(child_computed)
-                is_first_text = node_index == text_node_indices[0]
-                is_last_text = node_index == text_node_indices[-1]
+                is_first_text = node_index == first_text_index
+                is_last_text = node_index == last_text_index
                 if not floated and has_content and pending_space:
                     runs.append(_make_collapsed_space_run(paint_style, owner, top_edge_val, extra_height))
                 if not floated:
@@ -1563,8 +2026,8 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
             needs_leading_space = has_content and pending_space
             pending_space = False
             has_content = True
-            is_first_text = node_index == text_node_indices[0]
-            is_last_text = node_index == text_node_indices[-1]
+            is_first_text = node_index == first_text_index
+            is_last_text = node_index == last_text_index
             nested_native = style_bridge.to_dict(child_style)
             nested_left = box_model._numeric_edge(nested_native["padding"][3]) + box_model._numeric_edge(nested_native["border"][3])
             nested_right = box_model._numeric_edge(nested_native["padding"][1]) + box_model._numeric_edge(nested_native["border"][1])
@@ -1598,6 +2061,17 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
             # physical field here since the recursive call's own params
             # can't express "this element's start edge is physically on the right".
             non_break_runs = [r for r in nested_runs if not r.get("break")]
+            for nested_run in non_break_runs:
+                if nested_run.get("owner") is child_node:
+                    # So far `leading`/`trailing` hold only enclosing
+                    # wrappers' edges; this element's own box (its
+                    # getClientRects()) excludes them -- inline-formatting-
+                    # context-006.xht. Vertically, its own top/bottom edges
+                    # are `nested_top`/`nested_extra` (-023.xht).
+                    nested_run.setdefault("own_leading", 0.0)
+                    nested_run.setdefault("own_trailing", 0.0)
+                    nested_run["own_top_edge"] = nested_top
+                    nested_run["own_extra_height"] = nested_extra
             if non_break_runs:
                 first_run, last_run = non_break_runs[0], non_break_runs[-1]
                 is_rtl_nested = dom._element_direction(child_node, child_computed) == "rtl"
@@ -1611,7 +2085,9 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                     # regardless of direction; only a line-break split
                     # invokes the start/end swap.
                     first_run["leading"] = first_run.get("leading", 0.0) + nested_left
+                    first_run["own_leading"] = first_run.get("own_leading", 0.0) + nested_left
                     first_run["trailing"] = first_run.get("trailing", 0.0) + nested_right
+                    first_run["own_trailing"] = first_run.get("own_trailing", 0.0) + nested_right
                     first_run["margin_start"] = first_run.get("margin_start", 0.0) + nested_margin_left
                     first_run["margin_end"] = first_run.get("margin_end", 0.0) + nested_margin_right
                     first_run["own_margin_start"] = first_run.get("own_margin_start", 0.0) + nested_margin_left
@@ -1621,22 +2097,26 @@ def _build_text_runs_from_nodes(child_nodes, paint_style, owner, *,
                                                       + nested_margin_left + nested_margin_right)
                 elif is_rtl_nested:
                     first_run["trailing"] = first_run.get("trailing", 0.0) + nested_right
+                    first_run["own_trailing"] = first_run.get("own_trailing", 0.0) + nested_right
                     first_run["margin_end"] = first_run.get("margin_end", 0.0) + nested_margin_right
                     first_run["own_margin_end"] = first_run.get("own_margin_end", 0.0) + nested_margin_right
                     first_run["intrinsic_width"] = (first_run.get("intrinsic_width", 0.0)
                                                       + nested_right + nested_margin_right)
                     last_run["leading"] = last_run.get("leading", 0.0) + nested_left
+                    last_run["own_leading"] = last_run.get("own_leading", 0.0) + nested_left
                     last_run["margin_start"] = last_run.get("margin_start", 0.0) + nested_margin_left
                     last_run["own_margin_start"] = last_run.get("own_margin_start", 0.0) + nested_margin_left
                     last_run["intrinsic_width"] = (last_run.get("intrinsic_width", 0.0)
                                                      + nested_left + nested_margin_left)
                 else:
                     first_run["leading"] = first_run.get("leading", 0.0) + nested_left
+                    first_run["own_leading"] = first_run.get("own_leading", 0.0) + nested_left
                     first_run["margin_start"] = first_run.get("margin_start", 0.0) + nested_margin_left
                     first_run["own_margin_start"] = first_run.get("own_margin_start", 0.0) + nested_margin_left
                     first_run["intrinsic_width"] = (first_run.get("intrinsic_width", 0.0)
                                                       + nested_left + nested_margin_left)
                     last_run["trailing"] = last_run.get("trailing", 0.0) + nested_right
+                    last_run["own_trailing"] = last_run.get("own_trailing", 0.0) + nested_right
                     last_run["margin_end"] = last_run.get("margin_end", 0.0) + nested_margin_right
                     last_run["own_margin_end"] = last_run.get("own_margin_end", 0.0) + nested_margin_right
                     last_run["intrinsic_width"] = (last_run.get("intrinsic_width", 0.0)
@@ -1848,6 +2328,12 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
         for index, (block, _computed, _style) in enumerate(blocks)
     ]
 
+    float_segments = set()
+    box_of(wrapper).split_float_segments = float_segments
+    # Everything else its pieces lay out, which its relative offset moves
+    # too (`inline_finalize._fix_split_inline_relative_offset`).
+    contents: dict = {}
+    box_of(wrapper).split_contents = contents
     for index, seg_nodes in enumerate(segments):
         is_first, is_last = index == 0, index == len(segments) - 1
         # direction:rtl: the first segment owns the start (physical-right)
@@ -1878,6 +2364,11 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
             # Genuinely nothing on this side -- still an explicit 0x0
             # fragment (Chrome reports one), no height/font/flow of its own.
             runs = [_empty_decoration_only_run(wrapper, 0.0, 0.0, 0.0, 0.0, 0.0)]
+        elif all(run.get("float") for run in runs):
+            # Only floats: the wrapper still has a (0x0) fragment on the
+            # line they shorten -- block-in-inline-relpos-002.xht.
+            runs = runs + [_empty_decoration_only_run(wrapper, 0.0, 0.0, 0.0, 0.0, 0.0)]
+            float_segments.add(index)
         if runs:
             # Tags each run with its segment index (document order), so
             # `_finalize_inline_owner_boxes` places interruption markers
@@ -1890,6 +2381,10 @@ def _split_wrapping_inline_element(wrapper, computed_cache, container):
                         # real, direction-aware answer -- suppress
                         # measure()'s owner-raw-margin fallback.
                         run["_bidi_margin_resolved"] = True
+                if run.get("atomic"):
+                    contents[id(run["element"])] = run["element"]
+                elif run.get("owner") is not None and run["owner"] is not wrapper and not run.get("escapee"):
+                    contents[id(run["owner"])] = run["owner"]
             yield ("run", runs)
         if index < len(blocks):
             if index in nested_wrapper_at:
@@ -1943,59 +2438,54 @@ def _split_inline_flow_around_blocks(element, inline_items, style, css_display, 
     box_of(element).pop("split_container", None)
     pieces: list = []
     pending: list = []
+    # CSS 2.1 9.2.1.1: everything between two block interruptions is one
+    # anonymous block box -- a split wrapper's trailing fragment shares its
+    # lines (and any float among them) with the inline content after it,
+    # up to the next wrapper's block -- block-in-inline-margin-collapses-
+    # through-intervening-float.html.
+    runs_acc: list = []
     found_split = False
 
-    def flush_pending():
+    def absorb_pending():
         if pending:
-            plan = _make_inline_formatting_plan(element, list(pending), style, css_display, computed_cache,
-                                                allow_escapees=True)
-            if plan is not None:
-                pieces.append(("plan", plan))
+            pending_plan = _make_inline_formatting_plan(element, list(pending), style, css_display, computed_cache)
+            if pending_plan is not None:
+                runs_acc.extend(pending_plan.runs)
             pending.clear()
+
+    def flush_runs(final):
+        if runs_acc:
+            plan = _InlineFormattingPlan(element, list(runs_acc), box_of(element).paint_style, css_display)
+            # measure()'s RTL mirror applies a wrapper's margin-right only
+            # on its true trailing segment, never one a block follows.
+            box_of(plan).final_split_fragment = final
+            pieces.append(("plan", plan))
+            runs_acc.clear()
 
     for kind, item, text, child_computed, child_style in inline_items:
         if (kind == "element" and not box_model._is_absolutely_positioned(child_style)
                 and _is_genuine_inline_wrapper(item, child_style)
                 and _contains_in_flow_block(item, computed_cache)):
             found_split = True
-            # CSS 2.1 9.2.1.1: the wrapper's leading fragment isn't itself a
-            # line break -- pending text before it belongs on the same line
-            # box until the first real block interruption forces a split.
-            # Seeded from `pending`'s runs instead of flushed as an
-            # independent plan, which would stack it as its own row.
-            runs_acc: list = []
-            if pending:
-                pending_plan = _make_inline_formatting_plan(element, list(pending), style, css_display, computed_cache)
-                if pending_plan is not None:
-                    runs_acc.extend(pending_plan.runs)
-                pending.clear()
+            absorb_pending()
             for sub in _split_wrapping_inline_element(item, computed_cache, element):
                 if sub[0] == "run":
                     runs_acc.extend(sub[1])
                 else:
-                    if runs_acc:
-                        plan = _InlineFormattingPlan(
-                            element, runs_acc, box_of(element).paint_style, css_display)
-                        # A block interruption follows -- this plan is a
-                        # leading/interior segment, never the wrapper's true
-                        # trailing one. measure()'s RTL mirror must not
-                        # apply the wrapper's margin-right on that false signal.
-                        box_of(plan).final_split_fragment = False
-                        pieces.append(("plan", plan))
-                        runs_acc = []
+                    flush_runs(False)
                     pieces.append(sub)
-            if runs_acc:
-                # Nothing follows this plan for `item` -- the real trailing
-                # segment, where measure() applies the wrapper's
-                # margin-right normally (the default for a non-split plan).
-                plan = _InlineFormattingPlan(
-                    element, runs_acc, box_of(element).paint_style, css_display)
-                box_of(plan).final_split_fragment = True
-                pieces.append(("plan", plan))
         else:
             pending.append((kind, item, text, child_computed, child_style))
-    flush_pending()
-    return pieces if found_split else None
+    if not found_split:
+        return None
+    if runs_acc:
+        absorb_pending()
+        flush_runs(True)
+    elif pending:
+        plan = _make_inline_formatting_plan(element, list(pending), style, css_display, computed_cache)
+        if plan is not None:
+            pieces.append(("plan", plan))
+    return pieces
 
 
 
@@ -2136,8 +2626,8 @@ def _make_inline_formatting_plan(element, inline_items, style, css_display, comp
                                                          + left_edge + margin_start)
             item_display = (getattr(child_computed, "display", "") or "").strip().lower()
             item_tag = (getattr(item, "tagName", "") or "").lower()
-            if (not child_runs and not dom._child_nodes(item)
-                    and item_display == "inline" and item_tag not in box_model._REPLACED_OR_CONTROL_TAGS):
+            if (not child_runs and item_display == "inline" and item_tag not in box_model._REPLACED_OR_CONTROL_TAGS
+                    and not any(dom._is_element(node) for node in dom._child_nodes(item))):
                 # CSS 2.1 9.2.1.1/10.8's empty-inline strut applies only to a
                 # plain non-replaced display:inline -- inline-block/replaced
                 # keeps its own explicit width/height even empty (10.3.10).

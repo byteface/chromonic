@@ -31,6 +31,8 @@ from . import (
     domonic_monospace_font_size_patch,
     domonic_font_size_keywords_patch,
     domonic_logical_size_patch,
+    domonic_shorthand_paren_patch,
+    domonic_text_merge_patch,
     hittest,
     netlog,
     tree,

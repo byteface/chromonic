@@ -311,30 +311,36 @@ def _build_root(tree, root_element, node_map, *, reuse_styles=False, projection=
     if html is None:
         return builder.build(tree, root_element, node_map, computed_cache=computed_cache,
                              reuse_styles=reuse_styles, projection=projection)
-    computed, style_obj = dom._describe(root_element, computed_cache, reuse_styles=reuse_styles)
+    from domonic.style import ComputedStyleDeclaration
+    html_computed = ComputedStyleDeclaration(html)
+    # CSS 2.1 9.2.4: a display:none root generates no boxes at all --
+    # root-box-003.xht.
+    html_hidden = (getattr(html_computed, "display", "") or "").strip().lower() == "none"
     viewport_children: list = []
-    body_is_cb = box_model._establishes_containing_block(style_obj)
-    previous_sink = builder._viewport_sink
-    builder._viewport_sink = viewport_children if viewport is not None else None
-    try:
-        body_id = builder.build(tree, root_element, node_map, computed=computed, style_obj=style_obj,
-                                computed_cache=computed_cache, is_containing_block=body_is_cb,
-                                escapees=None if body_is_cb else viewport_children,
-                                reuse_styles=reuse_styles, projection=projection)
-    finally:
-        builder._viewport_sink = previous_sink
+    body_id = None
+    if not html_hidden:
+        computed, style_obj = dom._describe(root_element, computed_cache, reuse_styles=reuse_styles)
+        body_is_cb = box_model._establishes_containing_block(style_obj)
+        previous_sink = builder._viewport_sink
+        builder._viewport_sink = viewport_children if viewport is not None else None
+        try:
+            body_id = builder.build(tree, root_element, node_map, computed=computed, style_obj=style_obj,
+                                    computed_cache=computed_cache, is_containing_block=body_is_cb,
+                                    escapees=None if body_is_cb else viewport_children,
+                                    reuse_styles=reuse_styles, projection=projection)
+        finally:
+            builder._viewport_sink = previous_sink
     boxes = box_of(root_element).setdefault("root_boxes", {})
     html_box = boxes.get("html")
     if html_box is None:
         html_box = boxes["html"] = anonymous_boxes._DocumentRootBox(html)
-    from domonic.style import ComputedStyleDeclaration
-    html_style = style_bridge.to_dict(LayoutStyle.from_computed(ComputedStyleDeclaration(html)))
+    html_style = style_bridge.to_dict(LayoutStyle.from_computed(html_computed))
     # CSS 2.1 9.4.1: the root element establishes a block formatting
     # context -- its children's margins stay inside it.
-    html_style.update({"display": "block", "position": "relative", "inset": ["auto"] * 4,
-                       "establishes_bfc": True})
+    html_style.update({"display": "none" if html_hidden else "block", "position": "relative",
+                       "inset": ["auto"] * 4, "establishes_bfc": True})
     box_of(html_box).native_style = html_style
-    html_children = [body_id] + ([] if viewport is not None else viewport_children)
+    html_children = ([] if body_id is None else [body_id]) + ([] if viewport is not None else viewport_children)
     html_id = (projection.upsert(html_box, html_style, html_children, None, None)
                if projection else tree.new_with_children(html_style, html_children))
     node_map[html_id] = html_box

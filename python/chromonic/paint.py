@@ -25,6 +25,7 @@ browsers have another decade of `paint.py` in them.
 from __future__ import annotations
 
 import functools
+import math
 import re
 import urllib.parse
 from collections import namedtuple
@@ -78,12 +79,17 @@ def _font(size_px: float, *, bold: bool = False, italic: bool = False, family: "
     """A cached `skia.Font` for this exact (size, weight, style, family)
     combination -- see `fonts.py` for how `family` resolves to a typeface,
     with downloaded fonts shared with Parley/fontique text layout."""
-    size_px = round(size_px)
+    # Never a whole-pixel size: layout measured the real one (10pt is
+    # 13.33px), and a rounded paint size drifts from it along the line.
+    size_px = round(size_px * 64.0) / 64.0
     key = (size_px, bold, italic, family)
     font = _FONT_CACHE.get(key)
     if font is None:
         typeface = fonts.resolve_typeface(family, bold=bold, italic=italic)
         font = skia.Font(typeface, size_px)
+        # Unhinted, fractional advances -- what Parley laid the text out with.
+        font.setSubpixel(True)
+        font.setLinearMetrics(True)
         _FONT_CACHE[key] = font
     return font
 
@@ -240,11 +246,137 @@ def _background_image_candidate_urls(url: str, doc) -> "list[str]":
     return candidates
 
 
+_GRADIENT_RE = re.compile(r"^\s*(-webkit-|-moz-|-o-|-ms-)?(repeating-)?linear-gradient\((.*)\)\s*$", re.I | re.S)
+_SIDE_VECTORS = {"top": (0.0, -1.0), "bottom": (0.0, 1.0), "left": (-1.0, 0.0), "right": (1.0, 0.0)}
+
+
+def _gradient_color(text: str) -> "skia.Color4f | None":
+    """A CSS colour in any syntax domonic normalizes (hex, named, rgb/hsl
+    and their alpha forms) -- `transparent` included, unlike `_color`."""
+    from domonic import _cssom
+
+    normalized = _cssom.normalize_color(text.strip())
+    match = _RGB_RE.match(normalized or "")
+    if not match:
+        return None
+    r, g, b = (float(match.group(i)) / 255.0 for i in (1, 2, 3))
+    return skia.Color4f(r, g, b, float(match.group(4)) if match.group(4) is not None else 1.0)
+
+
+def _gradient_line(direction: str, legacy: bool, width: float, height: float):
+    """CSS Images 3 3.1.1: the unit direction of a linear gradient's line,
+    or None when `direction` isn't one (it's then the first colour stop)."""
+    text = direction.strip().lower()
+    match = re.fullmatch(r"(-?[\d.]+)(deg|grad|rad|turn)", text)
+    if match:
+        value = float(match.group(1))
+        degrees = {"deg": value, "grad": value * 0.9, "rad": math.degrees(value), "turn": value * 360.0}[match.group(2)]
+        if legacy:
+            degrees = 90.0 - degrees  # prefixed syntax: 0deg points right, counter-clockwise
+        radians = math.radians(degrees)
+        return math.sin(radians), -math.cos(radians)
+    words = text.split()
+    if not legacy:
+        if not words or words[0] != "to":
+            return None
+        words = words[1:]
+    elif words and all(word in _SIDE_VECTORS for word in words):
+        # Prefixed syntax names the starting side: `left` runs to the right.
+        words = [{"top": "bottom", "bottom": "top", "left": "right", "right": "left"}[word] for word in words]
+    if not words or not all(word in _SIDE_VECTORS for word in words):
+        return None
+    if len(words) == 1:
+        return _SIDE_VECTORS[words[0]]
+    # A corner: perpendicular to the diagonal joining the two neighbouring
+    # corners, so the 50% line passes through them.
+    sx = sum(_SIDE_VECTORS[word][0] for word in words)
+    sy = sum(_SIDE_VECTORS[word][1] for word in words)
+    dx, dy = sx * height, sy * width
+    length = math.hypot(dx, dy) or 1.0
+    return dx / length, dy / length
+
+
+def _paint_linear_gradient(canvas: "skia.Canvas", box, token: str) -> bool:
+    """`linear-gradient(...)` (and its prefixed / repeating forms) over the
+    background box; False when `token` isn't one. csszengarden.com's
+    two-column page background is a hard-stop gradient."""
+    match = _GRADIENT_RE.match(token or "")
+    if not match:
+        return False
+    legacy = match.group(1) is not None
+    args = _split_top_level(match.group(3))
+    width, height = box.width, box.height
+    if width <= 0 or height <= 0 or not args:
+        return True
+    vector = _gradient_line(args[0], legacy, width, height)
+    if vector is None:
+        vector = _SIDE_VECTORS["bottom"]
+    else:
+        args = args[1:]
+    dx, dy = vector
+    length = abs(width * dx) + abs(height * dy)
+    stops: list = []  # (color, position fraction or None)
+    for arg in args:
+        parts = arg.strip().rsplit(None, 2)
+        positions = []
+        while len(parts) > 1 and re.fullmatch(r"-?[\d.]+(%|px)?", parts[-1]):
+            positions.insert(0, parts.pop())
+        color = _gradient_color(" ".join(parts) if len(parts) > 1 else parts[0]) if parts else None
+        if color is None:
+            continue
+        if not positions:
+            stops.append([color, None])
+        for position in positions:
+            value = float(position.rstrip("%px"))
+            stops.append([color, value / 100.0 if position.endswith("%") else (value / length if length else 0.0)])
+    if not stops:
+        return True
+    if len(stops) == 1:
+        stops.append([stops[0][0], None])
+    # Unpositioned first/last stops sit at the ends; the rest spread
+    # evenly between their positioned neighbours; never backwards.
+    if stops[0][1] is None:
+        stops[0][1] = 0.0
+    if stops[-1][1] is None:
+        stops[-1][1] = 1.0
+    index = 0
+    while index < len(stops):
+        if stops[index][1] is None:
+            end = index
+            while stops[end][1] is None:
+                end += 1
+            start_pos, end_pos = stops[index - 1][1], stops[end][1]
+            for k in range(index, end):
+                stops[k][1] = start_pos + (end_pos - start_pos) * (k - index + 1) / (end - index + 1)
+            index = end
+        index += 1
+    highest = stops[0][1]
+    for stop in stops:
+        highest = stop[1] = max(highest, stop[1])
+    cx, cy = box.x + width / 2.0, box.y + height / 2.0
+    start = skia.Point(cx - dx * length / 2.0, cy - dy * length / 2.0)
+    end = skia.Point(cx + dx * length / 2.0, cy + dy * length / 2.0)
+    offset = stops[0][1]
+    span = (stops[-1][1] - offset) or 1.0
+    colors = [stop[0].toColor() for stop in stops]
+    positions = [(stop[1] - offset) / span for stop in stops]
+    # Stretch the line to the first/last stop, so stops outside 0..1 work.
+    start, end = (skia.Point(start.x() + (end.x() - start.x()) * offset, start.y() + (end.y() - start.y()) * offset),
+                  skia.Point(start.x() + (end.x() - start.x()) * (offset + span),
+                             start.y() + (end.y() - start.y()) * (offset + span)))
+    tile = skia.TileMode.kRepeat if match.group(2) else skia.TileMode.kClamp
+    shader = skia.GradientShader.MakeLinear([start, end], colors, positions, tile)
+    canvas.drawRect(skia.Rect.MakeXYWH(box.x, box.y, width, height), skia.Paint(Shader=shader, AntiAlias=True))
+    return True
+
+
 def _paint_background_layer(canvas: "skia.Canvas", box, doc,
                              url_token: str, size_token: str, pos_token: str,
                              repeat_token: str) -> None:
     from . import browser_images
 
+    if _paint_linear_gradient(canvas, box, url_token):
+        return
     raw_url = _background_image_url(url_token)
     if not raw_url:
         return
@@ -359,6 +491,35 @@ def _paint_style(element) -> dict:
 #: belongs to (the owning element, or an anonymous inline-fragment "element"
 #: for mixed inline content -- see `paint_element`'s own `fragments` handling).
 TextRun = namedtuple("TextRun", "x baseline_y width height font text element")
+
+
+def _draw_text(canvas: "skia.Canvas", run: TextRun, style: dict, paint_: "skia.Paint") -> None:
+    """`run.text` at the advances layout measured it with: the font's own
+    glyph widths plus Parley's kerning between each pair, and CSS
+    letter-/word-spacing -- `drawString` applies none of the three, so a
+    kerned title painted wider than its box and over the space after it."""
+    text = run.text
+    glyphs = run.font.textToGlyphs(text) if text else []
+    if len(glyphs) != len(text):
+        canvas.drawString(text, run.x, run.baseline_y, run.font, paint_)
+        return
+    from .tree import inline_formatting
+    family = "" if style.get("font_family") == "none" else (style.get("font_family") or "")
+    font_size = _fontmetrics.parse_length(style.get("font_size"), default=16.0)
+    weight = inline_formatting._parse_font_weight(style.get("font_weight"))
+    italic = fonts.is_italic(style.get("font_style"))
+    letter = _fontmetrics.parse_length(style.get("letter_spacing"), default=0.0)
+    word = _fontmetrics.parse_length(style.get("word_spacing"), default=0.0)
+    widths = run.font.getWidths(glyphs)
+    xs = []
+    x = 0.0
+    for index, char in enumerate(text):
+        xs.append(x)
+        x += widths[index] + letter + (word if char == " " else 0.0)
+        if index + 1 < len(text):
+            x += inline_formatting._pair_kerning(char + text[index + 1], family, font_size, weight, italic,
+                                                 letter, word)
+    canvas.drawTextBlob(skia.TextBlob.MakeFromPosTextH(text, xs, 0.0, run.font), run.x, run.baseline_y, paint_)
 
 
 def text_line_runs(element, box, style):
@@ -693,7 +854,7 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
             ))
         try:
             for run in text_line_runs(element, box, style):
-                canvas.drawString(run.text, run.x, run.baseline_y, run.font, paint_)
+                _draw_text(canvas, run, style, paint_)
         finally:
             if clips_own_text:
                 canvas.restore()
@@ -734,14 +895,71 @@ def paint_element(canvas: "skia.Canvas", element, box=None) -> None:
                 canvas.restore()
 
 
+def _opacity(element) -> float:
+    style = box_of(element).paint_style or {}
+    try:
+        return max(0.0, min(1.0, float(style.get("opacity") or 1.0)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _boxed_pseudo(element, which: str):
+    """`element`'s `::before`/`::after` when it is laid out as a box of
+    its own (see `_paint_pseudo_box`), else None."""
+    if getattr(box_of(element), f"{which}_pseudo") is None:
+        return None
+    pseudo = (box_of(element).get("pseudo_objs") or {}).get(which)
+    if pseudo is None or box_of(pseudo).flattened_inline or pseudo.__dict__.get("_layout_box") is None:
+        return None
+    return pseudo
+
+
+def _paint_pseudo_box(canvas: "skia.Canvas", element, which: str) -> None:
+    """A `::before`/`::after` laid out as a box of its own -- an atomic
+    inline (inline-block, an empty sized icon box) or an absolutely
+    positioned one -- painted like an element: background, borders, its
+    text. (An inline one with text is one of `element`'s inline fragments,
+    painted with them.) csszengarden.com's ensō logo (`h1::before`, an
+    inline-block with an SVG background) and its icon-font download icons
+    (`.intro a::before`, absolutely positioned)."""
+    pseudo = _boxed_pseudo(element, which)
+    if pseudo is None:
+        return
+    opacity = _opacity(pseudo)
+    if opacity <= 0.0:
+        return
+    if opacity < 1.0:
+        canvas.saveLayerAlpha(None, int(round(opacity * 255)))
+    try:
+        paint_element(canvas, pseudo)
+    finally:
+        if opacity < 1.0:
+            canvas.restore()
+
+
 def paint_tree(canvas: "skia.Canvas", root_element) -> None:
     """Paint `root_element` and every descendant, pre-order (a parent's
     background/border always land before its children's -- painting a real
     DOM, not `tree.py`'s `node_map`, which is populated post-order and would
-    paint backwards if walked directly)."""
+    paint backwards if walked directly). `opacity` applies to the whole
+    subtree as a group (CSS Color 4 3.2)."""
+    opacity = _opacity(root_element) if _is_element(root_element) else 1.0
+    if opacity <= 0.0:
+        return
+    if opacity < 1.0:
+        canvas.saveLayerAlpha(None, int(round(opacity * 255)))
+    try:
+        _paint_tree(canvas, root_element)
+    finally:
+        if opacity < 1.0:
+            canvas.restore()
+
+
+def _paint_tree(canvas: "skia.Canvas", root_element) -> None:
     paint_element(canvas, root_element)
     if box_of(root_element).tag_name == "select":
         return  # <option>s were never laid out (see paint_element) -- nothing to recurse into
+    _paint_pseudo_box(canvas, root_element, "before")
     for child in (root_element.childNodes or []):
         if not _is_element(child):
             continue
@@ -753,6 +971,7 @@ def paint_tree(canvas: "skia.Canvas", root_element) -> None:
             continue
         paint_tree(canvas, child)
     _paint_anonymous_boxes(canvas, root_element)
+    _paint_pseudo_box(canvas, root_element, "after")
 
 
 def _paint_anonymous_boxes(canvas: "skia.Canvas", element) -> None:
@@ -776,30 +995,47 @@ def build_display_list(root_element) -> list:
     """
     result = []
 
-    def walk_anonymous(element):
+    def walk_anonymous(element, alpha):
         # Same anonymous boxes `_paint_anonymous_boxes` covers for the
         # direct paint path -- own boxes only, never their real children.
         for anonymous in (box_of(element).anonymous_table_boxes or {}).values():
             if anonymous.__dict__.get("_layout_box") is not None:
+                box_of(anonymous).paint_alpha = alpha
                 result.append(anonymous)
-            walk_anonymous(anonymous)
+            walk_anonymous(anonymous, alpha)
 
-    def walk(element):
+    def add_pseudo(element, which, alpha):
+        pseudo = _boxed_pseudo(element, which)
+        if pseudo is not None:
+            pseudo_alpha = alpha * _opacity(pseudo)
+            if pseudo_alpha > 0.0:
+                box_of(pseudo).paint_alpha = pseudo_alpha
+                result.append(pseudo)
+
+    def walk(element, alpha):
         # An open <dialog> paints separately, centred on top of everything
         # else (`native_browser.py`'s `draw_open_dialogs`) -- excluded here,
         # subtree included, so it isn't also painted at its in-flow position.
         if (box_of(element).tag_name or "").lower() == "dialog":
             return
+        # `opacity` fades the whole subtree; a flat list applies it to each
+        # entry (multiplied down) rather than compositing the group.
+        alpha *= _opacity(element)
+        if alpha <= 0.0:
+            return
+        box_of(element).paint_alpha = alpha
         if element.__dict__.get("_layout_box") is not None:
             result.append(element)
         if box_of(element).tag_name == "select":
             return
+        add_pseudo(element, "before", alpha)
         for child in (element.childNodes or []):
             if _is_element(child):
-                walk(child)
-        walk_anonymous(element)
+                walk(child, alpha)
+        walk_anonymous(element, alpha)
+        add_pseudo(element, "after", alpha)
 
-    walk(root_element)
+    walk(root_element, 1.0)
     return result
 
 
@@ -817,7 +1053,13 @@ def paint_display_list(
         box = element.__dict__.get("_layout_box")
         if box is None or box.y + box.height < top or box.y > bottom:
             continue
-        paint_element(canvas, element, box)
+        alpha = box_of(element).paint_alpha
+        if alpha is not None and alpha < 1.0:
+            canvas.saveLayerAlpha(None, int(round(alpha * 255)))
+            paint_element(canvas, element, box)
+            canvas.restore()
+        else:
+            paint_element(canvas, element, box)
         painted += 1
     return painted
 

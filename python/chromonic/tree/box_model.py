@@ -69,14 +69,33 @@ def _ua_stylesheet_applied(element) -> bool:
 
 
 
+# HTML elements whose UA default display isn't inline (HTML's rendering
+# section) that `ua_style.py` doesn't style -- domonic reports `inline` for
+# them either way, so a computed inline there can't be author intent.
+_NON_INLINE_DEFAULT_TAGS = frozenset({
+    "html", "body", "head", "title", "meta", "link", "base", "style", "script", "template",
+    "address", "blockquote", "center", "dialog", "div", "figure", "figcaption", "footer",
+    "form", "header", "hr", "legend", "listing", "main", "p", "plaintext", "pre", "search",
+    "xmp", "details", "summary", "dd", "dl", "dt", "ol", "ul", "menu", "dir", "li",
+    "h1", "h2", "h3", "h4", "h5", "h6", "article", "aside", "nav", "section", "hgroup",
+    "fieldset", "optgroup", "option", "table", "caption", "colgroup", "col", "thead",
+    "tbody", "tfoot", "tr", "td", "th", "frameset", "frame", "marquee", "meter",
+    "progress", "datalist", "area", "rp", "noembed", "noframes", "param", "source", "track",
+})
+
+
 def _trusts_computed_inline(element, tag_name: str) -> bool:
     """Whether a computed display:inline/inline-block on element can be
     trusted as real author intent rather than domonic's un-cascaded
-    default -- true for a tag assumed usually-inline, or one ua_style.py
-    gives an explicit block default when that stylesheet actually ran."""
+    default -- true for a tag assumed usually-inline, one ua_style.py
+    gives an explicit block default when that stylesheet actually ran, and
+    any element whose own default is inline anyway: `<font>`, `<nobr>`,
+    `<del>` or a custom element (line-breaking-font-size-zero-001.html)."""
     if tag_name in _USUALLY_INLINE_TAGS:
         return True
-    return tag_name in ua_style.BLOCK_DEFAULT_TAGS and _ua_stylesheet_applied(element)
+    if tag_name in ua_style.BLOCK_DEFAULT_TAGS:
+        return _ua_stylesheet_applied(element)
+    return bool(tag_name) and tag_name not in _NON_INLINE_DEFAULT_TAGS
 
 
 

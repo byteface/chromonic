@@ -15,12 +15,12 @@ full command and troubleshooting.
 ## whats been mostly done so far
 
 CSS2/box/ - 8/11 PASSING
-CSS2/visudet/ - 31/40 PASSING
+CSS2/visudet/ - 34/40 PASSING
 CSS2/positioning/ - 527/555 PASSING (old full run); first 250 fixtures now 225/250
-CSS2/box-display/ ??
-CSS2/margin-padding-clear/ - 86 failed / 69 errors (out of 739 total)
-CSS2/linebox/ - first 60 fixtures: 43 pass / 15 fail
-CSS2/normal-flow/ - 524 passed / 230 failed / 37 errors (old full run); first 200 fixtures now 98 pass / 37 fail / 4 errors
+CSS2/box-display/ - 94/100 PASSING (39 more skipped: need JS)
+CSS2/margin-padding-clear/ - first 372: 322 pass / 13 fail / 37 err (of 739 total)
+CSS2/linebox/ - first 60 fixtures: 53 pass / 5 fail
+CSS2/normal-flow/ - 524 passed / 230 failed / 37 errors (old full run); first 200 fixtures now 120 pass / 18 fail / 1 error
 CSS2/tables/ - 920/1137 PASSING with the table node (old code: 909 of the same 1137; 2 regressions left: row-visibility-003/004)
 CSS2/backgrounds - 173/200 PASSING
 CSS2/colors ??
@@ -29,7 +29,7 @@ css-position/ ? no idea
 css-display/ - ??
 css-flexbox/ - 706/1203
 css-grid/ - 257/551 
-CSS2/floats/ + CSS2/floats-clear/ - 110/366 (old); now floats first 120: 36 pass, floats-clear first 60: 46 pass
+CSS2/floats/ + CSS2/floats-clear/ - 110/366 (old); now floats first 120: 68 pass, floats-clear first 60: 49 pass
 css-sizing/ - 205/608 
 css-box/ - tiny (10 fixtures) and??
 css-text/ + css-text-decor/ - 257/1538
@@ -84,10 +84,9 @@ Agent should NOT run full suite of tests between fixes. It takes too long and wa
   (`baseline-shift`, `alignment-baseline`, `initial-letter`), inline-level
   text next to a float when the *line* is taller than the band it starts
   in for text leaves (plan-based inline nodes re-lay such lines; leaves
-  use the line's own uniform height). Taffy 0.14 quirks seen: a BFC box with a
-  negative remaining width beside a float still "fits" (floats-wrap-bfc-with-
-  margin-004), and a float wider than its containing block is dropped below
-  earlier floats where Chrome keeps it at the top (floats-rule3-outside-*).
+  use the line's own uniform height). Taffy 0.14 quirk seen: a float wider than its
+  containing block is dropped below earlier floats where Chrome keeps it at
+  the top (floats-rule3-outside-*).
 - The WPT harness reuses a stored `chrome.json` baseline for an unchanged
   fixture when its tagged id set matches (`--fresh-chrome` to force);
   `el.style = ...` scripted fixtures are skipped like `.style.x =` ones.
@@ -162,6 +161,23 @@ styles get re-cascaded instead of hitting `_computed_style_cache`), giving
 `from domonic.bs4 import (...)` at the top of `_matches_selector_chain`
 (~1.1s of import machinery under cProfile). GC and streaming/progressive
 parse are not the bottleneck (GC off saves ~0.25s total).
+
+domonic's html5lib tree builder (`ext/html5lib_` `NodeBuilder.insertText`)
+makes a new Text node per character token instead of appending to a
+preceding Text sibling: `A&nbsp;&nbsp;B &amp; c` parses to 7 nodes, not 1,
+and leading whitespace splits off too. Patched in
+`domonic_text_merge_patch.py`.
+
+domonic's cascade (`_expand_shorthands_for_cascade`) leaves a shorthand
+unexpanded when its value has whitespace inside parens -- meant for
+`var(--x, 4px)`, but it also drops `border-top: 12px solid rgba(0, 0, 0, .5)`
+and `background: linear-gradient(to right, ...)` entirely. Patched in
+`domonic_shorthand_paren_patch.py` (guard narrowed to `var()`).
+
+domonic resolves `font-size: smaller`/`larger` to the parent's size
+unchanged (`_font_size_px` falls through to the keyword table's default);
+Blink uses parent / 1.2 and * 1.2. Patched in
+`domonic_font_size_keywords_patch.py`.
 
 domonic doesn't drop an invalid declaration in favour of an earlier valid
 one: python.org's `white-space: pre-wrap; white-space: -o-pre-wrap;` computes

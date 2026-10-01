@@ -102,7 +102,10 @@ caption { display: table-caption; text-align: center; }
 center { display: block; text-align: -webkit-center; }
 pre, code, kbd, samp { font-family: monospace; }
 pre { white-space: pre; }
+nobr { white-space: nowrap; }
 small { font-size: 0.83em; }
+sub { vertical-align: sub; font-size: smaller; }
+sup { vertical-align: super; font-size: smaller; }
 a { color: #0000ee; }
 hr { margin: 0.5em 0; border: 1px solid; height: 0; }
 button, input, select, textarea { display: inline-block; font: 13.3333px Arial; margin: 0; color: black; background-color: white; }

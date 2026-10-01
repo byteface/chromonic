@@ -62,12 +62,15 @@ class Box:
         "flattened_inline",        # laid out as runs of an enclosing plan, no node of its own
         "leading_collapsed_space", # collapsible white space before it survives as a space
         "inline_rel_offset",       # the position:relative offset applied inside a line
+        "paint_alpha",             # opacity it paints with, ancestors' included (display list)
 
         # -- CSS 2.1 9.2.1.1 block-in-inline splits ---------------------------------
         "split_container",         # the block container whose flow the split pieces join
         "split_self_edges",        # (left, right, top) edges of a self-splitting container
         "split_plan_owners",       # {index: anonymous owner} per inline piece
         "interruption_blocks",     # the blocks this inline was split around
+        "split_float_segments",    # indices of split pieces holding only floats
+        "split_contents",          # atomics/floats/nested inlines laid out in its pieces
         "final_split_fragment",    # the plan holds the inline's trailing piece
 
         # -- out-of-flow boxes -------------------------------------------------------

@@ -1363,14 +1363,36 @@ impl TreeView<'_> {
         let mut atomics: Vec<AtomicChild> = Vec::with_capacity(children.len());
         for child in &children {
             let child_id = NodeId::from(*child);
-            let (child_margin, child_padding, child_border, float, clear) = {
+            let (child_margin, child_padding, child_border, float, clear, relative_offset) = {
                 let child_style = &self.tree.nodes[index_of(child_id)].style;
+                // CSS 2.1 9.4.3: a relatively positioned atomic box or float
+                // is offset from where the line put it, as Taffy's block
+                // layout does for its own children.
+                let relative_offset = if child_style.position == Position::Relative {
+                    let cb_height = content_available.height.into_option();
+                    let inset = child_style.inset;
+                    let left: Option<f32> = inset.left.maybe_resolve(cb_width, calc);
+                    let right: Option<f32> = inset.right.maybe_resolve(cb_width, calc);
+                    let top: Option<f32> = inset.top.maybe_resolve(cb_height, calc);
+                    let bottom: Option<f32> = inset.bottom.maybe_resolve(cb_height, calc);
+                    Point {
+                        x: if style.direction == taffy::Direction::Rtl {
+                            right.map(|x| -x).or(left).unwrap_or(0.0)
+                        } else {
+                            left.or(right.map(|x| -x)).unwrap_or(0.0)
+                        },
+                        y: top.or(bottom.map(|y| -y)).unwrap_or(0.0),
+                    }
+                } else {
+                    Point::ZERO
+                };
                 (
                     child_style.margin.resolve_or_zero(cb_width, calc),
                     child_style.padding.resolve_or_zero(cb_width, calc),
                     child_style.border.resolve_or_zero(cb_width, calc),
                     child_style.float,
                     child_style.clear,
+                    relative_offset,
                 )
             };
             let max_content = self
@@ -1423,6 +1445,7 @@ impl TreeView<'_> {
                 border: child_border,
                 float,
                 clear,
+                relative_offset,
             });
         }
 
@@ -1721,12 +1744,13 @@ struct AtomicChild {
     border: Rect<f32>,
     float: Float,
     clear: Clear,
+    relative_offset: Point<f32>,
 }
 
 impl AtomicChild {
     fn layout(&self, order: u32, x: f32, y: f32) -> Layout {
         let mut layout = Layout::with_order(order);
-        layout.location = Point { x, y };
+        layout.location = Point { x: x + self.relative_offset.x, y: y + self.relative_offset.y };
         layout.size = self.size;
         layout.border = self.border;
         layout.padding = self.padding;
@@ -1958,7 +1982,10 @@ fn layout_text(
                 let range = line.text_range();
                 let line_text = text.get(range).unwrap_or("").to_string();
                 let metrics = line.metrics();
-                let mut line_width = metrics.advance;
+                // An empty line has no glyphs: Parley still reports an
+                // advance for it (4px at 16px), which the plan's kerning
+                // step then took off the preceding token.
+                let mut line_width = if line_text.is_empty() { 0.0 } else { metrics.advance };
                 // Parley trims a line's *measured* width down to its last
                 // non-whitespace glyph (any Unicode whitespace, matching how
                 // most text-layout engines treat trailing whitespace for

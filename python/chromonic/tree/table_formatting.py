@@ -255,9 +255,17 @@ class _TableLayoutPlan:
         caption_boxes = {}
         requests = []
         for caption in captions:
-            margin = (box_of(caption).native_style or {}).get("margin") or (0.0,) * 4
+            caption_style = box_of(caption).native_style or {}
+            margin = caption_style.get("margin") or (0.0,) * 4
             ml, mr = box_model._numeric_edge(margin[3]), box_model._numeric_edge(margin[1])
-            caption_boxes[id(caption)] = (ml, max(0.0, outer_width - ml - mr))
+            caption_width = max(0.0, outer_width - ml - mr)
+            if isinstance(caption_style.get("width"), (int, float)):
+                # A caption's own width stands (floats-wrap-bfc-006.xht);
+                # only an auto one spans the table.
+                caption_width = float(caption_style["width"])
+                if caption_style.get("box_sizing") != "border-box":
+                    caption_width += _horizontal_edges(caption_style)
+            caption_boxes[id(caption)] = (ml, caption_width)
             key = ("l", self._node(caption), round(caption_boxes[id(caption)][1], 3))
             if key not in responses:
                 requests.append((key, self._node(caption), caption_boxes[id(caption)][1], None))

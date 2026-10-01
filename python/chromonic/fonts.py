@@ -143,6 +143,9 @@ def text_metrics(family, size, bold=False, italic=False):
     sum. The macOS legacy-font adjustment matches Blink's FontMetrics::
     AscentDescentWithHacks (also used by Safari); it is not fixture-specific.
     """
+    if size <= 0:
+        # `font-size: 0` has no extent; Skia's size-0 font reports some.
+        return 0.0, 0.0, 0.0
     face = resolve_typeface(family, bold=bold, italic=italic)
     metrics = skia.Font(face, size).getMetrics()
     ascent = math.floor(-metrics.fAscent + 0.5)
