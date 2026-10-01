@@ -7,7 +7,6 @@ be the DOM/CSSOM behind a native rendering pipeline:
 
 > Browser compatibility is incomplete and the rendering engine is still under active development. You can help evolve Chromonic by contributing to conformance and layout tests. Check the repo for open issues to join in.
 
-
 ## Install
 
 Install with pipx to use the command line:
