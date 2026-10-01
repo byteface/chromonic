@@ -29,6 +29,12 @@ TOOLBAR = 44
 _IMAGE_RELAYOUT_INTERVAL = 0.2
 _MAX_DEFERRED_LAYOUT_LATENCY = 0.15
 
+# A live window drag reports a new size on nearly every pointer move, and a
+# resize relayout is a full cascade + Taffy pass -- seconds on a big page.
+# So a drag neither reflows nor redraws: the window keeps its last frame
+# until the size has held still for this long, then reflows once.
+_RESIZE_SETTLE = 0.1
+
 
 def _clipboard_text(glfw_module, window):
     """Return GLFW clipboard contents as text across glfw Python versions."""
@@ -246,7 +252,7 @@ def sync_window_size(view, window, glfw_module):
     logical_size = glfw_module.get_window_size(window)
     if logical_size == (view.width, view.height):
         return False
-    view.resize(*logical_size)
+    view.resize(*logical_size, defer=True)
     return True
 
 
@@ -344,6 +350,9 @@ class View:
         self._deferred_layout_at = None
         self._deferred_layout_first_at = None
         self._deferred_layout_reuse_styles = True
+        # When the latest unapplied window-drag size change happened (see
+        # `resize(defer=True)`).
+        self._resize_last_at = None
         self.display_list = []
         self.layout_projection = tree.LayoutProjection()
         self.last_painted_elements = 0
@@ -589,7 +598,17 @@ class View:
             self._deferred_layout_reuse_styles and reuse_styles
         )
 
+    def poll_resize(self):
+        """Reflow a deferred window resize once its size has settled."""
+        if self._resize_last_at is None or time.monotonic() - self._resize_last_at < _RESIZE_SETTLE:
+            return False
+        self._resize_last_at = None
+        self.relayout()
+        return True
+
     def poll_deferred_work(self):
+        if self.poll_resize():
+            return True
         deadline = self._deferred_layout_at
         if deadline is None or time.monotonic() < deadline:
             return False
@@ -804,18 +823,19 @@ class View:
                 self.dirty = True
                 return
 
-    def resize(self, width, height):
+    def resize(self, width, height, *, defer=False):
+        """Reflow to a new viewport size.
+
+        ``defer`` is for live window drags (`sync_window_size`): leave the
+        reflow and redraw to `poll_resize()` once the drag settles (see
+        `_RESIZE_SETTLE`). Programmatic callers get the relayout immediately.
+        """
         if width > 0 and height > 0 and (width, height) != (self.width, self.height):
             self.width, self.height = width, height
-            # Just relayout. No pre-emptive guessing about whether this
-            # page/this tick can "afford" it -- a page too expensive to
-            # relayout on every resize tick makes the render loop take
-            # longer that iteration, which naturally paints fewer frames
-            # during the drag. That's a real, honest frame drop with
-            # every painted frame showing correct, current geometry --
-            # strictly better than a coalescing scheme that paints
-            # guaranteed-stale geometry against the live window bounds
-            # for a guessed-in-advance window of time.
+            if defer:
+                self._resize_last_at = time.monotonic()
+                return
+            self._resize_last_at = None
             self.relayout()
 
     def scroll(self, delta):
@@ -2249,23 +2269,9 @@ class WindowInput:
         g.set_mouse_button_callback(w, self.on_mouse_button)
         g.set_scroll_callback(w, self.on_scroll)
         g.set_cursor_pos_callback(w, self.on_cursor_pos)
-        # On macOS (and similarly elsewhere), an OS-driven window-resize
-        # drag runs GLFW's event dispatch inside a *modal* nested loop --
-        # this project's own `while not window_should_close` loop in `run()`
-        # never regains control until the pointer is released, so a
-        # size/refresh callback that only sets `view.dirty = True` (as these
-        # used to, relying on the main loop to notice and redraw) never
-        # actually gets drawn until the drag ends: the window shows a
-        # frozen last-good frame, stretched to whatever size it's being
-        # dragged to, for the whole gesture. Calling `_live_redraw` directly
-        # from these callbacks instead -- reflow-if-needed, paint, swap --
-        # runs that real work synchronously from inside GLFW's own nested
-        # loop (same thread, same GL context, so it's safe), which is what
-        # actually makes a resize track the pointer live rather than just
-        # snapping into place on release.
-        g.set_window_size_callback(w, self._live_redraw)
-        g.set_framebuffer_size_callback(w, self._live_redraw)
-        g.set_window_refresh_callback(w, self._live_redraw)
+        # No size/refresh callbacks: a window drag (a modal loop on macOS,
+        # so `run()`'s loop is paused) keeps showing the last frame, and the
+        # main loop reflows once the size settles -- see `_RESIZE_SETTLE`.
 
     def close(self):
         destroy = getattr(self.glfw, 'destroy_cursor', None)
@@ -2273,13 +2279,6 @@ class WindowInput:
             for cursor in self._cursors.values():
                 destroy(cursor)
         self._cursors.clear()
-
-    def _live_redraw(self, *_args):
-        g = self.glfw
-        sync_window_size(self.view, self.window, g)
-        if self.view.dirty:
-            self.renderer.draw(self.view, g.get_framebuffer_size(self.window))
-            g.swap_buffers(self.window)
 
     def _command_pressed(self, mods):
         return bool(mods & (self.glfw.MOD_CONTROL | self.glfw.MOD_SUPER))
@@ -2658,6 +2657,7 @@ def run(url='chromonic://home', *, width=1000, height=800, title='chromonic — 
                 or browser_images.has_pending(view._page_image_urls)
                 or browser_images.has_active_animations(view._page_image_urls)
                 or view._deferred_layout_at is not None
+                or view._resize_last_at is not None
             )
             glfw.wait_events_timeout(0.02 if eager else 0.25)
 

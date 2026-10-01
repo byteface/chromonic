@@ -94,12 +94,10 @@ def test_settled_glfw_size_is_applied_before_the_next_draw():
     assert sync_window_size(view, object(), FakeGlfw)
     assert (view.width, view.height) == (640, 360)
     # `resize(..., defer=True)` (what `sync_window_size` calls) only
-    # *schedules* the relayout now (`request_relayout`, coalesced with
-    # every other relayout trigger) -- the real run loop settles it via
-    # `poll_deferred_work()` before its next `draw()` (this test's own
-    # name), which needs real time to have actually reached the deadline;
-    # force that here rather than sleeping the test.
-    view._deferred_layout_at -= 1.0
+    # repaints now; the run loop's `poll_deferred_work()` reflows once the
+    # size has settled. Age the resize rather than sleeping the test.
+    assert box.get_layout_box().width == 300
+    view._resize_last_at -= 1.0
     assert view.poll_deferred_work()
     assert box.get_layout_box().width == 640
     assert not sync_window_size(view, object(), FakeGlfw)
